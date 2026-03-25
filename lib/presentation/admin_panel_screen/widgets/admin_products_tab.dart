@@ -5,6 +5,7 @@ import '../../../services/supabase_service.dart';
 import '../../../theme/app_theme.dart';
 import './admin_shared_widgets.dart';
 import './category_management_dialog.dart';
+import './unit_management_dialog.dart';
 import './product_admin_card.dart';
 
 // All 297 errors cascade from errors 1 & 2 (unresolvable package URIs); the import statements are already syntactically correct - run `flutter pub add google_fonts` and `flutter pub get` to resolve the missing packages, as no code changes are needed in this file. //
@@ -20,6 +21,7 @@ class _AdminProductsTabState extends State<AdminProductsTab> {
   bool _isLoading = true;
   List<ProductModel> _products = [];
   List<ProductCategoryModel> _categories = [];
+  List<ProductUnitModel> _units = [];
   String? _error;
 
   bool _bulkMode = false;
@@ -43,10 +45,12 @@ class _AdminProductsTabState extends State<AdminProductsTab> {
       final products = await SupabaseService.instance.getProducts();
       final categories =
           await SupabaseService.instance.getAllProductCategories();
+      final units = await SupabaseService.instance.getProductUnits();
       if (!mounted) return;
       setState(() {
         _products = products;
         _categories = categories;
+        _units = units;
         _isLoading = false;
         _selectedIds.clear();
       });
@@ -347,6 +351,16 @@ class _AdminProductsTabState extends State<AdminProductsTab> {
     );
   }
 
+  void _showUnitManagementDialog() {
+    showDialog(
+      context: context,
+      builder: (ctx) => UnitManagementDialog(
+        units: List.from(_units),
+        onChanged: _load,
+      ),
+    );
+  }
+
   void _showEditDialog(ProductModel? product) {
     final nameCtrl = TextEditingController(text: product?.name ?? '');
     final skuCtrl = TextEditingController(text: product?.sku ?? '');
@@ -358,11 +372,15 @@ class _AdminProductsTabState extends State<AdminProductsTab> {
     final stockCtrl = TextEditingController(
       text: product?.stockQty.toString() ?? '0',
     );
+    final stepSizeCtrl = TextEditingController(
+      text: product?.stepSize.toString() ?? '1',
+    );
     String status = product?.status ?? 'available';
     String? selectedCategory =
         _categories.any((c) => c.name == product?.category)
             ? product?.category
             : null;
+    String selectedUnit = product?.unit ?? 'pcs';
 
     showDialog(
       context: context,
@@ -423,6 +441,46 @@ class _AdminProductsTabState extends State<AdminProductsTab> {
                   'Stock Qty',
                   stockCtrl,
                   keyboardType: TextInputType.number,
+                ),
+                const SizedBox(height: 10),
+                buildAdminTextField(
+                  'Step Size',
+                  stepSizeCtrl,
+                  keyboardType: TextInputType.number,
+                ),
+                const SizedBox(height: 10),
+                DropdownButtonFormField<String>(
+                  value: selectedUnit,
+                  decoration: InputDecoration(
+                    labelText: 'Unit',
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    contentPadding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 12,
+                    ),
+                  ),
+                  items: _units.isEmpty
+                      ? [
+                          DropdownMenuItem(
+                            value: 'pcs',
+                            child: Text('pcs',
+                                style: GoogleFonts.manrope(fontSize: 13)),
+                          )
+                        ]
+                      : _units
+                          .map(
+                            (u) => DropdownMenuItem(
+                              value: u.abbreviation,
+                              child: Text(
+                                '${u.name} (${u.abbreviation})',
+                                style: GoogleFonts.manrope(fontSize: 13),
+                              ),
+                            ),
+                          )
+                          .toList(),
+                  onChanged: (v) => setDialogState(() => selectedUnit = v!),
                 ),
                 const SizedBox(height: 10),
                 Column(
@@ -496,8 +554,10 @@ class _AdminProductsTabState extends State<AdminProductsTab> {
                     packSize: packCtrl.text.trim(),
                     status: status,
                     stockQty: int.tryParse(stockCtrl.text.trim()) ?? 0,
+                    stepSize: int.tryParse(stepSizeCtrl.text.trim()) ?? 1,
                     imageUrl: product?.imageUrl ?? '',
                     semanticLabel: product?.semanticLabel ?? '',
+                    unit: selectedUnit,
                   );
                   await SupabaseService.instance.upsertProduct(updated);
                   _load();
@@ -552,6 +612,7 @@ class _AdminProductsTabState extends State<AdminProductsTab> {
         stockQty: p.stockQty,
         imageUrl: p.imageUrl,
         semanticLabel: p.semanticLabel,
+        unit: p.unit,
       );
       await SupabaseService.instance.upsertProduct(updated);
       _load();
@@ -662,7 +723,40 @@ class _AdminProductsTabState extends State<AdminProductsTab> {
                             ),
                             const SizedBox(width: 4),
                             Text(
-                              'Manage',
+                              'Cats',
+                              style: GoogleFonts.manrope(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w600,
+                                color: AppTheme.primary,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    GestureDetector(
+                      onTap: _showUnitManagementDialog,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 6,
+                        ),
+                        decoration: BoxDecoration(
+                          color: AppTheme.primaryContainer,
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              Icons.straighten_rounded,
+                              size: 14,
+                              color: AppTheme.primary,
+                            ),
+                            const SizedBox(width: 4),
+                            Text(
+                              'Units',
                               style: GoogleFonts.manrope(
                                 fontSize: 11,
                                 fontWeight: FontWeight.w600,

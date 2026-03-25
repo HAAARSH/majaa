@@ -73,83 +73,99 @@ class ProductListItemWidget extends StatelessWidget {
                 ),
                 const SizedBox(width: 12),
                 Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        product.name,
-                        style: GoogleFonts.manrope(
-                          fontSize: 14,
-                          fontWeight: FontWeight.w700,
-                          color: AppTheme.onSurface,
-                          height: 1.2,
+                  child: InkWell(
+                    onTap: () => Navigator.pushNamed(
+                      context,
+                      AppRoutes.productDetailScreen,
+                      arguments: {'product': product},
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          product.name,
+                          style: GoogleFonts.manrope(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w700,
+                            color: AppTheme.onSurface,
+                            height: 1.2,
+                          ),
                         ),
-                      ),
-                      const SizedBox(height: 6),
-                      Wrap(
-                        crossAxisAlignment: WrapCrossAlignment.center,
-                        spacing: 6,
-                        runSpacing: 4,
-                        children: [
-                          Text(
-                            '₹${product.unitPrice.toStringAsFixed(2)}',
-                            style: GoogleFonts.manrope(
-                              fontSize: 13,
-                              fontWeight: FontWeight.w800,
-                              color: AppTheme.primary,
+                        const SizedBox(height: 6),
+                        Wrap(
+                          crossAxisAlignment: WrapCrossAlignment.center,
+                          spacing: 6,
+                          runSpacing: 4,
+                          children: [
+                            Text(
+                              '₹${product.unitPrice.toStringAsFixed(2)}',
+                              style: GoogleFonts.manrope(
+                                fontSize: 13,
+                                fontWeight: FontWeight.w800,
+                                color: AppTheme.primary,
+                              ),
                             ),
-                          ),
-                          Text(
-                            '• ${product.packSize}',
-                            style: GoogleFonts.manrope(
-                              fontSize: 11,
-                              color: AppTheme.onSurfaceVariant,
+                            Text(
+                              '• ${product.unit}',
+                              style: GoogleFonts.manrope(
+                                fontSize: 11,
+                                color: AppTheme.onSurfaceVariant,
+                              ),
                             ),
-                          ),
-                          Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 5,
-                              vertical: 2,
-                            ),
-                            decoration: BoxDecoration(
-                              color: product.stockQty > 50
-                                  ? AppTheme.statusAvailableContainer
-                                  : product.stockQty > 0
-                                      ? AppTheme.warningContainer
-                                      : AppTheme.errorContainer,
-                              borderRadius: BorderRadius.circular(4),
-                            ),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Icon(
-                                  Icons.inventory_2_outlined,
-                                  size: 10,
-                                  color: product.stockQty > 50
-                                      ? AppTheme.statusAvailable
-                                      : product.stockQty > 0
-                                          ? AppTheme.warning
-                                          : AppTheme.error,
+                            if (product.packSize.isNotEmpty)
+                              Text(
+                                '• ${product.packSize}',
+                                style: GoogleFonts.manrope(
+                                  fontSize: 10,
+                                  color: AppTheme.onSurfaceVariant,
+                                  fontStyle: FontStyle.italic,
                                 ),
-                                const SizedBox(width: 3),
-                                Text(
-                                  '${product.stockQty} pcs',
-                                  style: GoogleFonts.manrope(
-                                    fontSize: 9,
-                                    fontWeight: FontWeight.w700,
+                              ),
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 5,
+                                vertical: 2,
+                              ),
+                              decoration: BoxDecoration(
+                                color: product.stockQty > 50
+                                    ? AppTheme.statusAvailableContainer
+                                    : product.stockQty > 0
+                                        ? AppTheme.warningContainer
+                                        : AppTheme.errorContainer,
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(
+                                    Icons.inventory_2_outlined,
+                                    size: 10,
                                     color: product.stockQty > 50
                                         ? AppTheme.statusAvailable
                                         : product.stockQty > 0
                                             ? AppTheme.warning
                                             : AppTheme.error,
                                   ),
-                                ),
-                              ],
+                                  const SizedBox(width: 3),
+                                  Text(
+                                    '${product.stockQty} ${product.unit}',
+                                    style: GoogleFonts.manrope(
+                                      fontSize: 9,
+                                      fontWeight: FontWeight.w700,
+                                      color: product.stockQty > 50
+                                          ? AppTheme.statusAvailable
+                                          : product.stockQty > 0
+                                              ? AppTheme.warning
+                                              : AppTheme.error,
+                                    ),
+                                  ),
+                                ],
+                              ),
                             ),
-                          ),
-                        ],
-                      ),
-                    ],
+                          ],
+                        ),
+                      ],
+                    ),
                   ),
                 ),
                 const SizedBox(width: 8),
@@ -192,7 +208,7 @@ class ProductListItemWidget extends StatelessWidget {
                           ),
                           onPressed: () {
                             HapticFeedback.lightImpact();
-                            onAddToCart(1);
+                            onAddToCart(product.stepSize);
                           },
                           padding: EdgeInsets.zero,
                           constraints: const BoxConstraints(minWidth: 32),
@@ -210,7 +226,7 @@ class ProductListItemWidget extends StatelessWidget {
                           _canAddToCart ? AppTheme.secondary : AppTheme.outline,
                       size: 28,
                     ),
-                    onPressed: _canAddToCart ? () => onAddToCart(1) : null,
+                    onPressed: _canAddToCart ? () => onAddToCart(product.stepSize) : null,
                     padding: EdgeInsets.zero,
                     constraints: const BoxConstraints(),
                   ),
@@ -255,7 +271,7 @@ class ProductListItemWidget extends StatelessWidget {
                                 child: InkWell(
                                   onTap: () {
                                     HapticFeedback.mediumImpact();
-                                    onAddToCart(n);
+                                    onAddToCart(n * product.stepSize);
                                   },
                                   child: Container(
                                     width: 38,
@@ -268,7 +284,7 @@ class ProductListItemWidget extends StatelessWidget {
                                     ),
                                     child: Center(
                                       child: Text(
-                                        '+$n',
+                                        '+${n * product.stepSize}',
                                         style: GoogleFonts.manrope(
                                           fontSize: 13,
                                           fontWeight: FontWeight.w800,

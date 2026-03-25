@@ -18,7 +18,9 @@ class _OrderHistoryScreenState extends State<OrderHistoryScreen> {
   bool _isInitialized = false;
   String? _error;
   List<OrderModel> _orders = [];
+  List<OrderModel> _filteredOrders = [];
   String? _contextBeatName;
+  final TextEditingController _searchController = TextEditingController();
 
   @override
   void didChangeDependencies() {
@@ -30,6 +32,12 @@ class _OrderHistoryScreenState extends State<OrderHistoryScreen> {
       _loadOrders();
       _isInitialized = true;
     }
+  }
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
   }
 
   Future<void> _loadOrders() async {
@@ -44,6 +52,7 @@ class _OrderHistoryScreenState extends State<OrderHistoryScreen> {
       if (!mounted) return;
       setState(() {
         _orders = orders;
+        _filteredOrders = orders;
         _isLoading = false;
       });
     } catch (e) {
@@ -53,6 +62,22 @@ class _OrderHistoryScreenState extends State<OrderHistoryScreen> {
         _isLoading = false;
       });
     }
+  }
+
+  void _filterOrders(String query) {
+    setState(() {
+      if (query.isEmpty) {
+        _filteredOrders = _orders;
+      } else {
+        _filteredOrders = _orders.where((order) {
+          final customerName = order.customerName.toLowerCase();
+          final orderId = order.id.toLowerCase();
+          final searchLower = query.toLowerCase();
+          return customerName.contains(searchLower) ||
+              orderId.contains(searchLower);
+        }).toList();
+      }
+    });
   }
 
   String _formatDate(DateTime date) {
@@ -106,76 +131,117 @@ class _OrderHistoryScreenState extends State<OrderHistoryScreen> {
         ),
       ),
       body: SafeArea(
-        child: _isLoading
-            ? const Center(child: CircularProgressIndicator())
-            : _error != null
-                ? Center(
-                    child: Padding(
-                    padding: const EdgeInsets.all(24.0),
-                    child: Text('Error: $_error',
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(color: Colors.red)),
-                  ))
-                : _orders.isEmpty
-                    ? Center(
-                        child: Text('No orders found for this period.',
-                            style: GoogleFonts.manrope(
-                                color: AppTheme.onSurfaceVariant)))
-                    : RefreshIndicator(
-                        onRefresh: _loadOrders,
-                        child: ListView.builder(
-                          padding: const EdgeInsets.all(16),
-                          itemCount: _orders.length,
-                          itemBuilder: (context, index) {
-                            final order = _orders[index];
-                            return Card(
-                              margin: const EdgeInsets.only(bottom: 12),
-                              shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(16),
-                                  side: BorderSide(
-                                      color: AppTheme.outlineVariant)),
-                              child: ListTile(
-                                contentPadding: const EdgeInsets.all(16),
-                                onTap: () => Navigator.pushNamed(
-                                    context, AppRoutes.orderDetailScreen,
-                                    arguments: {'order': order}),
-                                title: Row(
-                                  mainAxisAlignment:
-                                      MainAxisAlignment.spaceBetween,
-                                  children: [
-                                    Text(order.id,
-                                        style: GoogleFonts.manrope(
-                                            fontSize: 13,
-                                            fontWeight: FontWeight.w800,
-                                            color: AppTheme.primary)),
-                                    Text(
-                                        '₹${order.grandTotal.toStringAsFixed(2)}',
-                                        style: GoogleFonts.manrope(
-                                            fontSize: 16,
-                                            fontWeight: FontWeight.w800)),
-                                  ],
-                                ),
-                                subtitle: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
-                                  children: [
-                                    const SizedBox(height: 8),
-                                    Text(order.customerName,
-                                        style: GoogleFonts.manrope(
-                                            fontSize: 15,
-                                            fontWeight: FontWeight.w700,
-                                            color: AppTheme.onSurface)),
-                                    const SizedBox(height: 4),
-                                    Text(
-                                        '${_formatDate(order.orderDate)} • ${order.itemCount} items',
-                                        style:
-                                            GoogleFonts.manrope(fontSize: 12)),
-                                  ],
-                                ),
+        child: Column(
+          children: [
+            if (!_isLoading && _error == null && _orders.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: TextField(
+                  controller: _searchController,
+                  onChanged: _filterOrders,
+                  decoration: InputDecoration(
+                    hintText: 'Search by Customer or Order ID',
+                    prefixIcon: const Icon(Icons.search_rounded),
+                    suffixIcon: _searchController.text.isNotEmpty
+                        ? IconButton(
+                            icon: const Icon(Icons.clear_rounded),
+                            onPressed: () {
+                              _searchController.clear();
+                              _filterOrders('');
+                            },
+                          )
+                        : null,
+                    filled: true,
+                    fillColor: Colors.white,
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      borderSide: BorderSide(color: AppTheme.outlineVariant),
+                    ),
+                    enabledBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12),
+                      borderSide: BorderSide(color: AppTheme.outlineVariant),
+                    ),
+                  ),
+                ),
+              ),
+            Expanded(
+              child: _isLoading
+                  ? const Center(child: CircularProgressIndicator())
+                  : _error != null
+                      ? Center(
+                          child: Padding(
+                          padding: const EdgeInsets.all(24.0),
+                          child: Text('Error: $_error',
+                              textAlign: TextAlign.center,
+                              style: const TextStyle(color: Colors.red)),
+                        ))
+                      : _filteredOrders.isEmpty
+                          ? Center(
+                              child: Text(
+                                  _searchController.text.isEmpty
+                                      ? 'No orders found for this period.'
+                                      : 'No orders match your search.',
+                                  style: GoogleFonts.manrope(
+                                      color: AppTheme.onSurfaceVariant)))
+                          : RefreshIndicator(
+                              onRefresh: _loadOrders,
+                              child: ListView.builder(
+                                padding: const EdgeInsets.all(16),
+                                itemCount: _filteredOrders.length,
+                                itemBuilder: (context, index) {
+                                  final order = _filteredOrders[index];
+                                  return Card(
+                                    margin: const EdgeInsets.only(bottom: 12),
+                                    shape: RoundedRectangleBorder(
+                                        borderRadius: BorderRadius.circular(16),
+                                        side: BorderSide(
+                                            color: AppTheme.outlineVariant)),
+                                    child: ListTile(
+                                      contentPadding: const EdgeInsets.all(16),
+                                      onTap: () => Navigator.pushNamed(
+                                          context, AppRoutes.orderDetailScreen,
+                                          arguments: {'order': order}),
+                                      title: Row(
+                                        mainAxisAlignment:
+                                            MainAxisAlignment.spaceBetween,
+                                        children: [
+                                          Text(order.id,
+                                              style: GoogleFonts.manrope(
+                                                  fontSize: 13,
+                                                  fontWeight: FontWeight.w800,
+                                                  color: AppTheme.primary)),
+                                          Text(
+                                              '₹${order.grandTotal.toStringAsFixed(2)}',
+                                              style: GoogleFonts.manrope(
+                                                  fontSize: 16,
+                                                  fontWeight: FontWeight.w800)),
+                                        ],
+                                      ),
+                                      subtitle: Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          const SizedBox(height: 8),
+                                          Text(order.customerName,
+                                              style: GoogleFonts.manrope(
+                                                  fontSize: 15,
+                                                  fontWeight: FontWeight.w700,
+                                                  color: AppTheme.onSurface)),
+                                          const SizedBox(height: 4),
+                                          Text(
+                                              '${_formatDate(order.orderDate)} • ${order.itemCount} items',
+                                              style: GoogleFonts.manrope(
+                                                  fontSize: 12)),
+                                        ],
+                                      ),
+                                    ),
+                                  );
+                                },
                               ),
-                            );
-                          },
-                        ),
-                      ),
+                            ),
+            ),
+          ],
+        ),
       ),
     );
   }

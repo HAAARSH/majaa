@@ -19,6 +19,8 @@ class ProductModel {
   final String imageUrl;
   final String semanticLabel;
   final double gstRate;
+  final String unit; // NEW: Unit of measurement (e.g., kg, pcs, box)
+  final int stepSize;
 
   const ProductModel({
     required this.id,
@@ -33,6 +35,8 @@ class ProductModel {
     required this.imageUrl,
     required this.semanticLabel,
     this.gstRate = 0.18,
+    this.unit = 'pcs', // Default to pieces
+    this.stepSize = 1,
   });
 
   factory ProductModel.fromJson(Map<String, dynamic> json) => ProductModel(
@@ -48,6 +52,8 @@ class ProductModel {
         imageUrl: json['image_url'] as String? ?? '',
         semanticLabel: json['semantic_label'] as String? ?? '',
         gstRate: (json['gst_rate'] as num?)?.toDouble() ?? 0.18,
+        unit: json['unit'] as String? ?? 'pcs',
+        stepSize: (json['step_size'] as int? ?? 1).clamp(1, 999999),
       );
 
   Map<String, dynamic> toJson() => {
@@ -63,6 +69,33 @@ class ProductModel {
         'image_url': imageUrl,
         'semantic_label': semanticLabel,
         'gst_rate': gstRate,
+        'unit': unit,
+        'step_size': stepSize,
+      };
+}
+
+class ProductUnitModel {
+  final String id;
+  final String name;
+  final String abbreviation;
+
+  const ProductUnitModel({
+    required this.id,
+    required this.name,
+    required this.abbreviation,
+  });
+
+  factory ProductUnitModel.fromJson(Map<String, dynamic> json) =>
+      ProductUnitModel(
+        id: json['id'] as String,
+        name: json['name'] as String,
+        abbreviation: json['abbreviation'] as String,
+      );
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'name': name,
+        'abbreviation': abbreviation,
       };
 }
 
@@ -803,5 +836,80 @@ class SupabaseService {
     if (data.isNotEmpty) {
       await client.from('app_users').update(data).eq('id', id);
     }
+  }
+
+  Future<List<ProductUnitModel>> getProductUnits() async {
+    final response = await client.from('product_units').select().order('name');
+    return (response as List<dynamic>)
+        .map((e) => ProductUnitModel.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
+  Future<void> upsertProductUnit(ProductUnitModel unit) async {
+    final data = unit.toJson();
+    if (unit.id.isEmpty) {
+      data.remove('id');
+      await client.from('product_units').insert(data);
+    } else {
+      await client.from('product_units').update(data).eq('id', unit.id);
+    }
+  }
+
+  Future<void> deleteProductUnit(String id) async {
+    await client.from('product_units').delete().eq('id', id);
+  }
+
+  Future<Map<String, dynamic>> getSalesAnalytics() async {
+    final now = DateTime.now();
+    final startOfMonth = DateTime(now.year, now.month, 1).toIso8601String();
+    final endOfMonth =
+        DateTime(now.year, now.month + 1, 0, 23, 59, 59).toIso8601String();
+
+    final response = await client
+        .from('orders')
+        .select('grand_total, beat, order_date')
+        .gte('order_date', startOfMonth)
+        .lte('order_date', endOfMonth)
+        .eq('user_id', currentUserId!);
+
+    final List<dynamic> orders = response as List<dynamic>;
+
+    double totalSales = 0;
+    Map<String, double> salesByBeat = {};
+    int totalOrders = orders.length;
+
+    for (var order in orders) {
+      final double amount = (order['grand_total'] as num).toDouble();
+      final String beat = order['beat'] as String? ?? 'Unknown';
+      totalSales += amount;
+      salesByBeat[beat] = (salesByBeat[beat] ?? 0) + amount;
+    }
+
+    return {
+      'totalSales': totalSales,
+      'totalOrders': totalOrders,
+      'avgOrderValue': totalOrders > 0 ? totalSales / totalOrders : 0.0,
+      'salesByBeat': salesByBeat,
+    };
+  }
+
+  Future<List<OrderModel>> getCustomerOrders(String customerId) async {
+    final response = await client
+        .from('orders')
+        .select('*, order_items(*)')
+        .eq('customer_id', customerId)
+        .order('order_date', ascending: false);
+
+    return (response as List<dynamic>)
+        .map((e) => OrderModel.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
+  Stream<List<OrderModel>> getOrdersStream() {
+    return client
+        .from('orders')
+        .stream(primaryKey: ['id'])
+        .order('order_date', ascending: false)
+        .map((data) => data.map((e) => OrderModel.fromJson(e)).toList());
   }
 }

@@ -200,6 +200,12 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> {
                         ),
                       ),
                       IconButton(
+                        icon: const Icon(Icons.analytics_rounded,
+                            color: AppTheme.primary),
+                        onPressed: () => Navigator.pushNamed(
+                            context, AppRoutes.dashboardScreen),
+                      ),
+                      IconButton(
                         icon: const Icon(Icons.history_rounded,
                             color: AppTheme.primary),
                         onPressed: () => Navigator.pushNamed(

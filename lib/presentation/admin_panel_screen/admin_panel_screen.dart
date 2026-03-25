@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
@@ -6,8 +7,10 @@ import '../../services/supabase_service.dart';
 import '../../theme/app_theme.dart';
 import './widgets/admin_beats_tab.dart';
 import './widgets/admin_customers_tab.dart';
+import './widgets/admin_dashboard_tab.dart';
 import './widgets/admin_orders_tab.dart';
 import './widgets/admin_products_tab.dart';
+import './widgets/admin_settings_tab.dart';
 import './widgets/admin_user_beats_tab.dart';
 
 class AdminPanelScreen extends StatefulWidget {
@@ -21,11 +24,51 @@ class _AdminPanelScreenState extends State<AdminPanelScreen>
     with SingleTickerProviderStateMixin {
   late TabController _tabController;
   AppUserModel? _currentUser;
+  StreamSubscription? _orderSubscription;
 
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 5, vsync: this);
+    _tabController = TabController(length: 7, vsync: this);
+    _setupOrderListener();
+  }
+
+  void _setupOrderListener() {
+    _orderSubscription =
+        SupabaseService.instance.getOrdersStream().listen((orders) {
+      if (orders.isNotEmpty) {
+        final latestOrder = orders.first;
+        final orderTime = DateTime.parse(latestOrder.orderDate);
+        if (DateTime.now().difference(orderTime).inSeconds < 10) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Row(
+                  children: [
+                    const Icon(Icons.shopping_cart_checkout_rounded,
+                        color: Colors.white),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        'New Order from ${latestOrder.customerName}!',
+                        style: GoogleFonts.manrope(fontWeight: FontWeight.w600),
+                      ),
+                    ),
+                  ],
+                ),
+                backgroundColor: AppTheme.primary,
+                behavior: SnackBarBehavior.floating,
+                action: SnackBarAction(
+                  label: 'VIEW',
+                  textColor: Colors.white,
+                  onPressed: () => _tabController.animateTo(5), // Orders tab
+                ),
+              ),
+            );
+          }
+        }
+      }
+    });
   }
 
   @override
@@ -40,6 +83,7 @@ class _AdminPanelScreenState extends State<AdminPanelScreen>
   @override
   void dispose() {
     _tabController.dispose();
+    _orderSubscription?.cancel();
     super.dispose();
   }
 
@@ -131,7 +175,12 @@ class _AdminPanelScreenState extends State<AdminPanelScreen>
             fontSize: 11,
             fontWeight: FontWeight.w400,
           ),
+          isScrollable: true,
           tabs: const [
+            Tab(
+              icon: Icon(Icons.dashboard_rounded, size: 18),
+              text: 'Dashboard',
+            ),
             Tab(
               icon: Icon(Icons.inventory_2_rounded, size: 18),
               text: 'Products',
@@ -146,17 +195,23 @@ class _AdminPanelScreenState extends State<AdminPanelScreen>
               icon: Icon(Icons.receipt_long_rounded, size: 18),
               text: 'Orders',
             ),
+            Tab(
+              icon: Icon(Icons.settings_rounded, size: 18),
+              text: 'Settings',
+            ),
           ],
         ),
       ),
       body: TabBarView(
         controller: _tabController,
         children: const [
+          AdminDashboardTab(),
           AdminProductsTab(),
           AdminCustomersTab(),
           AdminBeatsTab(),
           AdminUserBeatsTab(),
           AdminOrdersTab(),
+          AdminSettingsTab(),
         ],
       ),
     );

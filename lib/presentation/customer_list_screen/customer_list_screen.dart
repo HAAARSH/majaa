@@ -188,8 +188,20 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
                               style: GoogleFonts.manrope(
                                   fontSize: 12,
                                   color: AppTheme.onSurfaceVariant)),
-                          trailing: const Icon(Icons.chevron_right_rounded,
-                              color: AppTheme.outlineVariant),
+                          trailing: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              IconButton(
+                                icon: const Icon(Icons.info_outline_rounded,
+                                    color: AppTheme.primary),
+                                onPressed: () => Navigator.pushNamed(
+                                    context, AppRoutes.customerDetailScreen,
+                                    arguments: {'customer': customer}),
+                              ),
+                              const Icon(Icons.chevron_right_rounded,
+                                  color: AppTheme.outlineVariant),
+                            ],
+                          ),
                           onTap: () => _selectCustomer(customer),
                         ),
                       );

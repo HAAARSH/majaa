@@ -231,13 +231,14 @@ class _OrderLineItemWidgetState extends State<OrderLineItemWidget>
                     children: [
                       _QtyButton(
                         icon: Icons.remove_rounded,
-                        onTap: () => widget.onQuantityChanged(
-                          widget.cartItem.quantity - 1,
-                        ),
-                        color: widget.cartItem.quantity <= 1
+                        onTap: () {
+                          final newQty = widget.cartItem.quantity - product.stepSize;
+                          widget.onQuantityChanged(newQty < 0 ? 0 : newQty);
+                        },
+                        color: widget.cartItem.quantity <= product.stepSize
                             ? AppTheme.error
                             : AppTheme.onSurfaceVariant,
-                        bgColor: widget.cartItem.quantity <= 1
+                        bgColor: widget.cartItem.quantity <= product.stepSize
                             ? AppTheme.errorContainer
                             : AppTheme.surfaceVariant,
                       ),
@@ -258,7 +259,7 @@ class _OrderLineItemWidgetState extends State<OrderLineItemWidget>
                       _QtyButton(
                         icon: Icons.add_rounded,
                         onTap: () => widget.onQuantityChanged(
-                          widget.cartItem.quantity + 1,
+                          widget.cartItem.quantity + product.stepSize,
                         ),
                         color: AppTheme.secondary,
                         bgColor: AppTheme.secondaryContainer,

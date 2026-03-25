@@ -17,6 +17,8 @@ class Product {
   final String semanticLabel;
   final String brand;
   final double gstRate;
+  final String unit;
+  final int stepSize;
 
   const Product({
     required this.id,
@@ -31,6 +33,8 @@ class Product {
     required this.semanticLabel,
     required this.brand,
     this.gstRate = 0.18,
+    this.unit = 'pcs',
+    this.stepSize = 1,
   });
 
   factory Product.fromModel(ProductModel model) {
@@ -47,6 +51,8 @@ class Product {
       semanticLabel: model.semanticLabel,
       brand: model.brand,
       gstRate: model.gstRate,
+      unit: model.unit,
+      stepSize: model.stepSize,
     );
   }
 
@@ -117,8 +123,8 @@ class CartService {
     final index = items.indexWhere((item) => item.product.id == product.id);
 
     if (index >= 0) {
-      if (items[index].quantity > 1) {
-        items[index].quantity--;
+      if (items[index].quantity > product.stepSize) {
+        items[index].quantity -= product.stepSize;
       } else {
         items.removeAt(index);
       }
