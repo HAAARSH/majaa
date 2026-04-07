@@ -1,0 +1,151 @@
+{
+  "fetched_at": "2026-03-30T00:00:00Z",
+  "supabase_url": "https://ctrmpwmnnvvsciqouqyo.supabase.co",
+  "tables": {
+    "app_users": {
+      "status": "ok",
+      "row_count": 6,
+      "data": [
+        {"id":"857e1d6f-7698-4e35-9a60-e9abbde6098c","email":"james.okonkwo@fmcgorders.com","password_hash":"FMCGDemo@2026","full_name":"James Okonkwo","role":"sales_rep","is_active":true,"created_at":"2026-03-23T10:18:02.313841+00:00","updated_at":"2026-03-28T09:37:01.88692+00:00","team_id":"JA","upi_id":"harshgarg111@oksbi"},
+        {"id":"5c8225c2-f57e-4d47-9c13-2a4b43deeeb1","email":"adi@gmail.com","password_hash":"adi","full_name":"Aditiya","role":"sales_rep","is_active":true,"created_at":"2026-03-27T08:54:07.886707+00:00","updated_at":"2026-03-28T09:37:03.629226+00:00","team_id":"JA","upi_id":"harshgarg111@oksbi"},
+        {"id":"c2daf66d-816c-4411-8c87-cb961bb60cb4","email":"ranjeet@majaa.com","password_hash":"ran","full_name":"Ranjeet Yadav","role":"sales_rep","is_active":true,"created_at":"2026-03-23T10:18:02.313841+00:00","updated_at":"2026-03-28T09:37:03.811548+00:00","team_id":"JA","upi_id":"harshgarg111@oksbi"},
+        {"id":"d02c75fc-f645-4a2b-8a3c-b2faf207d56b","email":"ajaychana@gmail.com","password_hash":"ajay@2026","full_name":"Ajay Chana","role":"sales_rep","is_active":true,"created_at":"2026-03-23T10:18:02.313841+00:00","updated_at":"2026-03-28T09:37:11.819576+00:00","team_id":"JA","upi_id":"harshgarg111@oksbi"},
+        {"id":"48371a54-1cb3-42ac-bc0f-7e27b49a3f60","email":"sa@gmail.com","password_hash":"sa@2026","full_name":"Harsh","role":"super_admin","is_active":true,"created_at":"2026-03-23T10:18:02.313841+00:00","updated_at":"2026-03-28T18:51:50.996925+00:00","team_id":"JA","upi_id":"harshgarg111@oksbi"},
+        {"id":"cdc4c4e5-1201-48c8-99e4-e81d1c9e20fd","email":"vijay@majaa.com","password_hash":"vijay@ddn","full_name":"Vijay Sahni","role":"delivery_rep","is_active":true,"created_at":"2026-03-26T18:42:40.821758+00:00","updated_at":"2026-03-29T08:47:58.833427+00:00","team_id":"JA","upi_id":"harshgarg111@oksbi"}
+      ]
+    },
+    "customers": {
+      "status": "ok",
+      "row_count": 13,
+      "data": [
+        {"id":"c001","name":"Sunrise General Store","address":"12 North Main St, Sector 4","phone":"+91 98765 43210","type":"General Trade","beat_id":"bt-a","beat":"Beat A – North","last_order_value":280.35,"last_order_date":"2026-03-25","created_at":"2026-03-23T07:36:32.188972+00:00","updated_at":"2026-03-25T12:55:32.040467+00:00","delivery_route":null,"team_id":"JA","beat_ja_id":null,"beat_ma_id":null,"outstanding_ja":0.00,"outstanding_ma":0.00},
+        {"id":"c002","name":"City Corner Shop","address":"45 North Ave, Block B","phone":"+91 87654 32109","type":"Convenience","beat_id":"bt-a","beat":"Beat A – North","last_order_value":2129.60,"last_order_date":"2026-03-24","created_at":"2026-03-23T07:36:32.188972+00:00","updated_at":"2026-03-24T12:47:26.414286+00:00","delivery_route":null,"team_id":"JA","beat_ja_id":null,"beat_ma_id":null,"outstanding_ja":0.00,"outstanding_ma":0.00},
+        {"id":"c003","name":"Fresh & Fast Mart","address":"7 North Ring Rd","phone":"+91 76543 21098","type":"Supermarket","beat_id":"bt-a","beat":"Beat A – North","last_order_value":378.00,"last_order_date":"2026-03-25","created_at":"2026-03-23T07:36:32.188972+00:00","updated_at":"2026-03-25T14:26:52.122223+00:00","delivery_route":null,"team_id":"JA","beat_ja_id":null,"beat_ma_id":null,"outstanding_ja":0.00,"outstanding_ma":0.00},
+        {"id":"c004","name":"Daily Needs Depot","address":"23 North Cross Rd","phone":"+91 65432 10987","type":"General Trade","beat_id":"bt-a","beat":"Beat A – North","last_order_value":560.70,"last_order_date":"2026-03-25","created_at":"2026-03-23T07:36:32.188972+00:00","updated_at":"2026-03-25T12:10:09.018527+00:00","delivery_route":null,"team_id":"JA","beat_ja_id":null,"beat_ma_id":null,"outstanding_ja":0.00,"outstanding_ma":0.00},
+        {"id":"c005","name":"Metro Mart Pvt Ltd","address":"88 South Blvd, Zone 2","phone":"+91 54321 09876","type":"Supermarket","beat_id":"bt-b","beat":"Beat B – South","last_order_value":876.00,"last_order_date":"2026-03-21","created_at":"2026-03-23T07:36:32.188972+00:00","updated_at":"2026-03-23T07:36:32.188972+00:00","delivery_route":null,"team_id":"JA","beat_ja_id":null,"beat_ma_id":null,"outstanding_ja":0.00,"outstanding_ma":0.00},
+        {"id":"c006","name":"Handy Mart","address":"3 South Lane, Colony 5","phone":"+91 43210 98765","type":"Convenience","beat_id":"bt-b","beat":"Beat B – South","last_order_value":320.00,"last_order_date":"2026-03-17","created_at":"2026-03-23T07:36:32.188972+00:00","updated_at":"2026-03-23T07:36:32.188972+00:00","delivery_route":null,"team_id":"JA","beat_ja_id":null,"beat_ma_id":null,"outstanding_ja":0.00,"outstanding_ma":0.00},
+        {"id":"c007","name":"Value Bazaar","address":"56 South Market Rd","phone":"+91 32109 87654","type":"General Trade","beat_id":"bt-b","beat":"Beat B – South","last_order_value":3003.00,"last_order_date":"2026-03-23","created_at":"2026-03-23T07:36:32.188972+00:00","updated_at":"2026-03-23T12:44:10.030535+00:00","delivery_route":null,"team_id":"JA","beat_ja_id":null,"beat_ma_id":null,"outstanding_ja":0.00,"outstanding_ma":0.00},
+        {"id":"c008","name":"Quick Pick Superstore","address":"101 East Highway, Sector 9","phone":"+919045000051","type":"Supermarket","beat_id":"bt-c","beat":"Beat C – East","last_order_value":2142.00,"last_order_date":"2026-03-29","created_at":"2026-03-23T07:36:32.188972+00:00","updated_at":"2026-03-29T14:48:48.479458+00:00","delivery_route":null,"team_id":"JA","beat_ja_id":null,"beat_ma_id":null,"outstanding_ja":0.00,"outstanding_ma":0.00},
+        {"id":"c009","name":"East End Grocers","address":"34 East Park Rd","phone":"+91 9045000051","type":"General Trade","beat_id":"bt-c","beat":"Beat C – East","last_order_value":9665.25,"last_order_date":"2026-03-29","created_at":"2026-03-23T07:36:32.188972+00:00","updated_at":"2026-03-29T13:50:09.820303+00:00","delivery_route":null,"team_id":"JA","beat_ja_id":null,"beat_ma_id":null,"outstanding_ja":0.00,"outstanding_ma":0.00},
+        {"id":"c010","name":"Ramu kaka store","address":"67 East Colony","phone":"+91 9634327340","type":"Convenience","beat_id":"bt-c","beat":"Beat C – East","last_order_value":101.85,"last_order_date":"2026-03-28","created_at":"2026-03-23T07:36:32.188972+00:00","updated_at":"2026-03-28T06:32:32.100574+00:00","delivery_route":null,"team_id":"JA","beat_ja_id":null,"beat_ma_id":null,"outstanding_ja":0.00,"outstanding_ma":0.00},
+        {"id":"c011","name":"Family Needs Store","address":"22 West End Rd, Block A","phone":"+91 88765 43210","type":"General Trade","beat_id":"bt-d","beat":"Beat D – West","last_order_value":161.70,"last_order_date":"2026-03-23","created_at":"2026-03-23T07:36:32.188972+00:00","updated_at":"2026-03-23T09:33:49.17543+00:00","delivery_route":null,"team_id":"JA","beat_ja_id":null,"beat_ma_id":null,"outstanding_ja":0.00,"outstanding_ma":0.00},
+        {"id":"c012","name":"West Gate Mart","address":"9 West Gate Colony","phone":"+91 77654 32109","type":"Convenience","beat_id":"bt-d","beat":"Beat D – West","last_order_value":280.50,"last_order_date":"2026-03-23","created_at":"2026-03-23T07:36:32.188972+00:00","updated_at":"2026-03-23T09:33:30.797949+00:00","delivery_route":null,"team_id":"JA","beat_ja_id":null,"beat_ma_id":null,"outstanding_ja":0.00,"outstanding_ma":0.00},
+        {"id":"c013","name":"Wholesale Hub","address":"45 West Industrial Area","phone":"+91 66543 21098","type":"Wholesale","beat_id":"bt-d","beat":"Beat D – West","last_order_value":1134.00,"last_order_date":"2026-03-25","created_at":"2026-03-23T07:36:32.188972+00:00","updated_at":"2026-03-25T12:11:52.54999+00:00","delivery_route":null,"team_id":"JA","beat_ja_id":null,"beat_ma_id":null,"outstanding_ja":0.00,"outstanding_ma":0.00}
+      ]
+    },
+    "products": {
+      "status": "ok",
+      "row_count": 6,
+      "data": [
+        {"id":"p001","name":"NG CASHEWS JUMBO 200GM","sku":"NUTTY-p001","category":"Nutty","brand":"NUTTY","unit_price":390.00,"pack_size":"200G","status":"available","stock_qty":100,"image_url":"","semantic_label":"NUTTY Cashews Jumbo 200g pack","created_at":"2026-03-23T08:16:54.150748+00:00","updated_at":"2026-03-25T07:07:31.5106+00:00","gst_rate":0.05,"step_size":1,"team_id":"JA","subcategory_id":null},
+        {"id":"p002","name":"NG CALIFORNIA ALMOND 200G","sku":"NUTTY-p002","category":"Nutty","brand":"NUTTY","unit_price":385.00,"pack_size":"200G","status":"available","stock_qty":100,"image_url":"","semantic_label":"NUTTY California Almond 200g pack","created_at":"2026-03-23T08:16:54.150748+00:00","updated_at":"2026-03-25T07:07:17.933811+00:00","gst_rate":0.05,"step_size":1,"team_id":"JA","subcategory_id":null},
+        {"id":"p003","name":"NG WALNUTS KERNEL 200GM","sku":"NUTTY-p003","category":"","brand":"NUTTY","unit_price":555.00,"pack_size":"200G","status":"available","stock_qty":100,"image_url":"","semantic_label":"NUTTY Walnuts Kernel 200g pack","created_at":"2026-03-23T08:16:54.150748+00:00","updated_at":"2026-03-29T11:34:19.627777+00:00","gst_rate":0.05,"step_size":1,"team_id":"JA","subcategory_id":null},
+        {"id":"p004","name":"NG BRAZIL NUTS 150GM","sku":"NUTTY-p004","category":"","brand":"NUTTY","unit_price":645.00,"pack_size":"150G","status":"available","stock_qty":100,"image_url":"","semantic_label":"NUTTY Brazil Nuts 150g pack","created_at":"2026-03-23T08:16:54.150748+00:00","updated_at":"2026-03-29T11:34:39.389989+00:00","gst_rate":0.05,"step_size":1,"team_id":"JA","subcategory_id":null},
+        {"id":"p005","name":"NG MACADAMIA NUTS 100GM","sku":"NUTTY-p005","category":"","brand":"NUTTY","unit_price":750.00,"pack_size":"100G","status":"available","stock_qty":100,"image_url":"","semantic_label":"NUTTY Macadamia Nuts 100g pack","created_at":"2026-03-23T08:16:54.150748+00:00","updated_at":"2026-03-29T11:34:54.229397+00:00","gst_rate":0.05,"step_size":1,"team_id":"JA","subcategory_id":null},
+        {"id":"p006","name":"NG PINE NUT 100GM","sku":"NUTTY-p006","category":"","brand":"NUTTY","unit_price":900.00,"pack_size":"100G","status":"available","stock_qty":100,"image_url":"","semantic_label":"NUTTY Pine Nut 100g pack","created_at":"2026-03-23T08:16:54.150748+00:00","updated_at":"2026-03-29T11:34:54.999949+00:00","gst_rate":0.05,"step_size":1,"team_id":"JA","subcategory_id":null}
+      ]
+    },
+    "product_categories": {
+      "status": "ok",
+      "row_count": 7,
+      "data": [
+        {"id":"3685bf99-2199-4980-a4da-f9595926b721","name":"Beverages","sort_order":1,"is_active":true,"created_at":"2026-03-23T12:32:53.026644+00:00","updated_at":"2026-03-23T12:32:53.026644+00:00","team_id":"JA"},
+        {"id":"b8225851-66ff-4c55-97d2-f919d958ad40","name":"Snacks","sort_order":2,"is_active":true,"created_at":"2026-03-23T12:32:53.026644+00:00","updated_at":"2026-03-23T12:32:53.026644+00:00","team_id":"JA"},
+        {"id":"82e5df01-ec87-439a-9686-821f5699edb9","name":"Dairy","sort_order":3,"is_active":true,"created_at":"2026-03-23T12:32:53.026644+00:00","updated_at":"2026-03-23T12:32:53.026644+00:00","team_id":"JA"},
+        {"id":"d1837e12-7d56-45c3-b905-5e7ffe27a596","name":"Personal Care","sort_order":4,"is_active":true,"created_at":"2026-03-23T12:32:53.026644+00:00","updated_at":"2026-03-23T12:32:53.026644+00:00","team_id":"JA"},
+        {"id":"d3d212ed-56da-498c-b9a7-ef1aa2301406","name":"Household","sort_order":5,"is_active":true,"created_at":"2026-03-23T12:32:53.026644+00:00","updated_at":"2026-03-23T12:32:53.026644+00:00","team_id":"JA"},
+        {"id":"4a5c9211-e6df-429f-9654-e73cc9aa8f81","name":"Nutty","sort_order":6,"is_active":true,"created_at":"2026-03-23T12:32:53.026644+00:00","updated_at":"2026-03-23T12:32:53.026644+00:00","team_id":"JA"},
+        {"id":"126b7325-ff38-4cf3-8728-65d49b27a24c","name":"Asta","sort_order":7,"is_active":true,"created_at":"2026-03-26T20:31:06.135224+00:00","updated_at":"2026-03-26T20:31:06.135224+00:00","team_id":"JA"}
+      ]
+    },
+    "product_subcategories": {
+      "status": "rls_blocked_or_empty",
+      "note": "Returned empty array []. RLS may be blocking anon SELECT, or table is empty.",
+      "row_count": 0,
+      "data": []
+    },
+    "beats": {
+      "status": "ok",
+      "row_count": 6,
+      "data": [
+        {"id":"bt-a","beat_name":"Hanuman Chowk","beat_code":"BT-A","weekdays":["Tuesday"],"created_at":"2026-03-23T07:36:32.188972+00:00","area":"","route":"","team_id":"JA"},
+        {"id":"bt-b","beat_name":"Prem Nagar","beat_code":"BT-B","weekdays":["Wednesday","sunday"],"created_at":"2026-03-23T07:36:32.188972+00:00","area":"","route":"","team_id":"JA"},
+        {"id":"bt-c","beat_name":"Beat C – East","beat_code":"BT-C","weekdays":["Wednesday","Saturday","friday","Sunday"],"created_at":"2026-03-23T07:36:32.188972+00:00","area":"","route":"","team_id":"JA"},
+        {"id":"bt-d","beat_name":"Kargi","beat_code":"BT-D","weekdays":["Monday"],"created_at":"2026-03-23T07:36:32.188972+00:00","area":"","route":"","team_id":"JA"},
+        {"id":"bt-e","beat_name":"Raipur","beat_code":"BT-E","weekdays":["THRUSDAY"],"created_at":"2026-03-25T12:26:08.523502+00:00","area":"","route":"","team_id":"JA"},
+        {"id":"bt-f","beat_name":"Clement Town 1st","beat_code":"BT-F","weekdays":["Friday"],"created_at":"2026-03-25T12:28:27.569838+00:00","area":"","route":"","team_id":"JA"}
+      ]
+    },
+    "orders": {
+      "status": "ok",
+      "row_count": 5,
+      "data": [
+        {"id":"ORD-536669","customer_id":"c009","customer_name":"East End Grocers","beat_name":"Beat C – East","order_date":"2026-03-29T17:12:17.673945+00:00","delivery_date":"2026-03-29","subtotal":2060.00,"vat":103.00,"grand_total":2163.00,"item_count":2,"total_units":4,"status":"Delivered","notes":null,"created_at":"2026-03-29T11:42:17.51119+00:00","updated_at":"2026-03-29T13:17:09.174545+00:00","user_id":"958f9ea4-c98f-41ee-b533-fb54b1323f8f","delivered_at":null,"team_id":"JA","final_bill_no":null,"actual_billed_amount":null,"bill_no":null,"bill_photo_url":null,"bill_amount":null,"verified_by_office":false,"verified_by_delivery":false},
+        {"id":"ORD-584427","customer_id":"c009","customer_name":"East End Grocers","beat_name":"Beat C – East","order_date":"2026-03-29T17:46:25.826546+00:00","delivery_date":"2026-03-29","subtotal":385.00,"vat":19.25,"grand_total":404.25,"item_count":1,"total_units":1,"status":"Delivered","notes":null,"created_at":"2026-03-29T12:16:25.634479+00:00","updated_at":"2026-03-29T13:17:11.43177+00:00","user_id":"958f9ea4-c98f-41ee-b533-fb54b1323f8f","delivered_at":null,"team_id":"JA","final_bill_no":null,"actual_billed_amount":null,"bill_no":null,"bill_photo_url":null,"bill_amount":null,"verified_by_office":false,"verified_by_delivery":false},
+        {"id":"ORD-259769","customer_id":"c009","customer_name":"East End Grocers","beat_name":"Beat C – East","order_date":"2026-03-29T18:47:41.414559+00:00","delivery_date":"2026-03-29","subtotal":770.00,"vat":38.50,"grand_total":808.50,"item_count":1,"total_units":2,"status":"Pending","notes":null,"created_at":"2026-03-29T13:17:41.197673+00:00","updated_at":"2026-03-29T13:17:41.197673+00:00","user_id":"958f9ea4-c98f-41ee-b533-fb54b1323f8f","delivered_at":null,"team_id":"JA","final_bill_no":null,"actual_billed_amount":null,"bill_no":null,"bill_photo_url":null,"bill_amount":null,"verified_by_office":false,"verified_by_delivery":false},
+        {"id":"ORD-202684","customer_id":"c009","customer_name":"East End Grocers","beat_name":"Beat C – East","order_date":"2026-03-29T19:20:08.959879+00:00","delivery_date":"2026-03-29","subtotal":9205.00,"vat":460.25,"grand_total":9665.25,"item_count":4,"total_units":22,"status":"Delivered","notes":null,"created_at":"2026-03-29T13:50:08.774215+00:00","updated_at":"2026-03-29T13:50:49.828035+00:00","user_id":"958f9ea4-c98f-41ee-b533-fb54b1323f8f","delivered_at":null,"team_id":"JA","final_bill_no":null,"actual_billed_amount":null,"bill_no":null,"bill_photo_url":null,"bill_amount":null,"verified_by_office":false,"verified_by_delivery":false},
+        {"id":"ORD-725798","customer_id":"c008","customer_name":"Quick Pick Superstore","beat_name":"Beat C – East","order_date":"2026-03-29T20:18:47.57845+00:00","delivery_date":"2026-03-29","subtotal":2040.00,"vat":102.00,"grand_total":2142.00,"item_count":3,"total_units":3,"status":"Pending","notes":null,"created_at":"2026-03-29T14:48:47.389217+00:00","updated_at":"2026-03-29T14:48:47.389217+00:00","user_id":"958f9ea4-c98f-41ee-b533-fb54b1323f8f","delivered_at":null,"team_id":"JA","final_bill_no":null,"actual_billed_amount":null,"bill_no":null,"bill_photo_url":null,"bill_amount":null,"verified_by_office":false,"verified_by_delivery":false}
+      ]
+    },
+    "order_items": {
+      "status": "ok",
+      "row_count": 11,
+      "data": [
+        {"id":"40fadd06-9a75-42e1-83e3-aecbef1524e2","order_id":"ORD-536669","product_id":"p002","product_name":"NG CALIFORNIA ALMOND 200G","sku":"NUTTY-p002","quantity":2,"unit_price":385.00,"line_total":770.00,"created_at":"2026-03-29T11:42:19.287425+00:00","gst_rate":null,"user_id":"958f9ea4-c98f-41ee-b533-fb54b1323f8f"},
+        {"id":"088a254d-937f-4501-925e-01c823da3694","order_id":"ORD-536669","product_id":"p004","product_name":"NG BRAZIL NUTS 150GM","sku":"NUTTY-p004","quantity":2,"unit_price":645.00,"line_total":1290.00,"created_at":"2026-03-29T11:42:19.287425+00:00","gst_rate":null,"user_id":"958f9ea4-c98f-41ee-b533-fb54b1323f8f"},
+        {"id":"6f5bb4ac-5f80-4be3-a7f0-ff76ae36fc61","order_id":"ORD-584427","product_id":"p002","product_name":"NG CALIFORNIA ALMOND 200G","sku":"NUTTY-p002","quantity":1,"unit_price":385.00,"line_total":385.00,"created_at":"2026-03-29T12:16:26.272484+00:00","gst_rate":null,"user_id":"958f9ea4-c98f-41ee-b533-fb54b1323f8f"},
+        {"id":"65178fd6-002d-42b1-a003-9a7d4579f873","order_id":"ORD-259769","product_id":"p002","product_name":"NG CALIFORNIA ALMOND 200G","sku":"NUTTY-p002","quantity":2,"unit_price":385.00,"line_total":770.00,"created_at":"2026-03-29T13:17:41.70136+00:00","gst_rate":null,"user_id":"958f9ea4-c98f-41ee-b533-fb54b1323f8f"},
+        {"id":"41e19c41-429b-4ea9-9b4d-160dc8d0de5e","order_id":"ORD-202684","product_id":"p002","product_name":"NG CALIFORNIA ALMOND 200G","sku":"NUTTY-p002","quantity":10,"unit_price":385.00,"line_total":3850.00,"created_at":"2026-03-29T13:50:09.469868+00:00","gst_rate":null,"user_id":"958f9ea4-c98f-41ee-b533-fb54b1323f8f"},
+        {"id":"73e75fe6-a159-4832-8b3d-894851fd0348","order_id":"ORD-202684","product_id":"p001","product_name":"NG CASHEWS JUMBO 200GM","sku":"NUTTY-p001","quantity":10,"unit_price":390.00,"line_total":3900.00,"created_at":"2026-03-29T13:50:09.469868+00:00","gst_rate":null,"user_id":"958f9ea4-c98f-41ee-b533-fb54b1323f8f"},
+        {"id":"c796ef02-8126-4004-af16-67aa2c796294","order_id":"ORD-202684","product_id":"p006","product_name":"NG PINE NUT 100GM","sku":"NUTTY-p006","quantity":1,"unit_price":900.00,"line_total":900.00,"created_at":"2026-03-29T13:50:09.469868+00:00","gst_rate":null,"user_id":"958f9ea4-c98f-41ee-b533-fb54b1323f8f"},
+        {"id":"446f97ad-032a-42a3-a8e8-f8fb0e998c8b","order_id":"ORD-202684","product_id":"p003","product_name":"NG WALNUTS KERNEL 200GM","sku":"NUTTY-p003","quantity":1,"unit_price":555.00,"line_total":555.00,"created_at":"2026-03-29T13:50:09.469868+00:00","gst_rate":null,"user_id":"958f9ea4-c98f-41ee-b533-fb54b1323f8f"},
+        {"id":"638fba09-d9fc-4bc6-bbfb-36f85ec09b1b","order_id":"ORD-725798","product_id":"p005","product_name":"NG MACADAMIA NUTS 100GM","sku":"NUTTY-p005","quantity":1,"unit_price":750.00,"line_total":750.00,"created_at":"2026-03-29T14:48:48.180048+00:00","gst_rate":null,"user_id":"958f9ea4-c98f-41ee-b533-fb54b1323f8f"},
+        {"id":"e4eef418-c41a-42cf-b54d-6d2105b818d0","order_id":"ORD-725798","product_id":"p001","product_name":"NG CASHEWS JUMBO 200GM","sku":"NUTTY-p001","quantity":1,"unit_price":390.00,"line_total":390.00,"created_at":"2026-03-29T14:48:48.180048+00:00","gst_rate":null,"user_id":"958f9ea4-c98f-41ee-b533-fb54b1323f8f"},
+        {"id":"affd3198-9b4c-48d8-a632-9a5c5714c64d","order_id":"ORD-725798","product_id":"p006","product_name":"NG PINE NUT 100GM","sku":"NUTTY-p006","quantity":1,"unit_price":900.00,"line_total":900.00,"created_at":"2026-03-29T14:48:48.180048+00:00","gst_rate":null,"user_id":"958f9ea4-c98f-41ee-b533-fb54b1323f8f"}
+      ]
+    },
+    "collections": {
+      "status": "rls_blocked_or_empty",
+      "note": "Returned empty array []. RLS may be blocking anon SELECT, or table is empty.",
+      "row_count": 0,
+      "data": []
+    },
+    "visit_logs": {
+      "status": "rls_blocked_or_empty",
+      "note": "Returned empty array []. RLS may be blocking anon SELECT, or table is empty.",
+      "row_count": 0,
+      "data": []
+    },
+    "user_beats": {
+      "status": "ok",
+      "row_count": 12,
+      "data": [
+        {"id":"7bdf684c-33be-45bd-8f90-241fb825a222","user_id":"857e1d6f-7698-4e35-9a60-e9abbde6098c","beat_id":"bt-a","assigned_at":"2026-03-23T10:22:22.625479+00:00"},
+        {"id":"d92ae293-fce6-4740-8073-b4b148709ad5","user_id":"857e1d6f-7698-4e35-9a60-e9abbde6098c","beat_id":"bt-b","assigned_at":"2026-03-23T10:22:22.625479+00:00"},
+        {"id":"b8dd7b4d-5b81-4a78-a24a-ad7346e00bd4","user_id":"857e1d6f-7698-4e35-9a60-e9abbde6098c","beat_id":"bt-c","assigned_at":"2026-03-23T10:34:05.464205+00:00"},
+        {"id":"3d2ba8b5-13aa-47e4-8e59-ece397880c73","user_id":"d02c75fc-f645-4a2b-8a3c-b2faf207d56b","beat_id":"bt-d","assigned_at":"2026-03-23T12:49:32.704504+00:00"},
+        {"id":"c15b5a59-f580-41b1-8beb-ab51b893feca","user_id":"d02c75fc-f645-4a2b-8a3c-b2faf207d56b","beat_id":"bt-c","assigned_at":"2026-03-23T12:49:32.704504+00:00"},
+        {"id":"851c6732-bb89-413c-9898-1101ce7ae9f8","user_id":"d02c75fc-f645-4a2b-8a3c-b2faf207d56b","beat_id":"bt-a","assigned_at":"2026-03-23T12:49:32.704504+00:00"},
+        {"id":"02f242b5-582b-4da9-bf72-9feeab534e88","user_id":"c2daf66d-816c-4411-8c87-cb961bb60cb4","beat_id":"bt-d","assigned_at":"2026-03-25T13:54:23.796016+00:00"},
+        {"id":"350717d1-f0a5-4ba8-b1d0-f3324c1bd0f5","user_id":"c2daf66d-816c-4411-8c87-cb961bb60cb4","beat_id":"bt-a","assigned_at":"2026-03-25T13:54:23.796016+00:00"},
+        {"id":"2a19c9f5-8b63-4ceb-877a-6f103b2296d0","user_id":"c2daf66d-816c-4411-8c87-cb961bb60cb4","beat_id":"bt-b","assigned_at":"2026-03-25T13:54:23.796016+00:00"},
+        {"id":"c6a12099-1c1a-453e-894b-5ad6788ee107","user_id":"c2daf66d-816c-4411-8c87-cb961bb60cb4","beat_id":"bt-e","assigned_at":"2026-03-25T13:54:23.796016+00:00"},
+        {"id":"6d90d682-39d2-4663-8ef7-db3b4ea5de20","user_id":"c2daf66d-816c-4411-8c87-cb961bb60cb4","beat_id":"bt-f","assigned_at":"2026-03-25T13:54:23.796016+00:00"},
+        {"id":"70a30bae-e6b3-4505-ae66-46b235f2ded2","user_id":"c2daf66d-816c-4411-8c87-cb961bb60cb4","beat_id":"bt-c","assigned_at":"2026-03-25T13:54:23.796016+00:00"}
+      ]
+    },
+    "app_settings": {
+      "status": "ok",
+      "row_count": 1,
+      "data": [
+        {"id":1,"latest_version":"1.0.0","mandatory_update":true,"apk_download_url":"https://drive.google.com/uc?export=download&id=REPLACE_ME_LATER"}
+      ]
+    },
+    "app_versions": {
+      "status": "rls_blocked_or_empty",
+      "note": "Returned empty array []. RLS may be blocking anon SELECT, or table is empty.",
+      "row_count": 0,
+      "data": []
+    }
+  }
+}

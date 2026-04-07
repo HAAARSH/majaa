@@ -1,0 +1,50 @@
+{
+  "note": "First 3 rows of each accessible table. Generated 2026-03-30.",
+  "app_users": [
+    {"id":"857e1d6f-7698-4e35-9a60-e9abbde6098c","email":"james.okonkwo@fmcgorders.com","full_name":"James Okonkwo","role":"sales_rep","team_id":"JA","is_active":true},
+    {"id":"5c8225c2-f57e-4d47-9c13-2a4b43deeeb1","email":"adi@gmail.com","full_name":"Aditiya","role":"sales_rep","team_id":"JA","is_active":true},
+    {"id":"c2daf66d-816c-4411-8c87-cb961bb60cb4","email":"ranjeet@majaa.com","full_name":"Ranjeet Yadav","role":"sales_rep","team_id":"JA","is_active":true}
+  ],
+  "customers": [
+    {"id":"c001","name":"Sunrise General Store","beat_id":"bt-a","type":"General Trade","team_id":"JA","beat_ja_id":null,"beat_ma_id":null},
+    {"id":"c002","name":"City Corner Shop","beat_id":"bt-a","type":"Convenience","team_id":"JA","beat_ja_id":null,"beat_ma_id":null},
+    {"id":"c003","name":"Fresh & Fast Mart","beat_id":"bt-a","type":"Supermarket","team_id":"JA","beat_ja_id":null,"beat_ma_id":null}
+  ],
+  "products": [
+    {"id":"p001","name":"NG CASHEWS JUMBO 200GM","sku":"NUTTY-p001","category":"Nutty","unit_price":390.00,"subcategory_id":null,"team_id":"JA"},
+    {"id":"p002","name":"NG CALIFORNIA ALMOND 200G","sku":"NUTTY-p002","category":"Nutty","unit_price":385.00,"subcategory_id":null,"team_id":"JA"},
+    {"id":"p003","name":"NG WALNUTS KERNEL 200GM","sku":"NUTTY-p003","category":"","unit_price":555.00,"subcategory_id":null,"team_id":"JA"}
+  ],
+  "product_categories": [
+    {"id":"3685bf99-2199-4980-a4da-f9595926b721","name":"Beverages","sort_order":1,"team_id":"JA"},
+    {"id":"b8225851-66ff-4c55-97d2-f919d958ad40","name":"Snacks","sort_order":2,"team_id":"JA"},
+    {"id":"82e5df01-ec87-439a-9686-821f5699edb9","name":"Dairy","sort_order":3,"team_id":"JA"}
+  ],
+  "product_subcategories": "EMPTY or RLS-blocked — no rows returned",
+  "beats": [
+    {"id":"bt-a","beat_name":"Hanuman Chowk","beat_code":"BT-A","weekdays":["Tuesday"],"team_id":"JA"},
+    {"id":"bt-b","beat_name":"Prem Nagar","beat_code":"BT-B","weekdays":["Wednesday","sunday"],"team_id":"JA"},
+    {"id":"bt-c","beat_name":"Beat C – East","beat_code":"BT-C","weekdays":["Wednesday","Saturday","friday","Sunday"],"team_id":"JA"}
+  ],
+  "orders": [
+    {"id":"ORD-536669","customer_id":"c009","status":"Delivered","grand_total":2163.00,"bill_no":null,"verified_by_office":false,"verified_by_delivery":false},
+    {"id":"ORD-584427","customer_id":"c009","status":"Delivered","grand_total":404.25,"bill_no":null,"verified_by_office":false,"verified_by_delivery":false},
+    {"id":"ORD-259769","customer_id":"c009","status":"Pending","grand_total":808.50,"bill_no":null,"verified_by_office":false,"verified_by_delivery":false}
+  ],
+  "order_items": [
+    {"id":"40fadd06-9a75-42e1-83e3-aecbef1524e2","order_id":"ORD-536669","product_id":"p002","quantity":2,"unit_price":385.00,"line_total":770.00,"gst_rate":null},
+    {"id":"088a254d-937f-4501-925e-01c823da3694","order_id":"ORD-536669","product_id":"p004","quantity":2,"unit_price":645.00,"line_total":1290.00,"gst_rate":null},
+    {"id":"6f5bb4ac-5f80-4be3-a7f0-ff76ae36fc61","order_id":"ORD-584427","product_id":"p002","quantity":1,"unit_price":385.00,"line_total":385.00,"gst_rate":null}
+  ],
+  "collections": "EMPTY or RLS-blocked — no rows returned",
+  "visit_logs": "EMPTY or RLS-blocked — no rows returned",
+  "user_beats": [
+    {"id":"7bdf684c-33be-45bd-8f90-241fb825a222","user_id":"857e1d6f-7698-4e35-9a60-e9abbde6098c","beat_id":"bt-a"},
+    {"id":"d92ae293-fce6-4740-8073-b4b148709ad5","user_id":"857e1d6f-7698-4e35-9a60-e9abbde6098c","beat_id":"bt-b"},
+    {"id":"b8dd7b4d-5b81-4a78-a24a-ad7346e00bd4","user_id":"857e1d6f-7698-4e35-9a60-e9abbde6098c","beat_id":"bt-c"}
+  ],
+  "app_settings": [
+    {"id":1,"latest_version":"1.0.0","mandatory_update":true,"apk_download_url":"https://drive.google.com/uc?export=download&id=REPLACE_ME_LATER"}
+  ],
+  "app_versions": "EMPTY or RLS-blocked — no rows returned"
+}
