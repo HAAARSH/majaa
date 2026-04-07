@@ -4,9 +4,9 @@ from supabase import create_client, Client
 
 # ─── 1. YOUR SUPABASE CREDENTIALS ───
 
-SUPABASE_URL = "https://ctrmpwmnnvvsciqouqyo.supabase.co"
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImN0cm1wd21ubnZ2c2NpcW91cXlvIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NDI0ODMyNywiZXhwIjoyMDg5ODI0MzI3fQ.GyYfpB9I5-dJNP-oNjqmssGQNCNJqNluabIKZUNwBM8" 
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 
 # ─── 2. UPDATE THESE FOR EACH NEW RELEASE ───
 

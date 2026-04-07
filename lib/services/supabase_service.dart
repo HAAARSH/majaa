@@ -683,7 +683,12 @@ class SupabaseService {
         .toList();
   }
 
+  static const validOrderStatuses = ['Pending', 'Confirmed', 'Delivered', 'Cancelled'];
+
   Future<void> updateOrderStatus(String orderId, String status) async {
+    if (!validOrderStatuses.contains(status)) {
+      throw ArgumentError('Invalid order status: $status. Must be one of: $validOrderStatuses');
+    }
     await client.from('orders').update({'status': status}).eq('id', orderId);
   }
 
@@ -870,7 +875,7 @@ class SupabaseService {
         .select('grand_total, beat, order_date')
         .gte('order_date', startOfMonth)
         .lte('order_date', endOfMonth)
-        .eq('user_id', currentUserId!);
+        .eq('user_id', currentUserId ?? '');
 
     final List<dynamic> orders = response as List<dynamic>;
 

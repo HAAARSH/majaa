@@ -86,14 +86,14 @@ class _OrderCreationScreenState extends State<OrderCreationScreen>
             })
         .toList();
 
-    final subtotal = cartItems.fold(
-        0.0, (sum, item) => sum + item.product.unitPrice * item.quantity);
-    final totalGst = cartItems.fold(
+    final subtotal = double.parse(cartItems.fold(
+        0.0, (sum, item) => sum + item.product.unitPrice * item.quantity).toStringAsFixed(2));
+    final totalGst = double.parse(cartItems.fold(
         0.0,
         (sum, item) =>
             sum +
-            (item.product.unitPrice * item.quantity * item.product.gstRate));
-    final grandTotal = subtotal + totalGst;
+            (item.product.unitPrice * item.quantity * item.product.gstRate)).toStringAsFixed(2));
+    final grandTotal = double.parse((subtotal + totalGst).toStringAsFixed(2));
     final totalUnits = cartItems.fold(0, (sum, item) => sum + item.quantity);
     final deliveryDate = DateTime.now();
 

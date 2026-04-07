@@ -106,7 +106,10 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
   }
 
   String _csvField(String value) {
-    final escaped = value.replaceAll('"', '""');
+    final escaped = value
+        .replaceAll('"', '""')
+        .replaceAll('\n', ' ')
+        .replaceAll('\r', ' ');
     return '"$escaped"';
   }
 

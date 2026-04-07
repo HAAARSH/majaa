@@ -12,7 +12,7 @@ class ProductDetailScreen extends StatefulWidget {
 }
 
 class _ProductDetailScreenState extends State<ProductDetailScreen> {
-  late Product _product;
+  Product? _product;
   bool _isInitialized = false;
 
   @override
@@ -20,13 +20,27 @@ class _ProductDetailScreenState extends State<ProductDetailScreen> {
     super.didChangeDependencies();
     if (!_isInitialized) {
       final args = ModalRoute.of(context)?.settings.arguments as Map?;
-      _product = args?['product'];
+      _product = args?['product'] as Product?;
       _isInitialized = true;
     }
   }
 
   @override
   Widget build(BuildContext context) {
+    if (_product == null) {
+      return Scaffold(
+        backgroundColor: AppTheme.surface,
+        appBar: AppBar(
+          title: Text('Product Details',
+              style: GoogleFonts.manrope(fontWeight: FontWeight.bold)),
+          elevation: 0,
+          backgroundColor: Colors.white,
+          foregroundColor: AppTheme.onSurface,
+        ),
+        body: const Center(child: Text('Product not found')),
+      );
+    }
+
     return Scaffold(
       backgroundColor: AppTheme.surface,
       appBar: AppBar(
@@ -63,7 +77,7 @@ class _ProductDetailScreenState extends State<ProductDetailScreen> {
                       borderRadius: BorderRadius.circular(8),
                     ),
                     child: Text(
-                      _product.sku,
+                      _product!.sku,
                       style: GoogleFonts.manrope(
                         fontSize: 12,
                         fontWeight: FontWeight.bold,
@@ -73,7 +87,7 @@ class _ProductDetailScreenState extends State<ProductDetailScreen> {
                   ),
                   const SizedBox(height: 16),
                   Text(
-                    _product.name,
+                    _product!.name,
                     style: GoogleFonts.manrope(
                       fontSize: 24,
                       fontWeight: FontWeight.w800,
@@ -82,7 +96,7 @@ class _ProductDetailScreenState extends State<ProductDetailScreen> {
                   ),
                   const SizedBox(height: 8),
                   Text(
-                    _product.category,
+                    _product!.category,
                     style: GoogleFonts.manrope(
                       fontSize: 16,
                       color: AppTheme.onSurfaceVariant,
@@ -92,7 +106,7 @@ class _ProductDetailScreenState extends State<ProductDetailScreen> {
                     Row(
                       children: [
                         Text(
-                          '₹${_product.unitPrice.toStringAsFixed(2)}',
+                          '₹${_product!.unitPrice.toStringAsFixed(2)}',
                           style: GoogleFonts.manrope(
                             fontSize: 28,
                             fontWeight: FontWeight.w900,
@@ -101,16 +115,16 @@ class _ProductDetailScreenState extends State<ProductDetailScreen> {
                         ),
                         const SizedBox(width: 12),
                         Text(
-                          'per ${_product.unit}',
+                          'per ${_product!.unit}',
                           style: GoogleFonts.manrope(
                             fontSize: 14,
                             color: AppTheme.onSurfaceVariant,
                           ),
                         ),
-                        if (_product.packSize.isNotEmpty) ...[
+                        if (_product!.packSize.isNotEmpty) ...[
                           const SizedBox(width: 8),
                           Text(
-                            '(${_product.packSize})',
+                            '(${_product!.packSize})',
                             style: GoogleFonts.manrope(
                               fontSize: 12,
                               color: AppTheme.onSurfaceVariant,
@@ -141,12 +155,12 @@ class _ProductDetailScreenState extends State<ProductDetailScreen> {
                     Container(
                       padding: const EdgeInsets.all(12),
                       decoration: BoxDecoration(
-                        color: _product.stockQty > 0 ? AppTheme.statusAvailableContainer : AppTheme.errorContainer,
+                        color: _product!.stockQty > 0 ? AppTheme.statusAvailableContainer : AppTheme.errorContainer,
                         shape: BoxShape.circle,
                       ),
                       child: Icon(
                         Icons.inventory_2_rounded,
-                        color: _product.stockQty > 0 ? AppTheme.statusAvailable : AppTheme.error,
+                        color: _product!.stockQty > 0 ? AppTheme.statusAvailable : AppTheme.error,
                       ),
                     ),
                     const SizedBox(width: 16),
@@ -162,7 +176,7 @@ class _ProductDetailScreenState extends State<ProductDetailScreen> {
                             ),
                           ),
                           Text(
-                            '${_product.stockQty} Units Available',
+                            '${_product!.stockQty} Units Available',
                             style: GoogleFonts.manrope(
                               fontSize: 18,
                               fontWeight: FontWeight.bold,
@@ -175,15 +189,15 @@ class _ProductDetailScreenState extends State<ProductDetailScreen> {
                     Container(
                       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
                       decoration: BoxDecoration(
-                        color: _product.status == ProductStatus.available ? AppTheme.statusAvailableContainer : AppTheme.errorContainer,
+                        color: _product!.status == ProductStatus.available ? AppTheme.statusAvailableContainer : AppTheme.errorContainer,
                         borderRadius: BorderRadius.circular(20),
                       ),
                       child: Text(
-                        _product.status.name.toUpperCase(),
+                        _product!.status.name.toUpperCase(),
                         style: GoogleFonts.manrope(
                           fontSize: 10,
                           fontWeight: FontWeight.bold,
-                          color: _product.status == ProductStatus.available ? AppTheme.statusAvailable : AppTheme.error,
+                          color: _product!.status == ProductStatus.available ? AppTheme.statusAvailable : AppTheme.error,
                         ),
                       ),
                     ),
@@ -209,11 +223,11 @@ class _ProductDetailScreenState extends State<ProductDetailScreen> {
                     ),
                   ),
                   const SizedBox(height: 16),
-                  _buildInfoRow('Pack Size', _product.packSize),
-                  _buildInfoRow('Step Size', '${_product.stepSize} ${_product.unit}'),
-                  _buildInfoRow('Category', _product.category),
-                  _buildInfoRow('SKU Code', _product.sku),
-                  _buildInfoRow('Tax Rate', '18% GST (Included)'),
+                  _buildInfoRow('Pack Size', _product!.packSize),
+                  _buildInfoRow('Step Size', '${_product!.stepSize} ${_product!.unit}'),
+                  _buildInfoRow('Category', _product!.category),
+                  _buildInfoRow('SKU Code', _product!.sku),
+                  _buildInfoRow('Tax Rate', '${(_product!.gstRate * 100).toStringAsFixed(0)}% GST (Included)'),
                 ],
               ),
             ),

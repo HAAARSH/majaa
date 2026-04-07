@@ -43,10 +43,10 @@ CREATE POLICY "public_write_user_beats" ON public.user_beats
 
 DO $$
 BEGIN
-    UPDATE public.beats SET area = 'North Zone', route = 'Route A' WHERE beat_code = 'BEAT-001';
-    UPDATE public.beats SET area = 'South Zone', route = 'Route B' WHERE beat_code = 'BEAT-002';
-    UPDATE public.beats SET area = 'East Zone',  route = 'Route C' WHERE beat_code = 'BEAT-003';
-    UPDATE public.beats SET area = 'West Zone',  route = 'Route D' WHERE beat_code = 'BEAT-004';
+    UPDATE public.beats SET area = 'North Zone', route = 'Route A' WHERE beat_code = 'BT-A';
+    UPDATE public.beats SET area = 'South Zone', route = 'Route B' WHERE beat_code = 'BT-B';
+    UPDATE public.beats SET area = 'East Zone',  route = 'Route C' WHERE beat_code = 'BT-C';
+    UPDATE public.beats SET area = 'West Zone',  route = 'Route D' WHERE beat_code = 'BT-D';
 EXCEPTION
     WHEN OTHERS THEN
         RAISE NOTICE 'Beat area/route update skipped: %', SQLERRM;

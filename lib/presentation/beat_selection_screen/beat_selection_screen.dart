@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import '../../routes/app_routes.dart';
 import '../../services/supabase_service.dart';
+import '../../services/cart_service.dart';
 import '../../services/offline_service.dart'; //
 import '../../theme/app_theme.dart';
 
@@ -50,10 +51,14 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> {
       AppUserModel? user = _currentUser;
       
       List<BeatModel> beats;
-      if (user?.assignedBeats.isNotEmpty ?? false) {
-        beats = user!.assignedBeats;
-      } else {
+      if (user != null && user.assignedBeats.isNotEmpty) {
+        beats = user.assignedBeats;
+      } else if (user != null && user.role == 'admin') {
+        // Admins can see all beats
         beats = await SupabaseService.instance.getBeats();
+      } else {
+        // Sales reps with no assigned beats see empty list
+        beats = [];
       }
 
       if (!mounted) return;
@@ -120,6 +125,10 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> {
             style: ElevatedButton.styleFrom(
                 backgroundColor: AppTheme.error, foregroundColor: Colors.white),
             onPressed: () {
+              // Clear cart and session data on logout
+              CartService.instance.clearSession();
+              SupabaseService.instance.isOfflineMode = false;
+              SupabaseService.instance.currentUserId = null;
               Navigator.pop(ctx);
               Navigator.pushNamedAndRemoveUntil(
                   context, AppRoutes.loginScreen, (route) => false);

@@ -105,17 +105,28 @@ class CartService {
     cartNotifier.value = [];
   }
 
+  void clearSession() {
+    cartNotifier.value = [];
+    currentCustomer = null;
+    currentBeat = null;
+  }
+
   // ─── CART OPERATIONS ───
   void addOrUpdateItem(Product product, int amount) {
     final items = List<CartItem>.from(cartNotifier.value);
     final index = items.indexWhere((item) => item.product.id == product.id);
 
     if (index >= 0) {
-      items[index].quantity += amount;
+      final newQty = items[index].quantity + amount;
+      // Cap at available stock
+      items[index].quantity = product.stockQty > 0
+          ? newQty.clamp(0, product.stockQty)
+          : newQty;
     } else {
-      items.add(CartItem(product: product, quantity: amount));
+      final qty = product.stockQty > 0 ? amount.clamp(0, product.stockQty) : amount;
+      if (qty > 0) items.add(CartItem(product: product, quantity: qty));
     }
-    cartNotifier.value = items; // Triggers UI rebuild automatically
+    cartNotifier.value = items;
   }
 
   void removeItem(Product product) {
@@ -140,7 +151,10 @@ class CartService {
       if (quantity <= 0) {
         items.removeAt(index);
       } else {
-        items[index].quantity = quantity;
+        // Cap at available stock
+        items[index].quantity = product.stockQty > 0
+            ? quantity.clamp(1, product.stockQty)
+            : quantity;
       }
       cartNotifier.value = items;
     }

@@ -175,7 +175,7 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen>
                           ),
                           child: Center(
                             child: Text(
-                              _customer!.name.substring(0, 1).toUpperCase(),
+                              _customer!.name.isNotEmpty ? _customer!.name.substring(0, 1).toUpperCase() : '?',
                               style: GoogleFonts.manrope(
                                 fontSize: 15,
                                 fontWeight: FontWeight.w700,

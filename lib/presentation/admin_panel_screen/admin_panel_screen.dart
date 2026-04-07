@@ -78,6 +78,13 @@ class _AdminPanelScreenState extends State<AdminPanelScreen>
     if (args is Map<String, dynamic> && args['user'] is AppUserModel) {
       _currentUser = args['user'] as AppUserModel;
     }
+    // Route guard: redirect non-admin users back to login
+    if (_currentUser != null && _currentUser!.role != 'admin') {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        Navigator.pushNamedAndRemoveUntil(
+            context, AppRoutes.loginScreen, (route) => false);
+      });
+    }
   }
 
   @override
@@ -114,6 +121,9 @@ class _AdminPanelScreenState extends State<AdminPanelScreen>
               ),
             ),
             onPressed: () {
+              // Clear session data on logout
+              SupabaseService.instance.isOfflineMode = false;
+              SupabaseService.instance.currentUserId = null;
               Navigator.pop(ctx);
               Navigator.pushNamedAndRemoveUntil(
                 context,

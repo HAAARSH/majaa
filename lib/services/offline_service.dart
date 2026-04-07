@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:shared_preferences/shared_preferences.dart';
 import './supabase_service.dart';
 
@@ -8,16 +9,24 @@ class OfflineService {
   OfflineService._internal();
 
   static const String _queueKey = 'offline_orders_queue';
+  static const String _retryKey = 'offline_orders_retry_counts';
+  static const int _maxRetries = 5;
 
   // 1. Save an order to the local device when internet fails
   Future<void> queueOrder(Map<String, dynamic> orderData) async {
     final prefs = await SharedPreferences.getInstance();
     final queue = prefs.getStringList(_queueKey) ?? [];
 
+    // Limit queue size to prevent SharedPreferences overflow
+    if (queue.length >= 500) {
+      debugPrint('Offline queue full (500). Cannot add more orders.');
+      return;
+    }
+
     queue.add(jsonEncode(orderData));
     await prefs.setStringList(_queueKey, queue);
 
-    print('Order saved offline. Total in queue: ${queue.length}');
+    debugPrint('Order saved offline. Total in queue: ${queue.length}');
   }
 
   // 2. Check how many orders are waiting to be synced
@@ -27,17 +36,18 @@ class OfflineService {
   }
 
   // 3. THE SYNC ENGINE: Push all saved orders to Supabase
-  // Renamed to syncOfflineOrders as requested
   Future<bool> syncOfflineOrders() async {
     final prefs = await SharedPreferences.getInstance();
     final queue = prefs.getStringList(_queueKey) ?? [];
+    final retryCounts = Map<String, int>.from(
+        jsonDecode(prefs.getString(_retryKey) ?? '{}') as Map);
 
     if (queue.isEmpty) {
-      print('Offline Queue is empty. Nothing to sync.');
+      debugPrint('Offline Queue is empty. Nothing to sync.');
       return true;
     }
 
-    print('Starting sync for ${queue.length} offline orders...');
+    debugPrint('Starting sync for ${queue.length} offline orders...');
 
     List<String> failedQueue = [];
     bool allSuccess = true;
@@ -45,11 +55,19 @@ class OfflineService {
     for (String orderJson in queue) {
       try {
         final orderData = jsonDecode(orderJson) as Map<String, dynamic>;
+        final orderId = orderData['orderId'] as String? ?? '';
+
+        // Skip orders that exceeded max retries
+        final retries = retryCounts[orderId] ?? 0;
+        if (retries >= _maxRetries) {
+          debugPrint('Order $orderId exceeded max retries ($_maxRetries). Skipping.');
+          continue; // Drop from queue permanently
+        }
+
         final items = List<Map<String, dynamic>>.from(orderData['items']);
 
-        // Attempt to upload to Supabase
         await SupabaseService.instance.createOrder(
-          orderId: orderData['orderId'],
+          orderId: orderId,
           customerId: orderData['customerId'],
           customerName: orderData['customerName'],
           beat: orderData['beat'],
@@ -63,23 +81,25 @@ class OfflineService {
           items: items,
         );
 
-        print('Successfully synced offline order: ${orderData['orderId']}');
+        debugPrint('Successfully synced offline order: $orderId');
+        retryCounts.remove(orderId);
       } catch (e) {
-        print('Failed to sync offline order: $e');
-        // Keep failed orders in the list to try again next time
+        debugPrint('Failed to sync offline order: $e');
+        final orderData = jsonDecode(orderJson) as Map<String, dynamic>;
+        final orderId = orderData['orderId'] as String? ?? '';
+        retryCounts[orderId] = (retryCounts[orderId] ?? 0) + 1;
         failedQueue.add(orderJson);
         allSuccess = false;
       }
     }
 
-    // 4. Update the local storage:
-    // Only the orders that failed to upload stay in the phone's memory
     await prefs.setStringList(_queueKey, failedQueue);
+    await prefs.setString(_retryKey, jsonEncode(retryCounts));
 
     if (allSuccess) {
-      print('All offline orders synced successfully!');
+      debugPrint('All offline orders synced successfully!');
     } else {
-      print('Sync partial: ${failedQueue.length} orders still pending.');
+      debugPrint('Sync partial: ${failedQueue.length} orders still pending.');
     }
 
     return allSuccess;
