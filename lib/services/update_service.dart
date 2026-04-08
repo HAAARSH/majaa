@@ -18,7 +18,12 @@ class UpdateService {
           .from('app_settings')
           .select()
           .eq('id', 1)
-          .single();
+          .maybeSingle();
+
+      if (response == null) {
+        debugPrint('No app_settings record found, skipping update check');
+        return;
+      }
 
       final String latestVersion = response['latest_version'];
       final String apkUrl = response['apk_download_url'];

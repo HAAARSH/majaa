@@ -164,7 +164,9 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> {
       if (needsHeroSelfie && mounted) {
         // Show hero selfie modal after a short delay to allow UI to render
         WidgetsBinding.instance.addPostFrameCallback((_) {
-          _showHeroSelfieModal(userId, user.fullName);
+          if (mounted) {
+            _showHeroSelfieModal(userId, user.fullName);
+          }
         });
       }
     } catch (e) {

@@ -121,7 +121,7 @@ class GoogleDriveService {
         final data = jsonDecode(rootQuery.body) as Map<String, dynamic>;
         final files = data['files'] as List?;
         if (files != null && files.isNotEmpty) {
-          rootFolderId = files.first['id'] as String?;
+          rootFolderId = files.first is Map ? files.first['id'] as String? : null;
         }
       }
       
@@ -155,7 +155,7 @@ class GoogleDriveService {
         final data = jsonDecode(subQuery.body) as Map<String, dynamic>;
         final files = data['files'] as List?;
         if (files != null && files.isNotEmpty) {
-          subFolderId = files.first['id'] as String?;
+          subFolderId = files.first is Map ? files.first['id'] as String? : null;
         }
       }
       

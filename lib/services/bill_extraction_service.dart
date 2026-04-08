@@ -238,8 +238,12 @@ IMPORTANT:
           'sgst_total': (bill['sgst'] as num?)?.toDouble(),
           'grand_total': (bill['grand_total'] as num?)?.toDouble(),
           'team_id': teamId,
-        }).select('id').single();
+        }).select('id').maybeSingle();
 
+        if (insertResult == null) {
+          debugPrint('Failed to insert bill extraction for $billNo');
+          continue;
+        }
         final extractionId = insertResult['id'] as String;
 
         // Insert line items
@@ -295,7 +299,8 @@ IMPORTANT:
     final extraction = await _client.from('bill_extractions')
         .select('customer_name_ocr')
         .eq('id', extractionId)
-        .single();
+        .maybeSingle();
+    if (extraction == null) return;
     final ocrName = (extraction['customer_name_ocr'] as String? ?? '').trim();
 
     if (ocrName.isNotEmpty) {
@@ -326,7 +331,8 @@ IMPORTANT:
       final billExtraction = await _client.from('bill_extractions')
           .select('grand_total, customer_matched')
           .eq('id', extractionId)
-          .single();
+          .maybeSingle();
+      if (billExtraction == null) return;
       final extractedTotal = (billExtraction['grand_total'] as num?)?.toDouble() ?? 0;
       final orderTotal = (matchingOrder['grand_total'] as num?)?.toDouble() ?? 0;
 

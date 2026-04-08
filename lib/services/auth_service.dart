@@ -39,7 +39,12 @@ class AuthService {
           .from('app_users')
           .select('team_id, upi_id, full_name')
           .eq('email', email.trim().toLowerCase())
-          .single();
+          .maybeSingle();
+
+      if (userData == null) {
+        debugPrint('[AuthService] No app_users record found for $email');
+        return false;
+      }
 
       // 3. Set Global Variables — clear old cache if team is switching
       final newTeam = userData['team_id'] as String? ?? 'JA';

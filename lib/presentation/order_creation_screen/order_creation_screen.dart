@@ -223,10 +223,9 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
               height: 50,
               child: FilledButton(
                 onPressed: () {
-                  Navigator.pop(context); // Close dialog
-                  Navigator.pop(context); // Pop order creation screen
-                  Navigator.pop(context); // Pop products screen
-                  Navigator.pop(context); // Pop customer detail → back to customer list
+                  // Safely pop back to root, avoiding crashes if stack is shorter than expected
+                  int popCount = 0;
+                  Navigator.of(context).popUntil((route) => popCount++ >= 4 || route.isFirst);
                 },
                 style: FilledButton.styleFrom(
                   backgroundColor: AppTheme.primary,

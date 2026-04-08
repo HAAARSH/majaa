@@ -43,7 +43,8 @@ class SupabaseService {
       // Fall back to email match
       final email = client.auth.currentUser?.email;
       if (email != null) {
-        final byEmail = await client.from('app_users').select('id').eq('email', email).single();
+        final byEmail = await client.from('app_users').select('id').eq('email', email).maybeSingle();
+        if (byEmail == null) return authUid;
         _resolvedAppUserId = byEmail['id'] as String;
         return _resolvedAppUserId!;
       }
@@ -258,7 +259,8 @@ class SupabaseService {
       final resp = await client.from('customers')
           .select('*, customer_team_profiles(id, customer_id, team_ja, team_ma, beat_id_ja, beat_name_ja, outstanding_ja, beat_id_ma, beat_name_ma, outstanding_ma)')
           .eq('id', id)
-          .single();
+          .maybeSingle();
+      if (resp == null) return null;
       return CustomerModel.fromJson(Map<String, dynamic>.from(resp));
     } catch (e) {
       debugPrint('getCustomerById error: $e');
@@ -268,7 +270,8 @@ class SupabaseService {
 
   Future<BeatModel?> getBeatById(String id) async {
     try {
-      final resp = await client.from('beats').select().eq('id', id).single();
+      final resp = await client.from('beats').select().eq('id', id).maybeSingle();
+      if (resp == null) return null;
       return BeatModel.fromJson(Map<String, dynamic>.from(resp));
     } catch (e) {
       debugPrint('getBeatById error: $e');
@@ -278,7 +281,8 @@ class SupabaseService {
 
   Future<ProductModel?> getProductById(String id) async {
     try {
-      final resp = await client.from('products').select().eq('id', id).single();
+      final resp = await client.from('products').select().eq('id', id).maybeSingle();
+      if (resp == null) return null;
       return ProductModel.fromJson(Map<String, dynamic>.from(resp));
     } catch (e) {
       debugPrint('getProductById error: $e');
@@ -639,7 +643,8 @@ class SupabaseService {
     };
 
     try {
-      final response = await client.from('collections').insert(payload).select().single();
+      final response = await client.from('collections').insert(payload).select().maybeSingle();
+      if (response == null) throw Exception('Failed to insert collection');
       final collectionId = response['id'] as String;
       // Update customer's outstanding balance in the junction table
       try {
@@ -707,7 +712,11 @@ class SupabaseService {
           .select()
           .eq('id', collectionId)
           .eq('team_id', AuthService.currentTeam)
-          .single();
+          .maybeSingle();
+      if (collection == null) {
+        debugPrint('deleteCollection: collection $collectionId not found');
+        return false;
+      }
       final customerId = collection['customer_id'] as String;
       final amountCollected = (collection['amount_collected'] as num?)?.toDouble()
           ?? (collection['amount_paid'] as num?)?.toDouble()
@@ -724,8 +733,8 @@ class SupabaseService {
         final profile = await client.from('customer_team_profiles')
             .select(outCol)
             .eq('customer_id', customerId)
-            .single();
-        final currentBalance = (profile[outCol] as num?)?.toDouble() ?? 0.0;
+            .maybeSingle();
+        final currentBalance = (profile?[outCol] as num?)?.toDouble() ?? 0.0;
         await client.from('customer_team_profiles')
             .update({outCol: currentBalance + amountCollected})
             .eq('customer_id', customerId);
@@ -1162,7 +1171,8 @@ class SupabaseService {
         .select('order_date')
         .eq('id', orderId)
         .eq('team_id', AuthService.currentTeam)
-        .single();
+        .maybeSingle();
+    if (response == null) throw Exception('Order not found');
     final orderDate = DateTime.parse(response['order_date'] as String);
     if (DateTime.now().difference(orderDate).inDays.abs() > 3) {
       throw Exception('This order is older than 3 days and cannot be modified.');
@@ -1192,7 +1202,8 @@ class SupabaseService {
 
     // Validate status transition unless super admin
     if (!isSuperAdmin) {
-      final current = await client.from('orders').select('status').eq('id', orderId).eq('team_id', AuthService.currentTeam).single();
+      final current = await client.from('orders').select('status').eq('id', orderId).eq('team_id', AuthService.currentTeam).maybeSingle();
+      if (current == null) throw Exception('Order not found');
       final currentStatus = current['status'] as String? ?? 'Pending';
       final allowed = _validStatusTransitions[currentStatus] ?? [];
       if (!allowed.contains(newStatus)) {
@@ -1429,8 +1440,8 @@ class SupabaseService {
           .from('app_users')
           .select('role')
           .eq('id', user.id)
-          .single();
-      return response['role'] as String?;
+          .maybeSingle();
+      return response?['role'] as String?;
     } catch (e) {
       debugPrint('Error fetching user role: $e');
       return null;
@@ -1447,7 +1458,8 @@ class SupabaseService {
           .from('app_users')
           .select()
           .eq(email != null ? 'email' : 'id', email ?? user.id)
-          .single();
+          .maybeSingle();
+      if (response == null) return null;
       return AppUserModel.fromJson(Map<String, dynamic>.from(response));
     } catch (e) {
       debugPrint('Error fetching current user: $e');

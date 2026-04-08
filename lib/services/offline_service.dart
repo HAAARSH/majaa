@@ -139,9 +139,10 @@ class OfflineService {
 
         final Map<String, dynamic> orderData;
         final List<Map<String, dynamic>> itemsList;
-        if (entry is Map && entry.containsKey('order')) {
+        if (entry is Map && entry.containsKey('order') && entry['order'] is Map) {
           orderData = Map<String, dynamic>.from(entry['order'] as Map);
-          itemsList = (entry['items'] as List).map((i) => Map<String, dynamic>.from(i as Map)).toList();
+          final rawItems = entry['items'];
+          itemsList = (rawItems is List) ? rawItems.map((i) => i is Map ? Map<String, dynamic>.from(i) : <String, dynamic>{}).toList() : [];
         } else if (entry is Map) {
           orderData = Map<String, dynamic>.from(entry);
           itemsList = [];

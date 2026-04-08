@@ -26,6 +26,7 @@ class _HeroAvatarWidgetState extends State<HeroAvatarWidget> {
   Uint8List? _imageBytes;
   bool _isLoading = false;
   bool _hasError = false;
+  int _loadGeneration = 0; // Track load generation to prevent race conditions
 
   @override
   void initState() {
@@ -37,11 +38,13 @@ class _HeroAvatarWidgetState extends State<HeroAvatarWidget> {
   void didUpdateWidget(HeroAvatarWidget oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.imageUrl != widget.imageUrl) {
+      _loadGeneration++; // Invalidate any in-flight load
       _loadImage();
     }
   }
 
   Future<void> _loadImage() async {
+    final generation = _loadGeneration;
     if (widget.imageUrl == null || widget.imageUrl!.isEmpty) {
       setState(() {
         _imageBytes = null;
@@ -58,7 +61,7 @@ class _HeroAvatarWidgetState extends State<HeroAvatarWidget> {
 
     try {
       final imageBytes = await HeroCacheService.instance.getImage(widget.imageUrl!);
-      if (mounted) {
+      if (mounted && generation == _loadGeneration) {
         setState(() {
           _imageBytes = imageBytes;
           _isLoading = false;
@@ -66,7 +69,7 @@ class _HeroAvatarWidgetState extends State<HeroAvatarWidget> {
         });
       }
     } catch (e) {
-      if (mounted) {
+      if (mounted && generation == _loadGeneration) {
         setState(() {
           _isLoading = false;
           _hasError = true;

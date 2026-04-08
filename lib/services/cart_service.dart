@@ -94,7 +94,7 @@ class CartService {
   Future<Box> get _box async =>
       Hive.isBoxOpen(_boxName) ? Hive.box(_boxName) : await Hive.openBox(_boxName);
 
-  void _persistCart() async {
+  Future<void> _persistCart() async {
     try {
       final box = await _box;
       final items = cartNotifier.value.map((ci) => {
@@ -196,14 +196,13 @@ class CartService {
     final List<CartItem> newCart = [];
 
     for (var orderItem in order.lineItems) {
-      try {
-        final productModel = allProducts.firstWhere((p) => p.id == orderItem.productId);
+      final productIndex = allProducts.indexWhere((p) => p.id == orderItem.productId);
+      if (productIndex >= 0) {
         newCart.add(CartItem(
-          product: Product.fromModel(productModel),
+          product: Product.fromModel(allProducts[productIndex]),
           quantity: orderItem.quantity,
         ));
-      } catch (e) {
-        // Product not found, skip or create a dummy
+      } else {
         debugPrint('Product not found for order item: ${orderItem.productName}');
       }
     }

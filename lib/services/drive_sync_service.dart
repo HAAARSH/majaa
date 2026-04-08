@@ -506,7 +506,10 @@ class DriveSyncService {
       if (searchResp.statusCode == 200) {
         final data = jsonDecode(searchResp.body) as Map<String, dynamic>;
         final files = (data['files'] as List?) ?? [];
-        if (files.isNotEmpty) return files.first['id'] as String;
+        if (files.isNotEmpty) {
+          final id = files.first['id'] as String?;
+          if (id != null) return id;
+        }
       }
 
       // Folder not found — create it
@@ -971,7 +974,7 @@ class DriveSyncService {
       if (resp.statusCode == 200) {
         final data = jsonDecode(resp.body) as Map<String, dynamic>;
         final files = (data['files'] as List?) ?? [];
-        if (files.isNotEmpty) return files.first['id'] as String;
+        if (files.isNotEmpty) return files.first['id'] as String?;
       }
       return null;
     } catch (e) {
