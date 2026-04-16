@@ -465,6 +465,17 @@ class _ProductsScreenState extends State<ProductsScreen>
           .searchProducts(query, page: _searchPage);
       if (!mounted) return;
       var products = models.map((m) => Product.fromModel(m)).toList();
+
+      // Guard: if the fetched page is empty, no more results
+      if (products.isEmpty) {
+        setState(() {
+          _hasMoreSearchResults = false;
+          _isSearchLoading = false;
+          _isLoadingMoreSearch = false;
+        });
+        return;
+      }
+
       // Filter search results by allowed brands (same as category/all views)
       // Include products with empty category so they are not silently dropped
       if (_allowedBrands.isNotEmpty) {

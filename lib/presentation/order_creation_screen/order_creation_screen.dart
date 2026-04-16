@@ -173,6 +173,8 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
           'unit_price': item.product.unitPrice,
           'mrp': item.product.mrp,
           'line_total': lineTotal,
+          'gst_rate': item.product.gstRate,
+          'gst_amount': gst,
         };
       }).toList();
 

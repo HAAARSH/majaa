@@ -443,7 +443,15 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
                             ),
                           ),
                           // TASK 2A — Outstanding balance
-                          _buildBalanceRow(customer.outstandingForTeam(AuthService.currentTeam)),
+                          // In merged view, derive team from the customer's beat assignment
+                          _buildBalanceRow(customer.outstandingForTeam(
+                            _isMergedView
+                                ? (_beats.firstWhere(
+                                    (b) => customer.beatIdForTeam(b.teamId) == b.id,
+                                    orElse: () => _beats.first,
+                                  ).teamId)
+                                : AuthService.currentTeam,
+                          )),
                           // Phone and WhatsApp buttons (if phone present)
                           if (!phoneIsMissing) ...[
                             const SizedBox(height: 8),

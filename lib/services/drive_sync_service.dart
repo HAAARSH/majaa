@@ -968,10 +968,12 @@ class DriveSyncService {
 
           if (p.stockQty != newQty) {
             data['stock_qty'] = newQty;
-            // Auto-update status based on stock: available when stock > 0, outOfStock when 0
-            if (newQty > 0 && p.status != 'available') {
+            // Auto-update status based on stock thresholds
+            if (newQty > 10 && p.status != 'available') {
               data['status'] = 'available';
-            } else if (newQty <= 0 && p.status == 'available') {
+            } else if (newQty > 0 && newQty <= 10 && p.status != 'lowStock') {
+              data['status'] = 'lowStock';
+            } else if (newQty <= 0 && p.status != 'outOfStock') {
               data['status'] = 'outOfStock';
             }
             changed = true;
@@ -1008,9 +1010,13 @@ class DriveSyncService {
       // Batch execute stock updates: 20 concurrent at a time
       for (int i = 0; i < stockUpdates.length; i += 10) {
         final chunk = stockUpdates.sublist(i, (i + 10).clamp(0, stockUpdates.length));
-        await Future.wait(chunk.map((u) =>
-          SupabaseService.instance.updateProduct(u['id'] as String, u['data'] as Map<String, dynamic>)
-        ));
+        try {
+          await Future.wait(chunk.map((u) =>
+            SupabaseService.instance.updateProduct(u['id'] as String, u['data'] as Map<String, dynamic>)
+          ));
+        } catch (e) {
+          debugPrint('⚠️ Sync batch ${i ~/ 10 + 1} failed: $e — continuing');
+        }
       }
 
       // Clear product cache so app shows fresh data
@@ -1245,8 +1251,8 @@ class DriveSyncService {
                 .where((s) => s.isNotEmpty).join(', '),
             'phone': () {
               final raw = safeCol(phoneIdx).replaceAll(RegExp(r'[^0-9]'), '');
-              final digits = raw.length > 10 ? raw.substring(0, 10) : raw;
-              return digits.length == 10 ? '+91$digits' : digits;
+              final digits = raw.length > 10 ? raw.substring(raw.length - 10) : raw;
+              return (digits.length == 10 && RegExp(r'^[6-9]').hasMatch(digits)) ? '+91$digits' : digits;
             }(),
             'group': safeCol(groupIdx),
             'amount': double.tryParse(safeCol(amountIdx)) ?? 0.0,
@@ -1385,7 +1391,11 @@ class DriveSyncService {
       // Execute all updates in parallel batches of 20
       for (int i = 0; i < pendingUpdates.length; i += 10) {
         final chunk = pendingUpdates.sublist(i, (i + 10).clamp(0, pendingUpdates.length));
-        await Future.wait(chunk.map((fn) => fn()));
+        try {
+          await Future.wait(chunk.map((fn) => fn()));
+        } catch (e) {
+          debugPrint('⚠️ Sync batch ${i ~/ 10 + 1} failed: $e — continuing');
+        }
       }
       debugPrint('📊 CustomerSync: ${pendingUpdates.length} customers updated in ${(pendingUpdates.length / 20).ceil()} batches');
 
@@ -1920,16 +1930,20 @@ class DriveSyncService {
         // Batch update: 20 concurrent requests at a time
         for (int i = 0; i < updates.length; i += 10) {
           final chunk = updates.sublist(i, (i + 10).clamp(0, updates.length));
-          await Future.wait(chunk.map((u) =>
-            dbClient.from('customer_team_profiles')
-                .update({
-                  outCol: u[outCol],
-                  crNotesCol: u[crNotesCol],
-                  yrBilledCol: u[yrBilledCol],
-                })
-                .eq('customer_id', u['customer_id'])
-          ));
-          updated += chunk.length;
+          try {
+            await Future.wait(chunk.map((u) =>
+              dbClient.from('customer_team_profiles')
+                  .update({
+                    outCol: u[outCol],
+                    crNotesCol: u[crNotesCol],
+                    yrBilledCol: u[yrBilledCol],
+                  })
+                  .eq('customer_id', u['customer_id'])
+            ));
+            updated += chunk.length;
+          } catch (e) {
+            debugPrint('⚠️ Sync batch ${i ~/ 10 + 1} failed: $e — continuing');
+          }
         }
       }
 

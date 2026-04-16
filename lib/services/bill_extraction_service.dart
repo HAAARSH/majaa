@@ -118,6 +118,16 @@ IMPORTANT:
       }
     }
 
+    // Deduplicate bills by bill_no (bills spanning page boundaries may appear in multiple chunks)
+    final seen = <String>{};
+    allBills.removeWhere((bill) {
+      final billNo = (bill['bill_no'] ?? bill['invoice_no'] ?? '').toString().trim();
+      if (billNo.isEmpty) return false; // keep bills without number
+      if (seen.contains(billNo)) return true; // remove duplicate
+      seen.add(billNo);
+      return false;
+    });
+
     return allBills;
   }
 

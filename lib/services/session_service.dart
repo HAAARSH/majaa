@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 /// Tracks user activity for 6-hour idle session expiry.
@@ -34,6 +35,16 @@ class SessionService {
     if (_lastActiveMs == null) return false;
     final elapsed = DateTime.now().millisecondsSinceEpoch - _lastActiveMs!;
     return elapsed > timeoutHours * 60 * 60 * 1000;
+  }
+
+  /// Returns true if session is active and not expired.
+  /// Call before sensitive operations (PIN change, role change, export).
+  Future<bool> requireActiveSession() async {
+    if (isSessionExpired()) {
+      debugPrint('⚠️ Session expired — re-authentication required');
+      return false;
+    }
+    return true;
   }
 
   /// Clear the timestamp on logout.
