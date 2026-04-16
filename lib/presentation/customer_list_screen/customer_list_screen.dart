@@ -194,6 +194,9 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
         return;
       } else if (customerTeams.isNotEmpty) {
         AuthService.currentTeam = customerTeams.first;
+      } else {
+        // No beat match — keep current team as-is, don't navigate with stale context
+        return;
       }
     }
     // Navigate — dual-team customers handled inside customer detail screen
@@ -445,7 +448,7 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
                           // TASK 2A — Outstanding balance
                           // In merged view, derive team from the customer's beat assignment
                           _buildBalanceRow(customer.outstandingForTeam(
-                            _isMergedView
+                            _isMergedView && _beats.isNotEmpty
                                 ? (_beats.firstWhere(
                                     (b) => customer.beatIdForTeam(b.teamId) == b.id,
                                     orElse: () => _beats.first,

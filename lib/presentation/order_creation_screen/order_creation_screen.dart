@@ -174,7 +174,6 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
           'mrp': item.product.mrp,
           'line_total': lineTotal,
           'gst_rate': item.product.gstRate,
-          'gst_amount': gst,
         };
       }).toList();
 
@@ -251,7 +250,7 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
     showDialog(
       context: context,
       barrierDismissible: false,
-      builder: (ctx) => AlertDialog(
+      builder: (ctx) => PopScope(canPop: false, child: AlertDialog(
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
         content: Column(
           mainAxisSize: MainAxisSize.min,
@@ -302,7 +301,7 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
             ),
           ],
         ),
-      ),
+      )),
     );
   }
 
