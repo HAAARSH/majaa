@@ -8,6 +8,7 @@ import '../../routes/app_routes.dart';
 import '../../services/supabase_service.dart';
 import '../../theme/app_theme.dart';
 import '../../services/auth_service.dart';
+import '../../widgets/alphabet_scroll_list.dart';
 
 class CustomerListScreen extends StatefulWidget {
   const CustomerListScreen({super.key});
@@ -93,9 +94,10 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
           // Admin / no-beat context: show all customers.
           _allCustomers = customers;
         } else if (_isOutOfBeat) {
-          // Out-of-Beat mode: show only customers assigned to the selected beat.
+          // Out-of-Beat mode: show ALL customers for the current team so reps
+          // can place orders for walk-in / out-of-route customers.
           _allCustomers = customers
-              .where((c) => c.beatIdForTeam(AuthService.currentTeam) == _beat!.id)
+              .where((c) => c.belongsToTeam(AuthService.currentTeam))
               .toList();
         } else {
           // Normal beat mode: strictly filter to this beat.
@@ -179,15 +181,27 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
 
     // In merged view, set team context based on customer's beat
     if (_isMergedView) {
+      // Collect all distinct teams this customer belongs to across today's beats
+      final customerTeams = <String>[];
       for (final b in _beats) {
-        if (customer.beatIdForTeam(b.teamId) == b.id) {
-          AuthService.currentTeam = b.teamId;
-          break;
+        if (customer.beatIdForTeam(b.teamId) == b.id && !customerTeams.contains(b.teamId)) {
+          customerTeams.add(b.teamId);
         }
+      }
+      if (customerTeams.length > 1) {
+        // Dual-team customer — let the rep choose which team to order for
+        _showTeamPicker(customer);
+        return;
+      } else if (customerTeams.isNotEmpty) {
+        AuthService.currentTeam = customerTeams.first;
       }
     }
     // Navigate — dual-team customers handled inside customer detail screen
-    Navigator.pushNamed(context, AppRoutes.customerDetails, arguments: customer);
+    Navigator.pushNamed(context, AppRoutes.customerDetails, arguments: {
+                  'customer': customer,
+                  if (_beat != null) 'beat': _beat,
+                  'isMergedView': _isMergedView && _isDualTeam,
+                });
   }
 
   void _showTeamPicker(CustomerModel customer) {
@@ -225,7 +239,11 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
               onTap: () {
                 Navigator.pop(ctx);
                 AuthService.currentTeam = 'JA';
-                Navigator.pushNamed(context, AppRoutes.customerDetails, arguments: customer);
+                Navigator.pushNamed(context, AppRoutes.customerDetails, arguments: {
+                  'customer': customer,
+                  if (_beat != null) 'beat': _beat,
+                  'isMergedView': _isMergedView && _isDualTeam,
+                });
               },
             ),
             ListTile(
@@ -241,7 +259,11 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
               onTap: () {
                 Navigator.pop(ctx);
                 AuthService.currentTeam = 'MA';
-                Navigator.pushNamed(context, AppRoutes.customerDetails, arguments: customer);
+                Navigator.pushNamed(context, AppRoutes.customerDetails, arguments: {
+                  'customer': customer,
+                  if (_beat != null) 'beat': _beat,
+                  'isMergedView': _isMergedView && _isDualTeam,
+                });
               },
             ),
           ],
@@ -316,16 +338,15 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
             ),
           ),
           Expanded(
-            child: RefreshIndicator(
-              onRefresh: () => _loadCustomers(forceRefresh: true),
-              child: _isLoading
-                  ? const Center(child: CircularProgressIndicator())
-                  : ListView.builder(
-                padding: const EdgeInsets.symmetric(horizontal: 16),
-                itemCount: _filteredCustomers.length,
-                itemBuilder: (context, index) => _buildCustomerCard(_filteredCustomers[index]),
-              ),
-            ),
+            child: _isLoading
+                ? const Center(child: CircularProgressIndicator())
+                : AlphabetScrollList(
+                    itemCount: _filteredCustomers.length,
+                    itemBuilder: (context, index) => _buildCustomerCard(_filteredCustomers[index]),
+                    labelForIndex: (index) => _filteredCustomers[index].name,
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    onRefresh: () => _loadCustomers(forceRefresh: true),
+                  ),
           ),
         ],
       ),
@@ -738,7 +759,11 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
             onPressed: () {
               Navigator.pop(ctx);
               // Skip for Now: navigate directly without saving
-              Navigator.pushNamed(context, AppRoutes.customerDetails, arguments: customer);
+              Navigator.pushNamed(context, AppRoutes.customerDetails, arguments: {
+                  'customer': customer,
+                  if (_beat != null) 'beat': _beat,
+                  'isMergedView': _isMergedView && _isDualTeam,
+                });
             },
             child: Text(
               "Skip for Now",

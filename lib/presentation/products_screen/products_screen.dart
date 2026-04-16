@@ -148,7 +148,9 @@ class _ProductsScreenState extends State<ProductsScreen>
   DateTime? _lastSynced;
 
   // ADDED: Brand access control — empty means no restriction (show all)
+  // Exception: brand_rep with empty list = no access (show nothing)
   List<String> _allowedBrands = [];
+  bool _brandAccessDenied = false; // true when brand_rep has zero allowed brands
   // ADDED: Stock visibility control — default true (show stock)
   bool _showStock = true;
 
@@ -204,6 +206,19 @@ class _ProductsScreenState extends State<ProductsScreen>
       final showStock = userId != null
           ? await SupabaseService.instance.getUserShowStock(userId)
           : true;
+
+      // Brand rep with zero allowed brands = no access at all
+      final isBrandRep = SupabaseService.instance.currentUserRole == 'brand_rep';
+      if (isBrandRep && allowedBrands.isEmpty) {
+        if (!mounted) return;
+        setState(() {
+          _brandAccessDenied = true;
+          _allowedBrands = [];
+          _showStock = showStock;
+          _isLoading = false;
+        });
+        return;
+      }
 
       // Fetch categories: own team + any cross-team allowed brands
       var cats = await SupabaseService.instance.getProductCategories();
@@ -366,7 +381,17 @@ class _ProductsScreenState extends State<ProductsScreen>
 
       // Filter by allowed brands if brand access is configured
       if (_allowedBrands.isNotEmpty) {
-        products = products.where((p) => _allowedBrands.contains(p.category)).toList();
+        // Warn about products with missing categories
+        final missingCategoryProducts = products.where(
+            (p) => p.category.isEmpty).toList();
+        if (missingCategoryProducts.isNotEmpty) {
+          debugPrint('WARNING: ${missingCategoryProducts.length} products have missing/empty category: '
+              '${missingCategoryProducts.map((p) => p.name).take(5).join(", ")}');
+        }
+        // Include products with empty category in "All" view
+        products = products.where((p) =>
+            p.category.isEmpty ||
+            _allowedBrands.contains(p.category)).toList();
       }
 
       // Apply smart sorting for "All" category
@@ -423,6 +448,7 @@ class _ProductsScreenState extends State<ProductsScreen>
 
   // ─── Search ───
   Future<void> _performSearch(String query, {bool append = false}) async {
+    if (_brandAccessDenied) return; // no access — block search
     if (!append) {
       setState(() {
         _isSearchLoading = true;
@@ -438,7 +464,18 @@ class _ProductsScreenState extends State<ProductsScreen>
       final models = await SupabaseService.instance
           .searchProducts(query, page: _searchPage);
       if (!mounted) return;
-      final products = models.map((m) => Product.fromModel(m)).toList();
+      var products = models.map((m) => Product.fromModel(m)).toList();
+      // Filter search results by allowed brands (same as category/all views)
+      // Include products with empty category so they are not silently dropped
+      if (_allowedBrands.isNotEmpty) {
+        products = products.where((p) =>
+            p.category.isEmpty ||
+            _allowedBrands.contains(p.category)).toList();
+      }
+      // Filter by selected category (unless 'All')
+      if (_selectedCategory != 'All') {
+        products = products.where((p) => p.category == _selectedCategory).toList();
+      }
       setState(() {
         if (append) {
           _searchResults = [..._searchResults, ...products];
@@ -590,7 +627,29 @@ class _ProductsScreenState extends State<ProductsScreen>
                     ),
 
                     // ─── Content area ───
-                    if (_isLoading)
+                    if (_brandAccessDenied)
+                      SliverFillRemaining(
+                        hasScrollBody: false,
+                        child: Center(
+                          child: Padding(
+                            padding: const EdgeInsets.all(40),
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(Icons.block, size: 64, color: Colors.grey.shade400),
+                                const SizedBox(height: 16),
+                                Text('No brand access configured',
+                                    style: GoogleFonts.manrope(fontSize: 16, fontWeight: FontWeight.w600, color: AppTheme.onSurfaceVariant)),
+                                const SizedBox(height: 8),
+                                Text('Contact your admin to assign brands to your account.',
+                                    textAlign: TextAlign.center,
+                                    style: GoogleFonts.manrope(fontSize: 13, color: Colors.grey)),
+                              ],
+                            ),
+                          ),
+                        ),
+                      )
+                    else if (_isLoading)
                       const SliverToBoxAdapter(
                           child: Padding(
                               padding: EdgeInsets.all(40),
@@ -695,7 +754,7 @@ class _ProductsScreenState extends State<ProductsScreen>
                       ] else ...[
                         SliverPadding(
                           padding: EdgeInsets.fromLTRB(
-                            showSidebar ? 80.0 : 16.0, 10, 16, 100),
+                            showSidebar ? 86.0 : 16.0, 10, 16, 100),
                           sliver: SliverList(
                             delegate: SliverChildBuilderDelegate(
                               (context, index) {
@@ -733,7 +792,7 @@ class _ProductsScreenState extends State<ProductsScreen>
                           left: 0,
                           top: appBarHeight + 139.0,
                           bottom: 0,
-                          width: 76,
+                          width: 82,
                           child: child!,
                         );
                       },
@@ -786,7 +845,7 @@ class _SubcategorySidebar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return SizedBox(
-      width: 72,
+      width: 78,
       child: ListView.builder(
         padding: const EdgeInsets.symmetric(vertical: 6),
         itemCount: subcategories.length + 1, // +1 for "All"
@@ -838,17 +897,18 @@ class _SidebarButton extends StatelessWidget {
         ),
         child: Center(
           child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 6),
+            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
             child: Text(
               label,
               textAlign: TextAlign.center,
               maxLines: 3,
               softWrap: true,
+              overflow: TextOverflow.ellipsis,
               style: GoogleFonts.manrope(
-                fontSize: 11,
-                fontWeight: isSelected ? FontWeight.w700 : FontWeight.w500,
+                fontSize: 9.5,
+                fontWeight: isSelected ? FontWeight.w700 : FontWeight.w600,
                 color: isSelected ? Colors.white : AppTheme.onSurfaceVariant,
-                height: 1.3,
+                height: 1.25,
               ),
             ),
           ),

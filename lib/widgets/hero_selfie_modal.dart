@@ -185,57 +185,80 @@ class _HeroSelfieModalState extends State<HeroSelfieModal> {
       mainAxisAlignment: MainAxisAlignment.spaceEvenly,
       children: [
         if (_capturedImage == null) ...[
-          Expanded(
-            child: ElevatedButton.icon(
-              onPressed: _isCapturing ? null : _captureSelfie,
-              icon: const Icon(Icons.camera_alt_rounded, size: 18),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: AppTheme.primary,
-                foregroundColor: Colors.white,
-                padding: const EdgeInsets.symmetric(vertical: 12),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(8),
+          // Camera is not available on web — only show on native platforms
+          if (!kIsWeb) ...[
+            Expanded(
+              child: ElevatedButton.icon(
+                onPressed: _isCapturing ? null : _captureSelfie,
+                icon: const Icon(Icons.camera_alt_rounded, size: 18),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: AppTheme.primary,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8),
+                  ),
                 ),
-              ),
-              label: _isCapturing
-                  ? const SizedBox(
-                      width: 20,
-                      height: 20,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2,
-                        valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                label: _isCapturing
+                    ? const SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                        ),
+                      )
+                    : Text(
+                        'Camera',
+                        style: GoogleFonts.manrope(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                        ),
                       ),
-                    )
-                  : Text(
-                      'Camera',
+              ),
+            ),
+            const SizedBox(width: 10),
+          ],
+          Expanded(
+            child: kIsWeb
+                ? ElevatedButton.icon(
+                    onPressed: _isCapturing ? null : _pickFromGallery,
+                    icon: const Icon(Icons.photo_library_rounded, size: 18),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: AppTheme.primary,
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                    ),
+                    label: Text(
+                      'Choose Photo',
                       style: GoogleFonts.manrope(
                         fontSize: 14,
                         fontWeight: FontWeight.w600,
                       ),
                     ),
-            ),
-          ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: OutlinedButton.icon(
-              onPressed: _isCapturing ? null : _pickFromGallery,
-              icon: const Icon(Icons.photo_library_rounded, size: 18),
-              style: OutlinedButton.styleFrom(
-                foregroundColor: AppTheme.primary,
-                side: BorderSide(color: AppTheme.primary.withValues(alpha: 0.5)),
-                padding: const EdgeInsets.symmetric(vertical: 12),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(8),
-                ),
-              ),
-              label: Text(
-                'Gallery',
-                style: GoogleFonts.manrope(
-                  fontSize: 14,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-            ),
+                  )
+                : OutlinedButton.icon(
+                    onPressed: _isCapturing ? null : _pickFromGallery,
+                    icon: const Icon(Icons.photo_library_rounded, size: 18),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: AppTheme.primary,
+                      side: BorderSide(color: AppTheme.primary.withValues(alpha: 0.5)),
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                    ),
+                    label: Text(
+                      'Gallery',
+                      style: GoogleFonts.manrope(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
           ),
         ] else ...[
           Expanded(

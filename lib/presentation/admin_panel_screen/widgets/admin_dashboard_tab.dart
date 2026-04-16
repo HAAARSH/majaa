@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:google_fonts/google_fonts.dart';
@@ -71,11 +72,13 @@ class _AdminDashboardTabState extends State<AdminDashboardTab>
         type: FileType.custom,
         allowedExtensions: ['csv'],
       );
-      if (result == null || result.files.single.path == null) return;
+      if (result == null) return;
+      if (!kIsWeb && result.files.single.path == null) return;
       setState(() => _isUploading = true);
 
-      final file = File(result.files.single.path!);
-      final csvString = await file.readAsString();
+      final csvString = kIsWeb
+          ? String.fromCharCodes(result.files.single.bytes!)
+          : await File(result.files.single.path!).readAsString();
       List<List<dynamic>> csvTable =
       const CsvToListConverter().convert(csvString);
 

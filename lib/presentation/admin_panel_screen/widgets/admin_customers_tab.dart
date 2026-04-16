@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:file_picker/file_picker.dart';
@@ -96,6 +97,45 @@ class _AdminCustomersTabState extends State<AdminCustomersTab> {
       }).toList()
         ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
     });
+  }
+
+  void _confirmDeleteCustomer(CustomerModel customer) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Delete Customer', style: GoogleFonts.manrope(fontWeight: FontWeight.w700)),
+        content: Text('Delete "${customer.name}"?\n\nThis will remove the customer and all team profile data. This cannot be undone.',
+            style: GoogleFonts.manrope(fontSize: 14)),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text('Cancel', style: GoogleFonts.manrope(color: Colors.grey)),
+          ),
+          TextButton(
+            onPressed: () async {
+              Navigator.pop(ctx);
+              try {
+                await SupabaseService.instance.deleteCustomer(customer.id);
+                if (!mounted) return;
+                setState(() {
+                  _customers.removeWhere((c) => c.id == customer.id);
+                  _filtered.removeWhere((c) => c.id == customer.id);
+                });
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Customer deleted'), backgroundColor: Colors.green),
+                );
+              } catch (e) {
+                if (!mounted) return;
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red),
+                );
+              }
+            },
+            child: Text('Delete', style: GoogleFonts.manrope(color: Colors.red, fontWeight: FontWeight.w700)),
+          ),
+        ],
+      ),
+    );
   }
 
   void _showCustomerDialog(CustomerModel? customer) {
@@ -513,6 +553,7 @@ class _AdminCustomersTabState extends State<AdminCustomersTab> {
                           return _CustomerCard(
                             customer: c,
                             onEdit: () => _showCustomerDialog(c),
+                            onDelete: () => _confirmDeleteCustomer(c),
                           );
                         },
                       ),
@@ -529,10 +570,12 @@ class _AdminCustomersTabState extends State<AdminCustomersTab> {
       type: FileType.custom,
       allowedExtensions: ['csv'],
     );
-    if (result == null || result.files.single.path == null) return;
+    if (result == null) return;
+    if (!kIsWeb && result.files.single.path == null) return;
 
-    final file = File(result.files.single.path!);
-    final content = await file.readAsString();
+    final content = kIsWeb
+        ? String.fromCharCodes(result.files.single.bytes!)
+        : await File(result.files.single.path!).readAsString();
 
     List<Map<String, dynamic>> rows;
     try {
@@ -633,10 +676,12 @@ class _AdminCustomersTabState extends State<AdminCustomersTab> {
 class _CustomerCard extends StatelessWidget {
   final CustomerModel customer;
   final VoidCallback onEdit;
+  final VoidCallback onDelete;
 
   const _CustomerCard({
     required this.customer,
     required this.onEdit,
+    required this.onDelete,
   });
 
   @override
@@ -705,24 +750,48 @@ class _CustomerCard extends StatelessWidget {
               ),
             ),
             const SizedBox(width: 12),
-            GestureDetector(
-              onTap: onEdit,
-              child: Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                decoration: BoxDecoration(
-                  color: AppTheme.primaryContainer,
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: Text(
-                  'Edit',
-                  style: GoogleFonts.manrope(
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600,
-                    color: AppTheme.primary,
+            Column(
+              children: [
+                GestureDetector(
+                  onTap: onEdit,
+                  child: Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                    decoration: BoxDecoration(
+                      color: AppTheme.primaryContainer,
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Text(
+                      'Edit',
+                      style: GoogleFonts.manrope(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: AppTheme.primary,
+                      ),
+                    ),
                   ),
                 ),
-              ),
+                const SizedBox(height: 8),
+                GestureDetector(
+                  onTap: onDelete,
+                  child: Container(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                    decoration: BoxDecoration(
+                      color: Colors.red.shade50,
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Text(
+                      'Delete',
+                      style: GoogleFonts.manrope(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: Colors.red,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
             ),
           ],
         ),

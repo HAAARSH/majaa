@@ -28,21 +28,21 @@ class CsvReconciliationService {
   static const int _colVatCode = 13; // HSN code
   static const int _colMrp = 16;
   static const int _colQuantity = 22;
-  static const int _colRate = 26;
-  static const int _colAmount = 28;
-  static const int _colDiscPer1 = 31;
-  static const int _colDiscount1 = 32;
-  static const int _colVatPer = 43; // CGST %
-  static const int _colVatAmount = 44;
-  static const int _colSatPer = 45; // SGST %
-  static const int _colSatAmount = 46;
-  static const int _colAcName = 81; // Customer name
-  static const int _colGroup = 82; // Customer area
-  static const int _colVouType = 85; // S=Sale, P=Purchase, O=Opening
-  static const int _colBook = 86; // INV, etc.
-  static const int _colVno = 87; // Bill number
-  static const int _colSlNo = 88; // Line item serial
-  static const int _colUserName = 93;
+  static const int _colRate = 27;
+  static const int _colAmount = 29;
+  static const int _colDiscPer1 = 32;
+  static const int _colDiscount1 = 33;
+  static const int _colVatPer = 44; // CGST %
+  static const int _colVatAmount = 45;
+  static const int _colSatPer = 46; // SGST %
+  static const int _colSatAmount = 47;
+  static const int _colAcName = 77; // Customer name
+  static const int _colGroup = 78; // Customer area
+  static const int _colVouType = 81; // S=Sale, P=Purchase, O=Opening
+  static const int _colBook = 82; // INV, etc.
+  static const int _colVno = 83; // Bill number
+  static const int _colSlNo = 84; // Line item serial
+  static const int _colUserName = 92;
 
   // ─── PARSE CSV ───────────────────────────────────────────────
 
@@ -62,7 +62,7 @@ class CsvReconciliationService {
       if (line.trim().isEmpty) continue;
 
       final fields = _parseCsvLine(line);
-      if (fields.length < 90) continue;
+      if (fields.length < 84) continue; // Need at least up to SLNO column
 
       final vouType = fields.length > _colVouType ? fields[_colVouType].trim() : '';
       if (vouType != 'S') continue; // Only sales
@@ -161,18 +161,26 @@ class CsvReconciliationService {
     final teamId = AuthService.currentTeam;
     final List<Map<String, dynamic>> changes = [];
 
+    // Fetch ALL orders with items in one query, build lookup by billed_no/final_bill_no
+    final allOrders = await _client.from('orders')
+        .select('id, customer_name, grand_total, actual_billed_amount, billed_no, final_bill_no, status, order_items(*)')
+        .eq('team_id', teamId);
+    final Map<String, Map<String, dynamic>> orderByBillNo = {};
+    for (final o in allOrders) {
+      final billedNo = (o['billed_no'] as String?) ?? '';
+      final finalBillNo = (o['final_bill_no'] as String?) ?? '';
+      if (billedNo.isNotEmpty) orderByBillNo[billedNo] = o;
+      if (finalBillNo.isNotEmpty) orderByBillNo[finalBillNo] = o;
+    }
+
     for (final bill in csvBills) {
       final billNo = bill['bill_no'] as String;
       final csvTotal = bill['grand_total'] as double;
       final csvCustomer = bill['customer_name'] as String;
       final csvItems = bill['items'] as List;
 
-      // Find matching order in Supabase by billed_no or final_bill_no
-      final order = await _client.from('orders')
-          .select('id, customer_name, grand_total, actual_billed_amount, billed_no, final_bill_no, status, order_items(*)')
-          .eq('team_id', teamId)
-          .or('billed_no.eq.$billNo,final_bill_no.eq.$billNo')
-          .maybeSingle();
+      // Find matching order by billed_no or final_bill_no (in-memory lookup)
+      final order = orderByBillNo[billNo];
 
       if (order == null) {
         // Bill exists in CSV but NOT in Supabase
@@ -207,7 +215,7 @@ class CsvReconciliationService {
       }
 
       // Check amount difference
-      if ((csvTotal - dbTotal).abs() > 1) {
+      if ((csvTotal - dbTotal).abs() > 2) {
         changes.add({
           'type': 'amount_mismatch',
           'bill_no': billNo,
@@ -236,7 +244,7 @@ class CsvReconciliationService {
       }
 
       // If CSV confirms the bill and it's still pending → suggest auto-verify
-      if (dbStatus == 'Pending Verification' && (csvTotal - dbTotal).abs() <= 5) {
+      if (dbStatus == 'Pending Verification' && (csvTotal - dbTotal).abs() <= 2) {
         changes.add({
           'type': 'can_auto_verify',
           'bill_no': billNo,
