@@ -39,19 +39,32 @@ npm run lint       # TypeScript type-check
 
 ## Architecture
 
+### Models (`lib/models/`)
+
+Dedicated model files with `fromJson`/`toJson`. Barrel file `models.dart` re-exports all models. Key models: `product_model`, `customer_model`, `order_model`, `beat_model`, `visit_log_model`, `collection_model`, `app_user_model`, `bill_extraction_model`.
+
 ### Service Layer (`lib/services/`)
 
 All backend logic lives here. Services are **not** InheritedWidget/Provider — they are used directly (static or singleton).
 
 | Service | Role |
 |---|---|
-| `supabase_service.dart` (~28KB) | All CRUD — the central data layer |
+| `supabase_service.dart` | All CRUD — the central data layer |
 | `auth_service.dart` | Auth + `currentTeam` global (defaults `'JA'`) |
 | `cart_service.dart` | In-memory cart state |
 | `offline_service.dart` | Hive queue + auto-sync on reconnect |
 | `pdf_service.dart` / `pdf_generator.dart` | Report generation |
 | `google_drive_service.dart` | Export/import via Google Drive |
+| `google_drive_auth_service.dart` | Google Drive OAuth |
+| `drive_sync_service.dart` | Drive sync logic |
+| `gemini_ocr_service.dart` | OCR via Gemini API |
+| `bill_extraction_service.dart` | Bill data extraction |
+| `csv_reconciliation_service.dart` | CSV reconciliation |
+| `session_service.dart` | Session management |
+| `pin_service.dart` | PIN-based auth |
+| `hero_cache_service.dart` | Hero image caching |
 | `update_service.dart` | In-app update management |
+| `service_account_auth.dart` | Service account auth |
 
 ### Multi-Team Pattern
 

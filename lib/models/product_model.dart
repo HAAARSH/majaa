@@ -13,7 +13,8 @@ class ProductModel {
   final String sku;
   final String category;
   final String brand;
-  final double unitPrice;
+  final double unitPrice;  // Selling rate (RATE from billing software)
+  final double mrp;        // Maximum Retail Price (MRP from billing software)
   final String packSize;
   final String status;
   final int stockQty;
@@ -32,7 +33,7 @@ class ProductModel {
 
   const ProductModel({
     required this.id, required this.name, required this.sku, required this.category,
-    required this.brand, required this.unitPrice, required this.packSize,
+    required this.brand, required this.unitPrice, this.mrp = 0, required this.packSize,
     required this.status, required this.stockQty, required this.imageUrl,
     required this.semanticLabel, this.gstRate = 0.18, this.unit = 'pcs',
     this.stepSize = 1, required this.teamId, this.subcategoryId,
@@ -46,6 +47,7 @@ class ProductModel {
     category: json['category'] as String,
     brand: json['brand'] as String? ?? '',
     unitPrice: (json['unit_price'] as num).toDouble(),
+    mrp: (json['mrp'] as num?)?.toDouble() ?? 0,
     packSize: json['pack_size'] as String? ?? '',
     status: json['status'] as String? ?? 'available',
     stockQty: json['stock_qty'] as int? ?? 0,
@@ -62,7 +64,7 @@ class ProductModel {
 
   Map<String, dynamic> toJson() => {
     'id': id, 'name': name, 'sku': sku, 'category': category, 'brand': brand,
-    'unit_price': unitPrice, 'pack_size': packSize, 'status': status,
+    'unit_price': unitPrice, 'mrp': mrp, 'pack_size': packSize, 'status': status,
     'stock_qty': stockQty, 'image_url': imageUrl, 'semantic_label': semanticLabel,
     'gst_rate': (gstRate * 100).round(), 'unit': unit, 'step_size': stepSize, 'team_id': teamId,
     'subcategory_id': subcategoryId,

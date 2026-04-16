@@ -60,6 +60,7 @@ class _AdminPanelScreenState extends State<AdminPanelScreen>
           _isCheckingRole = false;
         });
         _setupOrderListener();
+        _listenForDriveAuthError();
         // Auto-sync bill photos to Google Drive on admin login
         DriveSyncService.instance.syncAll();
         // Check if admin needs selfie
@@ -141,8 +142,39 @@ class _AdminPanelScreenState extends State<AdminPanelScreen>
         });
   }
 
+  void _listenForDriveAuthError() {
+    DriveSyncService.instance.authError.addListener(_onDriveAuthError);
+  }
+
+  void _onDriveAuthError() {
+    final error = DriveSyncService.instance.authError.value;
+    if (error == null || !mounted) return;
+
+    // Show persistent banner and navigate to System tab (index 4) for re-login
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(children: [
+          const Icon(Icons.cloud_off_rounded, color: Colors.white, size: 18),
+          const SizedBox(width: 8),
+          Expanded(child: Text('Google Drive disconnected. Tap System tab to reconnect.',
+              style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w600))),
+        ]),
+        backgroundColor: Colors.red.shade700,
+        duration: const Duration(seconds: 6),
+        action: SnackBarAction(
+          label: 'GO',
+          textColor: Colors.white,
+          onPressed: () => _tabController.animateTo(4),
+        ),
+      ),
+    );
+    // Auto-navigate to System tab
+    _tabController.animateTo(4);
+  }
+
   @override
   void dispose() {
+    DriveSyncService.instance.authError.removeListener(_onDriveAuthError);
     _tabController.dispose();
     _orderSubscription?.cancel();
     super.dispose();

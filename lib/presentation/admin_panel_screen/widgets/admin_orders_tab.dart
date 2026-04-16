@@ -34,9 +34,9 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
   DateTime? _endDate;
   bool _hasFiltered = false;
   bool _generatingPdf = false;
-  String _selectedStatus = 'All';
-  // ADDED: team filter — null means 'Both' (all teams)
-  String _selectedTeamFilter = 'Both';
+  String _selectedStatus = 'Pending';
+  // Team filter
+  String _selectedTeamFilter = 'JA';
 
   // Pagination
   static const _pageSize = 50;
@@ -67,7 +67,7 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
       _hasMore = true;
     });
     try {
-      final teamId = _selectedTeamFilter == 'Both' ? null : _selectedTeamFilter;
+      final teamId = _selectedTeamFilter;
       final orders = await _service.getOrdersByDateRange(
         startDate: _startDate,
         endDate: _endDate,
@@ -95,7 +95,7 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
     if (_loadingMore || !_hasMore) return;
     setState(() => _loadingMore = true);
     try {
-      final teamId = _selectedTeamFilter == 'Both' ? null : _selectedTeamFilter;
+      final teamId = _selectedTeamFilter;
       final moreOrders = await _service.getOrdersByDateRange(
         startDate: _startDate,
         endDate: _endDate,
@@ -170,11 +170,6 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
     return '${d.day.toString().padLeft(2, '0')}/${d.month.toString().padLeft(2, '0')}/${d.year}';
   }
 
-  String _csvField(String value) {
-    final escaped = value.replaceAll('"', '""');
-    return '"$escaped"';
-  }
-
   Map<String, List<OrderModel>> _groupByCustomer() {
     final map = <String, List<OrderModel>>{};
     for (final o in _filteredOrders) {
@@ -186,25 +181,44 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
     return sorted;
   }
 
-  String _buildCsv() {
+  String _buildCsv({
+    required List<OrderModel> orders,
+    required Map<String, double> productMrpMap,
+    required Map<String, String> productBillingNameMap,
+    required Map<String, String> userNameMap,
+    String? invoicePrefix,
+    int? invoiceStartNum,
+  }) {
     final buffer = StringBuffer();
+    const t = '\t';
 
     buffer.writeln(
-      'Customer Name,Order ID,Order Date,Product Name,SKU,Qty,Unit Price,Line Total,Subtotal,Grand Total',
+      'Invoice No${t}Order ID${t}Order Date${t}Customer Name${t}Qty${t}Rep Name${t}Item Name${t}MRP${t}Unit Price${t}Item Discount${t}Discount${t}Item Gross Amount${t}Notes',
     );
 
-    for (final o in _filteredOrders) {
-      final orderDate =
-          '${o.orderDate.day.toString().padLeft(2, '0')}/${o.orderDate.month.toString().padLeft(2, '0')}/${o.orderDate.year}';
+    const months = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+    final yesterday = DateTime.now().subtract(const Duration(days: 1));
+    final exportDate = '="${yesterday.day.toString().padLeft(2, '0')}-${months[yesterday.month - 1]}-${yesterday.year}"';
+    int invoiceCounter = invoiceStartNum ?? 0;
+    for (final o in orders) {
+      final invoiceNo = (invoicePrefix != null && invoiceStartNum != null)
+          ? '$invoicePrefix${invoiceCounter++}'
+          : '';
+      final orderDate = exportDate;
+      final repName = (o.userId != null ? userNameMap[o.userId] : null) ?? '';
+      final notes = o.notes ?? '';
 
       if (o.lineItems.isEmpty) {
         buffer.writeln(
-          '${_csvField(o.customerName)},${_csvField(o.id)},${_csvField(orderDate)},"","",0,0.00,0.00,${o.subtotal.toStringAsFixed(2)},${o.grandTotal.toStringAsFixed(2)}',
+          '$invoiceNo$t${o.id}$t$orderDate$t${o.customerName}${t}0$t$repName$t${t}0.00${t}0.00${t}0.00${t}0.00${t}0.00$t$notes',
         );
       } else {
         for (final item in o.lineItems) {
+          final mrp = item.mrp > 0 ? item.mrp : (productMrpMap[item.productId] ?? productMrpMap[item.sku] ?? 0.0);
+          final itemName = productBillingNameMap[item.productId] ?? productBillingNameMap[item.sku] ?? item.productName;
+          final grossAmount = item.quantity * item.unitPrice;
           buffer.writeln(
-            '${_csvField(o.customerName)},${_csvField(o.id)},${_csvField(orderDate)},${_csvField(item.productName)},${_csvField(item.sku)},${item.quantity},${item.unitPrice.toStringAsFixed(2)},${item.lineTotal.toStringAsFixed(2)},${o.subtotal.toStringAsFixed(2)},${o.grandTotal.toStringAsFixed(2)}',
+            '$invoiceNo$t${o.id}$t$orderDate$t${o.customerName}$t${item.quantity}$t$repName$t$itemName$t${mrp.toStringAsFixed(2)}$t${item.unitPrice.toStringAsFixed(2)}${t}0.00${t}0.00$t${grossAmount.toStringAsFixed(2)}$t$notes',
           );
         }
       }
@@ -213,19 +227,254 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
     return buffer.toString();
   }
 
-  void _downloadCsv() {
+  Future<void> _downloadCsv() async {
     if (_filteredOrders.isEmpty) {
       Fluttertoast.showToast(msg: 'No orders to export');
       return;
     }
-    final csv = _buildCsv();
+
+    // Step 1: Ask which order status to export
+    String exportStatus = 'Pending';
+    final statusResult = await showDialog<String?>(
+      context: context,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setDialogState) => AlertDialog(
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+            title: Text('Export Orders', style: GoogleFonts.manrope(fontWeight: FontWeight.w800)),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text('Select which orders to export',
+                    style: GoogleFonts.manrope(fontSize: 13, color: AppTheme.onSurfaceVariant)),
+                const SizedBox(height: 12),
+                DropdownButtonFormField<String>(
+                  value: exportStatus,
+                  decoration: InputDecoration(
+                    labelText: 'Order Status',
+                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                  ),
+                  items: ['Pending', 'All', 'Delivered'].map((s) => DropdownMenuItem(value: s, child: Text(s))).toList(),
+                  onChanged: (v) {
+                    if (v != null) setDialogState(() => exportStatus = v);
+                  },
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, null),
+                child: Text('Cancel', style: GoogleFonts.manrope(fontWeight: FontWeight.w600)),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(ctx, exportStatus),
+                child: Text('Next', style: GoogleFonts.manrope(fontWeight: FontWeight.w700)),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+    if (statusResult == null) return;
+
+    // Filter orders by selected status
+    final statusFilteredOrders = statusResult == 'All'
+        ? _filteredOrders
+        : _filteredOrders.where((o) => o.status.toLowerCase() == statusResult.toLowerCase()).toList();
+    if (statusFilteredOrders.isEmpty) {
+      Fluttertoast.showToast(msg: 'No $statusResult orders to export');
+      return;
+    }
+
+    // Step 2: Ask which beats to export (multi-select)
+    final beats = statusFilteredOrders.map((o) => o.beat).where((b) => b.isNotEmpty).toSet().toList()..sort();
+    final selectedBeats = <String>{...beats}; // all selected by default
+    final beatResult = await showDialog<Set<String>?>(
+      context: context,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setDialogState) {
+            final allSelected = selectedBeats.length == beats.length;
+            return AlertDialog(
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+              title: Text('Select Beats', style: GoogleFonts.manrope(fontWeight: FontWeight.w800)),
+              content: SizedBox(
+                width: double.maxFinite,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text('Select which beat orders to export',
+                        style: GoogleFonts.manrope(fontSize: 13, color: AppTheme.onSurfaceVariant)),
+                    const SizedBox(height: 12),
+                    // Select All / Deselect All
+                    CheckboxListTile(
+                      dense: true,
+                      title: Text('All Beats', style: GoogleFonts.manrope(fontWeight: FontWeight.w700)),
+                      value: allSelected,
+                      onChanged: (_) {
+                        setDialogState(() {
+                          if (allSelected) {
+                            selectedBeats.clear();
+                          } else {
+                            selectedBeats.addAll(beats);
+                          }
+                        });
+                      },
+                    ),
+                    const Divider(height: 1),
+                    // Individual beats
+                    ConstrainedBox(
+                      constraints: const BoxConstraints(maxHeight: 300),
+                      child: ListView.builder(
+                        shrinkWrap: true,
+                        itemCount: beats.length,
+                        itemBuilder: (_, i) {
+                          final beat = beats[i];
+                          final count = statusFilteredOrders.where((o) => o.beat == beat).length;
+                          return CheckboxListTile(
+                            dense: true,
+                            title: Text(beat, style: GoogleFonts.manrope(fontSize: 13)),
+                            subtitle: Text('$count orders', style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
+                            value: selectedBeats.contains(beat),
+                            onChanged: (_) {
+                              setDialogState(() {
+                                if (selectedBeats.contains(beat)) {
+                                  selectedBeats.remove(beat);
+                                } else {
+                                  selectedBeats.add(beat);
+                                }
+                              });
+                            },
+                          );
+                        },
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(ctx, null),
+                  child: Text('Cancel', style: GoogleFonts.manrope(fontWeight: FontWeight.w600)),
+                ),
+                FilledButton(
+                  onPressed: selectedBeats.isEmpty ? null : () => Navigator.pop(ctx, selectedBeats),
+                  child: Text('Next (${selectedBeats.length})', style: GoogleFonts.manrope(fontWeight: FontWeight.w700)),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+    if (beatResult == null || beatResult.isEmpty) return;
+
+    final exportOrders = beatResult.length == beats.length
+        ? statusFilteredOrders
+        : statusFilteredOrders.where((o) => beatResult.contains(o.beat)).toList();
+    if (exportOrders.isEmpty) {
+      Fluttertoast.showToast(msg: 'No orders for selected beats');
+      return;
+    }
+
+    // Step 3: Ask for starting invoice number
+    final invoiceController = TextEditingController();
+    final invoiceResult = await showDialog<String?>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Text('Starting Invoice No', style: GoogleFonts.manrope(fontWeight: FontWeight.w800)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text('Enter starting invoice number (e.g. INV420).\nIt will auto-increment for each order.',
+                style: GoogleFonts.manrope(fontSize: 13, color: AppTheme.onSurfaceVariant)),
+            const SizedBox(height: 12),
+            TextField(
+              controller: invoiceController,
+              textCapitalization: TextCapitalization.characters,
+              decoration: InputDecoration(
+                hintText: 'e.g. INV420',
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+                contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, null),
+            child: Text('Ignore', style: GoogleFonts.manrope(fontWeight: FontWeight.w600)),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, invoiceController.text.trim()),
+            child: Text('Add Invoice No', style: GoogleFonts.manrope(fontWeight: FontWeight.w700)),
+          ),
+        ],
+      ),
+    );
+
+    // Parse prefix and starting number from input like "INV420"
+    String? invoicePrefix;
+    int? invoiceStartNum;
+    if (invoiceResult != null && invoiceResult.isNotEmpty) {
+      final match = RegExp(r'^([A-Za-z]*)(\d+)$').firstMatch(invoiceResult);
+      if (match != null) {
+        invoicePrefix = match.group(1)!;
+        invoiceStartNum = int.parse(match.group(2)!);
+      } else {
+        Fluttertoast.showToast(msg: 'Invalid format. Use like INV420');
+        return;
+      }
+    }
+
+    // Build product lookup maps (by id and sku)
+    final products = await _service.getProducts();
+    final mrpMap = <String, double>{};
+    final billingNameMap = <String, String>{};
+    for (final p in products) {
+      mrpMap[p.id] = p.mrp;
+      billingNameMap[p.id] = p.billingName ?? p.name;
+      if (p.sku.isNotEmpty) {
+        mrpMap[p.sku] = p.mrp;
+        billingNameMap[p.sku] = p.billingName ?? p.name;
+      }
+    }
+
+    // Build user name lookup map
+    // Map by app_users.id AND by email (handles early users like Ranjeet
+    // whose auth UID differs from app_users.id)
+    final users = await _service.getAppUsers(allTeams: true);
+    final userNameMap = <String, String>{};
+    for (final u in users) {
+      userNameMap[u.id] = u.fullName;
+    }
+    // For unmatched order user_ids, resolve via direct DB lookup
+    final unmatchedIds = _filteredOrders
+        .where((o) => o.userId != null && !userNameMap.containsKey(o.userId))
+        .map((o) => o.userId!)
+        .toSet();
+    for (final uid in unmatchedIds) {
+      final name = await _service.getUserFullName(uid);
+      if (name != null) userNameMap[uid] = name;
+    }
+
+    final csv = _buildCsv(
+      orders: exportOrders,
+      productMrpMap: mrpMap,
+      productBillingNameMap: billingNameMap,
+      userNameMap: userNameMap,
+      invoicePrefix: invoicePrefix,
+      invoiceStartNum: invoiceStartNum,
+    );
     final dateLabel = _startDate != null || _endDate != null
         ? '_${_formatDate(_startDate).replaceAll('/', '-')}_to_${_formatDate(_endDate).replaceAll('/', '-')}'
         : '_all';
-    final filename = 'orders_customer_wise$dateLabel.csv';
+    final filename = 'orders_customer_wise$dateLabel.xls';
 
     triggerCsvDownload(csv, filename);
-    Fluttertoast.showToast(msg: 'CSV downloaded: $filename');
+    Fluttertoast.showToast(msg: 'File downloaded: $filename');
   }
 
   Future<void> _downloadPdf() async {
@@ -723,15 +972,15 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
           ),
         )),
 
-        // ADDED: Team Filter Chips (JA / MA / Both)
+        // Team Filter Chips (JA / MA)
         if (_hasFiltered && !_loading && _error == null)
           SliverToBoxAdapter(child: Container(
             color: AppTheme.surface,
             padding: const EdgeInsets.fromLTRB(12.0, 10.0, 12.0, 4.0),
             child: Row(
-              children: ['Both', 'JA', 'MA'].map((team) {
+              children: ['JA', 'MA'].map((team) {
                 final selected = _selectedTeamFilter == team;
-                final label = team == 'Both' ? 'Both Teams' : team == 'JA' ? 'Jagannath' : 'Madhav';
+                final label = team == 'JA' ? 'Jagannath' : 'Madhav';
                 return Padding(
                   padding: const EdgeInsets.only(right: 8),
                   child: GestureDetector(
@@ -894,6 +1143,7 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
           const SliverFillRemaining(child: Center(child: CircularProgressIndicator())),
         if (!_loading && _error != null)
           SliverFillRemaining(
+            hasScrollBody: false,
             child: Center(
               child: Column(
                 mainAxisSize: MainAxisSize.min,
@@ -916,6 +1166,7 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
           ),
         if (!_loading && _error == null && _filteredOrders.isEmpty)
           SliverFillRemaining(
+            hasScrollBody: false,
             child: EmptyStateWidget(
               icon: Icons.receipt_long_rounded,
               title: _hasFiltered ? 'No orders found' : 'No orders yet',

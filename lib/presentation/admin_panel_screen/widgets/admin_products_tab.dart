@@ -231,6 +231,46 @@ class _AdminProductsTabState extends State<AdminProductsTab>
     return Icons.check_circle_outline;
   }
 
+  // ── Delete Product ───────────────────────────────────────────
+  void _confirmDeleteProduct(ProductModel product) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Delete Product', style: GoogleFonts.manrope(fontWeight: FontWeight.w700)),
+        content: Text('Delete "${product.name}"?\n\nThis cannot be undone.',
+            style: GoogleFonts.manrope(fontSize: 14)),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text('Cancel', style: GoogleFonts.manrope(color: Colors.grey)),
+          ),
+          TextButton(
+            onPressed: () async {
+              Navigator.pop(ctx);
+              try {
+                await SupabaseService.instance.deleteProduct(product.id);
+                if (!mounted) return;
+                setState(() {
+                  _products.removeWhere((p) => p.id == product.id);
+                  _filtered.removeWhere((p) => p.id == product.id);
+                });
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Product deleted'), backgroundColor: Colors.green),
+                );
+              } catch (e) {
+                if (!mounted) return;
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red),
+                );
+              }
+            },
+            child: Text('Delete', style: GoogleFonts.manrope(color: Colors.red, fontWeight: FontWeight.w700)),
+          ),
+        ],
+      ),
+    );
+  }
+
   // ── Bottom Sheet: Add / Edit ─────────────────────────────────
   void _openProductSheet({ProductModel? existing}) {
     final isEdit = existing != null;
@@ -239,8 +279,12 @@ class _AdminProductsTabState extends State<AdminProductsTab>
     final printNameCtrl = TextEditingController(text: existing?.printName ?? '');
     final priceCtrl = TextEditingController(
         text: existing != null ? existing.unitPrice.toString() : '');
+    final mrpCtrl = TextEditingController(
+        text: existing != null && existing.mrp > 0 ? existing.mrp.toString() : '');
     final stockCtrl = TextEditingController(
         text: existing != null ? existing.stockQty.toString() : '');
+    final stepSizeCtrl = TextEditingController(
+        text: existing != null ? existing.stepSize.toString() : '1');
     // Pre-select the existing category if it matches a known one
     String? selectedCategoryName = _categoryModels
         .where((c) => c.name == (existing?.categoryName ?? ''))
@@ -262,6 +306,9 @@ class _AdminProductsTabState extends State<AdminProductsTab>
               bottom: MediaQuery.of(ctx).viewInsets.bottom,
             ),
             child: Container(
+              constraints: BoxConstraints(
+                maxHeight: MediaQuery.of(ctx).size.height * 0.85,
+              ),
               decoration: BoxDecoration(
                 color: Theme.of(ctx).scaffoldBackgroundColor,
                 borderRadius:
@@ -270,6 +317,7 @@ class _AdminProductsTabState extends State<AdminProductsTab>
               padding: const EdgeInsets.fromLTRB(24, 12, 24, 32),
               child: Form(
                 key: formKey,
+                child: SingleChildScrollView(
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -441,6 +489,23 @@ class _AdminProductsTabState extends State<AdminProductsTab>
                         const SizedBox(width: 12),
                         Expanded(
                           child: _buildField(
+                            mrpCtrl,
+                            'MRP (₹)',
+                            Icons.sell_outlined,
+                            keyboardType: TextInputType.number,
+                            validator: (v) {
+                              if (v != null && v.isNotEmpty && double.tryParse(v) == null) return 'Invalid';
+                              return null;
+                            },
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 14),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: _buildField(
                             stockCtrl,
                             'Stock Qty',
                             Icons.warehouse_outlined,
@@ -448,6 +513,21 @@ class _AdminProductsTabState extends State<AdminProductsTab>
                             validator: (v) {
                               if (v == null || v.isEmpty) return 'Required';
                               if (int.tryParse(v) == null) return 'Invalid';
+                              return null;
+                            },
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: _buildField(
+                            stepSizeCtrl,
+                            'Step Size',
+                            Icons.linear_scale_rounded,
+                            keyboardType: TextInputType.number,
+                            validator: (v) {
+                              if (v == null || v.isEmpty) return 'Required';
+                              final n = int.tryParse(v);
+                              if (n == null || n < 1) return 'Min 1';
                               return null;
                             },
                           ),
@@ -475,8 +555,13 @@ class _AdminProductsTabState extends State<AdminProductsTab>
                                     'category': selectedCategoryName ?? '',
                                     'unit_price':
                                         double.parse(priceCtrl.text.trim()),
+                                    'mrp': mrpCtrl.text.trim().isNotEmpty
+                                        ? double.parse(mrpCtrl.text.trim())
+                                        : 0,
                                     'stock_qty':
                                         int.parse(stockCtrl.text.trim()),
+                                    'step_size':
+                                        int.parse(stepSizeCtrl.text.trim()),
                                     'subcategory_id': selectedSubcategoryId,
                                   };
                                   if (isEdit) {
@@ -487,6 +572,9 @@ class _AdminProductsTabState extends State<AdminProductsTab>
                                         .addProduct(data);
                                   }
                                   nav.pop();
+                                  // Wait for bottom sheet dismiss animation to complete
+                                  // before updating parent state to avoid _dependents.isEmpty assertion
+                                  await Future.delayed(const Duration(milliseconds: 300));
                                   if (!mounted) return;
                                   if (isEdit) {
                                     // Refresh only the edited product in-place
@@ -548,6 +636,7 @@ class _AdminProductsTabState extends State<AdminProductsTab>
                     ),
                   ],
                 ),
+                ),
               ),
             ),
           );
@@ -558,7 +647,9 @@ class _AdminProductsTabState extends State<AdminProductsTab>
       billingNameCtrl.dispose();
       printNameCtrl.dispose();
       priceCtrl.dispose();
+      mrpCtrl.dispose();
       stockCtrl.dispose();
+      stepSizeCtrl.dispose();
     });
   }
 
@@ -1297,6 +1388,8 @@ class _AdminProductsTabState extends State<AdminProductsTab>
                                   isSelectMode: _isSelectMode,
                                   onEdit: () =>
                                       _openProductSheet(existing: product),
+                                  onDelete: () =>
+                                      _confirmDeleteProduct(product),
                                   onLongPress: () =>
                                       _enterSelectMode(product.id),
                                   onSelect: () =>
@@ -1353,6 +1446,7 @@ class _ProductCard extends StatelessWidget {
   final bool isSelected;
   final bool isSelectMode;
   final VoidCallback onEdit;
+  final VoidCallback onDelete;
   final VoidCallback onLongPress;
   final VoidCallback onSelect;
 
@@ -1364,6 +1458,7 @@ class _ProductCard extends StatelessWidget {
     required this.isSelected,
     required this.isSelectMode,
     required this.onEdit,
+    required this.onDelete,
     required this.onLongPress,
     required this.onSelect,
   });
@@ -1479,7 +1574,7 @@ class _ProductCard extends StatelessWidget {
                   ],
                 ),
               ),
-              if (!isSelectMode)
+              if (!isSelectMode) ...[
                 IconButton(
                   onPressed: onEdit,
                   icon: const Icon(Icons.edit_rounded, size: 18),
@@ -1491,6 +1586,19 @@ class _ProductCard extends StatelessWidget {
                     ),
                   ),
                 ),
+                const SizedBox(width: 4),
+                IconButton(
+                  onPressed: onDelete,
+                  icon: const Icon(Icons.delete_outline_rounded, size: 18),
+                  color: Colors.red.shade400,
+                  style: IconButton.styleFrom(
+                    backgroundColor: Colors.red.shade50,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                  ),
+                ),
+              ],
             ],
           ),
         ),

@@ -29,6 +29,7 @@ class SupabaseService {
   bool get isAdmin => currentUserRole == 'admin' || currentUserRole == 'super_admin';
   bool isOfflineMode = false;
   String? _resolvedAppUserId; // cached resolved app_users.id
+  void clearResolvedUserId() => _resolvedAppUserId = null;
 
   /// Resolves auth UID to app_users.id (they may differ for early users)
   Future<String> _resolveAppUserId(String authUid) async {
@@ -270,7 +271,7 @@ class SupabaseService {
 
   Future<BeatModel?> getBeatById(String id) async {
     try {
-      final resp = await client.from('beats').select().eq('id', id).maybeSingle();
+      final resp = await client.from('beats').select().eq('id', id).eq('team_id', AuthService.currentTeam).maybeSingle();
       if (resp == null) return null;
       return BeatModel.fromJson(Map<String, dynamic>.from(resp));
     } catch (e) {
@@ -281,7 +282,7 @@ class SupabaseService {
 
   Future<ProductModel?> getProductById(String id) async {
     try {
-      final resp = await client.from('products').select().eq('id', id).maybeSingle();
+      final resp = await client.from('products').select().eq('id', id).eq('team_id', AuthService.currentTeam).maybeSingle();
       if (resp == null) return null;
       return ProductModel.fromJson(Map<String, dynamic>.from(resp));
     } catch (e) {
@@ -491,6 +492,21 @@ class SupabaseService {
     required String billNo, required String customerId, required String customerName,
     required double amountPaid, required double remainingBalance, String? paymentMethod, String? driveFileId,
   }) async {
+    // Duplicate guard: same bill + customer + amount + same day = skip
+    final today = DateTime.now().toIso8601String().substring(0, 10);
+    final existing = await client.from('collections')
+        .select('id')
+        .eq('bill_no', billNo)
+        .eq('customer_id', customerId)
+        .eq('amount_paid', amountPaid)
+        .eq('collection_date', today)
+        .eq('team_id', AuthService.currentTeam)
+        .maybeSingle();
+    if (existing != null) {
+      debugPrint('⚠️ Duplicate collection skipped: $billNo / $customerId / $amountPaid');
+      return;
+    }
+
     final uid = client.auth.currentUser?.id;
     String repName = client.auth.currentUser?.email ?? 'Offline Rep';
     if (uid != null) {
@@ -504,10 +520,34 @@ class SupabaseService {
       'rep_email': client.auth.currentUser?.email ?? 'Offline Rep',
       'collected_by': repName,
       'team_id': AuthService.currentTeam,
-      'collection_date': DateTime.now().toIso8601String().substring(0, 10),
+      'collection_date': today,
       if (paymentMethod != null) 'payment_mode': paymentMethod,
       if (driveFileId != null) 'drive_file_id': driveFileId,
     });
+  }
+
+  /// Delete app collections older than 6 days.
+  /// Called during sync — by then RECT data from billing software has the real records.
+  Future<int> cleanupOldAppCollections() async {
+    try {
+      final cutoff = DateTime.now().subtract(const Duration(days: 6))
+          .toIso8601String().substring(0, 10);
+      final old = await client.from('collections')
+          .select('id')
+          .lt('collection_date', cutoff)
+          .eq('team_id', AuthService.currentTeam);
+      final ids = (old as List).map((r) => r['id'].toString()).toList();
+      if (ids.isEmpty) return 0;
+      for (int i = 0; i < ids.length; i += 50) {
+        final chunk = ids.sublist(i, (i + 50).clamp(0, ids.length));
+        await client.from('collections').delete().inFilter('id', chunk);
+      }
+      debugPrint('🗑️ Cleaned up ${ids.length} app collections older than 6 days');
+      return ids.length;
+    } catch (e) {
+      debugPrint('⚠️ cleanupOldAppCollections error: $e');
+      return 0;
+    }
   }
 
   Future<List<dynamic>> getCollectionHistory(String customerId, {String? teamId}) async {
@@ -687,13 +727,13 @@ class SupabaseService {
       if (customerId != null) query = query.eq('customer_id', customerId);
       if (paymentMode != null) query = query.eq('payment_mode', paymentMode);
       if (collectedBy != null) query = query.eq('collected_by', collectedBy);
-      // Default to last 60 days if no start date specified (reps only)
-      // Admin/super_admin gets all data
-      if (!isAdmin) {
-        final effectiveStart = startDate ?? DateTime.now().subtract(const Duration(days: 60));
-        query = query.gte('created_at', effectiveStart.toIso8601String());
+      if (startDate != null) {
+        query = query.gte('collection_date', startDate.toIso8601String().substring(0, 10));
+      } else if (!isAdmin) {
+        // Default to last 60 days for reps when no date range specified
+        final cutoff = DateTime.now().subtract(const Duration(days: 60)).toIso8601String().substring(0, 10);
+        query = query.gte('collection_date', cutoff);
       }
-      if (startDate != null) query = query.gte('collection_date', startDate.toIso8601String().substring(0, 10));
       if (endDate != null) query = query.lte('collection_date', endDate.toIso8601String().substring(0, 10));
       final response = await query.order('collection_date', ascending: false);
       return (response as List)
@@ -748,6 +788,29 @@ class SupabaseService {
     }
   }
 
+
+  /// Update a collection's amount, method, and bill number.
+  Future<bool> updateCollection(String collectionId, {double? newAmount, String? newMethod, String? newBillNo}) async {
+    try {
+      final updates = <String, dynamic>{};
+      if (newAmount != null) {
+        updates['amount_paid'] = newAmount;
+        updates['amount_collected'] = newAmount;
+      }
+      if (newMethod != null) updates['payment_mode'] = newMethod;
+      if (newBillNo != null) updates['bill_no'] = newBillNo;
+      if (updates.isEmpty) return true;
+
+      await client.from('collections')
+          .update(updates)
+          .eq('id', collectionId)
+          .eq('team_id', AuthService.currentTeam);
+      return true;
+    } catch (e) {
+      debugPrint('updateCollection error: $e');
+      return false;
+    }
+  }
 
   // ─── ADMIN & STREAM METHODS ───
 
@@ -1122,13 +1185,71 @@ class SupabaseService {
   }
 
   Future<void> signOut() async {
+    _resolvedAppUserId = null; // Clear cached user ID on logout
     await AuthService.instance.signOut();
   }
 
-  // ─── STUBS FOR OLD METHODS (Prevents compilation errors) ───
   Future<List<ProductCategoryModel>> getAllProductCategories() async => getProductCategories();
-  Future<List<OrderModel>> getContextualOrders({String? beatName, int limit = 20, int offset = 0}) async => [];
-  Future<void> upsertProduct(ProductModel product) async {}
+
+  // ─── CUSTOMER BILLS / RECEIPTS (from OPNBIL / RECT / RCTBIL) ───
+
+  /// Get outstanding bills for a customer from customer_bills table (OPNBIL data).
+  /// For reps: filters to last 2 months. For admin: all data.
+  Future<List<Map<String, dynamic>>> getCustomerBills(String customerId, {bool repOnly = false}) async {
+    var query = client.from('customer_bills').select()
+        .eq('customer_id', customerId)
+        .eq('team_id', AuthService.currentTeam);
+    if (repOnly) {
+      final twoMonthsAgo = DateTime.now().subtract(const Duration(days: 60)).toIso8601String().substring(0, 10);
+      query = query.gte('bill_date', twoMonthsAgo);
+    }
+    final data = await query.order('bill_date', ascending: false);
+    return List<Map<String, dynamic>>.from(data);
+  }
+
+  /// Get all bills for current team (for outstanding report).
+  Future<List<Map<String, dynamic>>> getCustomerBillsForTeam({String? teamId}) async {
+    final data = await client.from('customer_bills').select()
+        .eq('team_id', teamId ?? AuthService.currentTeam)
+        .order('bill_date', ascending: false);
+    return List<Map<String, dynamic>>.from(data);
+  }
+
+  /// Get receipts for a customer from customer_receipts table (RECT data).
+  Future<List<Map<String, dynamic>>> getCustomerReceipts(String customerId, {bool repOnly = false}) async {
+    var query = client.from('customer_receipts').select()
+        .eq('customer_id', customerId)
+        .eq('team_id', AuthService.currentTeam);
+    if (repOnly) {
+      final twoMonthsAgo = DateTime.now().subtract(const Duration(days: 60)).toIso8601String().substring(0, 10);
+      query = query.gte('receipt_date', twoMonthsAgo);
+    }
+    final data = await query.order('receipt_date', ascending: false);
+    return List<Map<String, dynamic>>.from(data);
+  }
+
+  /// Get billed items for a customer from ITTR data (customer_billed_items table).
+  Future<List<Map<String, dynamic>>> getCustomerBilledItems(String customerId, {bool repOnly = false}) async {
+    var query = client.from('customer_billed_items').select()
+        .eq('customer_id', customerId)
+        .eq('team_id', AuthService.currentTeam);
+    if (repOnly) {
+      final twoMonthsAgo = DateTime.now().subtract(const Duration(days: 60)).toIso8601String().substring(0, 10);
+      query = query.gte('bill_date', twoMonthsAgo);
+    }
+    final data = await query.order('bill_date', ascending: false);
+    return List<Map<String, dynamic>>.from(data);
+  }
+
+  /// Get receipt bill breakdown (RCTBIL data) for receipts.
+  Future<List<Map<String, dynamic>>> getReceiptBillDetails(String receiptNo, {String? teamId}) async {
+    final team = teamId ?? AuthService.currentTeam;
+    final data = await client.from('customer_receipt_bills').select()
+        .eq('receipt_no', receiptNo)
+        .eq('team_id', team)
+        .order('bill_date', ascending: false);
+    return List<Map<String, dynamic>>.from(data);
+  }
 
   Future<void> addProduct(Map<String, dynamic> data) async {
     await client.from('products').insert({
@@ -1140,13 +1261,25 @@ class SupabaseService {
       'pack_size': '',
       'image_url': '',
       'semantic_label': '',
-      ...data,
       'team_id': AuthService.currentTeam,
+      ...data, // data can override team_id if explicitly provided
     });
   }
 
   Future<void> updateProduct(String id, Map<String, dynamic> data) async {
     await client.from('products').update(data).eq('id', id);
+  }
+
+  Future<void> deleteProduct(String id) async {
+    await client.from('products').delete().eq('id', id);
+    await invalidateCache('products');
+  }
+
+  Future<void> deleteCustomer(String id) async {
+    // Delete team profile first (FK dependency), then customer
+    await client.from('customer_team_profiles').delete().eq('customer_id', id);
+    await client.from('customers').delete().eq('id', id);
+    await invalidateCache('customers');
   }
 
   Future<void> updateCustomerLastOrder(String customerId, double orderValue) async {
@@ -1159,7 +1292,7 @@ class SupabaseService {
       debugPrint('⚠️ updateCustomerLastOrder failed: $e');
     }
   }
-  Future<List<OrderModel>> getOrders() async => [];
+
 
   // ─── 📦 ORDER MANAGEMENT ───
 
@@ -1407,6 +1540,44 @@ class SupabaseService {
       debugPrint("Error fetching users: $e");
       return [];
     }
+  }
+
+  /// Resolves a user_id (which may be auth UID) to full_name.
+  /// Tries direct app_users.id match first, then falls back to checking
+  /// auth admin API for early users whose auth UID differs from app_users.id.
+  Future<String?> getUserFullName(String userId) async {
+    try {
+      // Direct match by app_users.id
+      final direct = await client.from('app_users').select('full_name').eq('id', userId).maybeSingle();
+      if (direct != null) return direct['full_name'] as String?;
+      // Fallback for early users: find auth user email, then match app_users
+      final env = await _loadAdminEnv();
+      if (env['serviceKey'] == null) return null;
+      final resp = await http.get(
+        Uri.parse('${env['supabaseUrl']}/auth/v1/admin/users?page=1&per_page=1000'),
+        headers: {
+          'apikey': env['serviceKey']!,
+          'Authorization': 'Bearer ${env['serviceKey']}',
+        },
+      );
+      if (resp.statusCode == 200) {
+        final data = jsonDecode(resp.body) as Map<String, dynamic>;
+        final authUsers = data['users'] as List? ?? [];
+        for (final au in authUsers) {
+          if (au['id'] == userId) {
+            final email = (au['email'] as String?)?.toLowerCase();
+            if (email != null) {
+              final byEmail = await client.from('app_users').select('full_name').eq('email', email).maybeSingle();
+              return byEmail?['full_name'] as String?;
+            }
+            break;
+          }
+        }
+      }
+    } catch (e) {
+      debugPrint('getUserFullName error for $userId: $e');
+    }
+    return null;
   }
 
   Future<void> createAppUser({required String email, required String password, required String fullName, String role = 'sales_rep'}) async {
@@ -1687,18 +1858,20 @@ class SupabaseService {
   // CHANGED: unified profile — use team-specific beat column
   Future<Map<String, int>> getCustomerCountsByBeat() async {
     try {
-      final isJa = AuthService.currentTeam == 'JA';
-      final beatCol = isJa ? 'beat_id_ja' : 'beat_id_ma';
-      final teamCol = isJa ? 'team_ja' : 'team_ma';
-      final response = await client
-          .from('customer_team_profiles')
-          .select(beatCol)
-          .eq(teamCol, true)
-          .not(beatCol, 'is', null);
       final Map<String, int> counts = {};
-      for (final row in response as List) {
-        final beatId = row[beatCol] as String?;
-        if (beatId != null) counts[beatId] = (counts[beatId] ?? 0) + 1;
+      // Count for both teams so admin sees correct counts for all beats
+      for (final team in ['JA', 'MA']) {
+        final beatCol = team == 'JA' ? 'beat_id_ja' : 'beat_id_ma';
+        final teamCol = team == 'JA' ? 'team_ja' : 'team_ma';
+        final response = await client
+            .from('customer_team_profiles')
+            .select(beatCol)
+            .eq(teamCol, true)
+            .not(beatCol, 'is', null);
+        for (final row in response as List) {
+          final beatId = row[beatCol] as String?;
+          if (beatId != null) counts[beatId] = (counts[beatId] ?? 0) + 1;
+        }
       }
       return counts;
     } catch (e) {
@@ -1798,8 +1971,10 @@ class SupabaseService {
     }
   }
 
-  Future<void> addUserToBeat(String userId, String beatId) async {
-    await client.from('user_beats').insert({'user_id': userId, 'beat_id': beatId});
+  Future<void> addUserToBeat(String userId, String beatId, {List<String>? weekdays}) async {
+    final data = <String, dynamic>{'user_id': userId, 'beat_id': beatId};
+    if (weekdays != null && weekdays.isNotEmpty) data['weekdays'] = weekdays;
+    await client.from('user_beats').upsert(data, onConflict: 'user_id,beat_id');
   }
 
   Future<void> removeUserFromBeat(String userId, String beatId) async {

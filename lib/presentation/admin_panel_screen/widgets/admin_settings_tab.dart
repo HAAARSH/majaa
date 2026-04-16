@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:hive_flutter/hive_flutter.dart';
+import 'package:intl/intl.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../../../theme/app_theme.dart';
@@ -34,6 +35,24 @@ class _AdminSettingsTabState extends State<AdminSettingsTab> {
     _checkDatabaseHealth();
     _isGoogleSignedIn = GoogleDriveAuthService.instance.isSignedIn;
     _googleEmail = GoogleDriveAuthService.instance.userEmail;
+    DriveSyncService.instance.authError.addListener(_onDriveAuthError);
+  }
+
+  void _onDriveAuthError() {
+    final error = DriveSyncService.instance.authError.value;
+    if (error != null && mounted) {
+      // Service already called signOut — just refresh local state
+      setState(() {
+        _isGoogleSignedIn = GoogleDriveAuthService.instance.isSignedIn;
+        _googleEmail = null;
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    DriveSyncService.instance.authError.removeListener(_onDriveAuthError);
+    super.dispose();
   }
 
   Future<void> _handleGoogleSignIn() async {
@@ -99,33 +118,58 @@ class _AdminSettingsTabState extends State<AdminSettingsTab> {
   Future<void> _syncFromDrive() async {
     setState(() => _stockSyncing = true);
     try {
-      // Sync stock (ITMRP)
-      final stockResult = await DriveSyncService.instance.syncStockFromDrive();
-      // Sync bills (ITTR)
-      final billResult = await DriveSyncService.instance.syncBillsFromDrive();
-      if (!mounted) return;
-
       final msgs = <String>[];
-      if (stockResult.hasError) {
-        msgs.add('Stock: ${stockResult.error}');
-      } else {
-        msgs.add('Stock: ${stockResult.updated} updated');
-      }
-      if (billResult.hasError) {
-        msgs.add('Bills: ${billResult.error}');
-      } else {
-        final parts = <String>['${billResult.totalBills} bills'];
-        if (billResult.applied > 0) parts.add('${billResult.applied} verified');
-        if (billResult.discrepancies > 0) parts.add('${billResult.discrepancies} to review');
-        msgs.add('Bills: ${parts.join(', ')}');
-      }
+      bool hasError = false;
 
-      final hasError = stockResult.hasError || billResult.hasError;
+      // Cleanup old app collections first
+      await SupabaseService.instance.cleanupOldAppCollections();
+
+      // 1. ITMRP (Stock)
+      final stockResult = await DriveSyncService.instance.syncStockFromDrive();
+      if (stockResult.hasError) { msgs.add('Stock: ${stockResult.error}'); hasError = true; }
+      else { msgs.add('Stock: ${stockResult.updated} updated'); }
+
+      // 2. ITTR (Bills)
+      final billResult = await DriveSyncService.instance.syncBillsFromDrive();
+      if (billResult.hasError) { msgs.add('Bills: ${billResult.error}'); hasError = true; }
+      else { msgs.add('Bills: ${billResult.totalBills}'); }
+
+      // 3. ACMAST (Customers)
+      final custResult = await DriveSyncService.instance.syncCustomersFromDrive();
+      if (custResult.hasError) { msgs.add('Customers: ${custResult.error}'); hasError = true; }
+      else { msgs.add('Cust: ${custResult.matched} matched'); }
+
+      // 4. OPNBIL (Opening Bills)
+      try { await DriveSyncService.instance.syncOutstandingBillsFromDrive(); msgs.add('OPNBIL: done'); }
+      catch (e) { msgs.add('OPNBIL: $e'); hasError = true; }
+
+      // 5. INV (Invoices)
+      try { await DriveSyncService.instance.syncInvoicesFromDrive(); msgs.add('INV: done'); }
+      catch (e) { msgs.add('INV: $e'); hasError = true; }
+
+      // 6. RECT + RCTBIL (Receipts)
+      try { await DriveSyncService.instance.syncReceiptsFromDrive(); msgs.add('Receipts: done'); }
+      catch (e) { msgs.add('Receipts: $e'); hasError = true; }
+
+      // 7. ITTR Billed Items (per-customer)
+      try { await DriveSyncService.instance.syncBilledItemsFromDrive(); msgs.add('Billed: done'); }
+      catch (e) { msgs.add('Billed: $e'); hasError = true; }
+
+      // 8. BILLED_COLLECTED (Outstanding totals)
+      try { await DriveSyncService.instance.syncBilledCollectedFromDrive(); msgs.add('Outstanding: done'); }
+      catch (e) { msgs.add('Outstanding: $e'); hasError = true; }
+
+      // Save last synced timestamp
+      final box = await Hive.openBox('app_settings');
+      await box.put('last_drive_sync', DateTime.now().toIso8601String());
+      if (mounted) setState(() {});
+
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(msgs.join(' | ')),
+          content: Text(msgs.join(' | '), maxLines: 3),
           backgroundColor: hasError ? Colors.orange : Colors.green,
-          duration: const Duration(seconds: 5),
+          duration: const Duration(seconds: 6),
         ),
       );
     } catch (e) {
@@ -441,6 +485,17 @@ class _AdminSettingsTabState extends State<AdminSettingsTab> {
                   padding: const EdgeInsets.symmetric(vertical: 10),
                 ),
               ),
+            ),
+            const SizedBox(height: 6),
+            FutureBuilder<String?>(
+              future: Hive.openBox('app_settings').then((b) => b.get('last_drive_sync') as String?),
+              builder: (_, snap) {
+                final ts = snap.data;
+                if (ts == null) return Text('Never synced', style: GoogleFonts.manrope(fontSize: 10, color: AppTheme.onSurfaceVariant));
+                final dt = DateTime.tryParse(ts);
+                final label = dt != null ? DateFormat('dd MMM yyyy, hh:mm a').format(dt) : ts;
+                return Text('Last synced: $label', style: GoogleFonts.manrope(fontSize: 10, color: Colors.green.shade700));
+              },
             ),
           ],
         ],

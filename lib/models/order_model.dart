@@ -23,6 +23,8 @@ class OrderModel {
   // Stage 1: delivery rep OCR values
   final String? preliminaryBillNo;
   final double? preliminaryAmount;
+  final String source; // 'app' = sales rep order, 'office' = auto-created from ITTR
+  final String? userId;
 
   const OrderModel({
     required this.id, this.customerId, required this.customerName, required this.beat,
@@ -32,6 +34,7 @@ class OrderModel {
     this.finalBillNo, this.actualBilledAmount,
     this.billPhotoUrl, this.verifiedByDelivery = false, this.verifiedByOffice = false,
     this.billVerified = false, this.preliminaryBillNo, this.preliminaryAmount,
+    this.source = 'app', this.userId,
   });
 
   factory OrderModel.fromJson(Map<String, dynamic> json) => OrderModel(
@@ -58,6 +61,8 @@ class OrderModel {
     billVerified: json['bill_verified'] as bool? ?? false,
     preliminaryBillNo: json['preliminary_bill_no'] as String?,
     preliminaryAmount: (json['preliminary_amount'] as num?)?.toDouble(),
+    source: json['source'] as String? ?? 'app',
+    userId: json['user_id'] as String?,
   );
 
   OrderModel copyWithStatus(String newStatus) => OrderModel(
@@ -69,7 +74,10 @@ class OrderModel {
     billPhotoUrl: billPhotoUrl, verifiedByDelivery: verifiedByDelivery,
     verifiedByOffice: verifiedByOffice, billVerified: billVerified,
     preliminaryBillNo: preliminaryBillNo, preliminaryAmount: preliminaryAmount,
+    source: source, userId: userId,
   );
+
+  bool get isOfficeBill => source == 'office';
 }
 
 class OrderItemModel {
@@ -80,11 +88,12 @@ class OrderItemModel {
   final String sku;
   final int quantity;
   final double unitPrice;
+  final double mrp;
   final double lineTotal;
 
   const OrderItemModel({
     this.id, required this.orderId, this.productId, required this.productName,
-    required this.sku, required this.quantity, required this.unitPrice, required this.lineTotal,
+    required this.sku, required this.quantity, required this.unitPrice, this.mrp = 0, required this.lineTotal,
   });
 
   factory OrderItemModel.fromJson(Map<String, dynamic> json) => OrderItemModel(
@@ -95,11 +104,12 @@ class OrderItemModel {
     sku: json['sku'] as String? ?? '',
     quantity: json['quantity'] as int? ?? 1,
     unitPrice: (json['unit_price'] as num?)?.toDouble() ?? 0.0,
+    mrp: (json['mrp'] as num?)?.toDouble() ?? 0.0,
     lineTotal: (json['line_total'] as num?)?.toDouble() ?? 0.0,
   );
 
   Map<String, dynamic> toJson() => {
     'order_id': orderId, 'product_id': productId, 'product_name': productName,
-    'sku': sku, 'quantity': quantity, 'unit_price': unitPrice, 'line_total': lineTotal,
+    'sku': sku, 'quantity': quantity, 'unit_price': unitPrice, 'mrp': mrp, 'line_total': lineTotal,
   };
 }

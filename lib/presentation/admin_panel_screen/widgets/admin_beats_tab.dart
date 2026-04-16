@@ -55,10 +55,6 @@ class _AdminBeatsTabState extends State<AdminBeatsTab> {
     final codeCtrl = TextEditingController(text: beat?.beatCode ?? '');
     final areaCtrl = TextEditingController(text: beat?.area ?? '');
     final routeCtrl = TextEditingController(text: beat?.route ?? '');
-    final selectedDays = Set<String>.from(
-      (beat?.weekdays ?? []).map((d) => d.toLowerCase().trim()),
-    );
-
     showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
@@ -77,26 +73,6 @@ class _AdminBeatsTabState extends State<AdminBeatsTab> {
                 buildAdminTextField('Area', areaCtrl),
                 const SizedBox(height: 10),
                 buildAdminTextField('Route', routeCtrl),
-                const SizedBox(height: 14),
-                Text('Schedule Days', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w600, color: AppTheme.onSurfaceVariant)),
-                const SizedBox(height: 8),
-                Wrap(
-                  spacing: 8, runSpacing: 8,
-                  children: _allDays.map((day) {
-                    final sel = selectedDays.contains(day);
-                    return FilterChip(
-                      label: Text(_dayLabels[day]!, style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w600, color: sel ? Colors.white : AppTheme.onSurface)),
-                      selected: sel,
-                      onSelected: (v) => setDialogState(() { if (v) selectedDays.add(day); else selectedDays.remove(day); }),
-                      selectedColor: AppTheme.primary,
-                      backgroundColor: AppTheme.surfaceVariant,
-                      checkmarkColor: Colors.white,
-                      side: BorderSide(color: sel ? AppTheme.primary : AppTheme.outline, width: 1),
-                      padding: const EdgeInsets.symmetric(horizontal: 4),
-                      visualDensity: VisualDensity.compact,
-                    );
-                  }).toList(),
-                ),
               ],
             ),
           ),
@@ -113,7 +89,7 @@ class _AdminBeatsTabState extends State<AdminBeatsTab> {
                 }
                 Navigator.pop(ctx);
                 try {
-                  await SupabaseService.instance.upsertBeat(id: beat?.id, beatName: name, beatCode: code, area: areaCtrl.text.trim(), route: routeCtrl.text.trim(), weekdays: selectedDays.toList());
+                  await SupabaseService.instance.upsertBeat(id: beat?.id, beatName: name, beatCode: code, area: areaCtrl.text.trim(), route: routeCtrl.text.trim(), weekdays: beat?.weekdays ?? []);
                   if (beat != null) {
                     // Edit — refresh only the edited beat in-place
                     final updated = await SupabaseService.instance.getBeatById(beat.id);

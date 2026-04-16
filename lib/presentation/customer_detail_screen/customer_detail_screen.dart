@@ -33,8 +33,21 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
   bool _collectionsLoading = true;
   List<dynamic> _collections = [];
 
-  // Dual-team support for customers in both JA and MA
-  bool get _isDualTeam => _customer != null &&
+  // OPNBIL outstanding bills + RECT receipts + ITTR billed items from billing software
+  bool _billsLoading = true;
+  List<Map<String, dynamic>> _outstandingBills = [];
+  bool _receiptsLoading = true;
+  List<Map<String, dynamic>> _receipts = [];
+  bool _billedItemsLoading = true;
+  List<Map<String, dynamic>> _billedItems = [];
+  // RCTBIL: receipt_no → list of invoice numbers paid by that receipt
+  Map<String, List<String>> _receiptBillMap = {};
+
+  // Dual-team support — only when navigated from merged multi-team beat view
+  // AND customer actually belongs to both teams
+  bool _isMergedView = false;
+  bool get _isDualTeam => _isMergedView &&
+      _customer != null &&
       _customer!.belongsToTeam('JA') && _customer!.belongsToTeam('MA');
   List<dynamic> _collectionsJA = [];
   List<dynamic> _collectionsMA = [];
@@ -53,14 +66,17 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
         _customer = args['customer'] as CustomerModel;
         _loadOrders();
         _loadCollections();
+        _loadBillingData();
       }
       if (args['beat'] is BeatModel) {
         _beat = args['beat'] as BeatModel;
       }
+      _isMergedView = args['isMergedView'] as bool? ?? false;
     } else if (args is CustomerModel) {
       _customer = args;
       _loadOrders();
       _loadCollections();
+      _loadBillingData();
     }
   }
 
@@ -107,6 +123,90 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
     }
   }
 
+  Future<void> _loadBillingData() async {
+    if (_customer == null) return;
+    final isRep = SupabaseService.instance.currentUserRole == 'sales_rep' ||
+        SupabaseService.instance.currentUserRole == 'brand_rep';
+    try {
+      if (_isDualTeam) {
+        // Load both teams' data for dual-team customers
+        final savedTeam = AuthService.currentTeam;
+        AuthService.currentTeam = 'JA';
+        final jaResults = await Future.wait([
+          SupabaseService.instance.getCustomerBills(_customer!.id, repOnly: isRep),
+          SupabaseService.instance.getCustomerReceipts(_customer!.id, repOnly: isRep),
+          SupabaseService.instance.getCustomerBilledItems(_customer!.id, repOnly: isRep),
+        ]);
+        AuthService.currentTeam = 'MA';
+        final maResults = await Future.wait([
+          SupabaseService.instance.getCustomerBills(_customer!.id, repOnly: isRep),
+          SupabaseService.instance.getCustomerReceipts(_customer!.id, repOnly: isRep),
+          SupabaseService.instance.getCustomerBilledItems(_customer!.id, repOnly: isRep),
+        ]);
+        AuthService.currentTeam = savedTeam;
+        if (!mounted) return;
+        setState(() {
+          _outstandingBills = [...jaResults[0] as List<Map<String, dynamic>>, ...maResults[0] as List<Map<String, dynamic>>];
+          _billsLoading = false;
+          _receipts = [...jaResults[1] as List<Map<String, dynamic>>, ...maResults[1] as List<Map<String, dynamic>>];
+          _receiptsLoading = false;
+          _billedItems = [...jaResults[2] as List<Map<String, dynamic>>, ...maResults[2] as List<Map<String, dynamic>>];
+          _billedItemsLoading = false;
+        });
+      } else {
+        final results = await Future.wait([
+          SupabaseService.instance.getCustomerBills(_customer!.id, repOnly: isRep),
+          SupabaseService.instance.getCustomerReceipts(_customer!.id, repOnly: isRep),
+          SupabaseService.instance.getCustomerBilledItems(_customer!.id, repOnly: isRep),
+        ]);
+        if (!mounted) return;
+        setState(() {
+          _outstandingBills = results[0] as List<Map<String, dynamic>>;
+          _billsLoading = false;
+          _receipts = results[1] as List<Map<String, dynamic>>;
+          _receiptsLoading = false;
+          _billedItems = results[2] as List<Map<String, dynamic>>;
+          _billedItemsLoading = false;
+        });
+      }
+      // Load receipt → bill mappings from RCTBIL
+      _loadReceiptBillMap();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() { _billsLoading = false; _receiptsLoading = false; _billedItemsLoading = false; });
+    }
+  }
+
+  Future<void> _loadReceiptBillMap() async {
+    if (_receipts.isEmpty) return;
+    final receiptNos = _receipts
+        .map((r) => r['receipt_no'] as String? ?? '')
+        .where((r) => r.isNotEmpty)
+        .toSet()
+        .toList();
+    if (receiptNos.isEmpty) return;
+
+    try {
+      final data = await SupabaseService.instance.client
+          .from('customer_receipt_bills')
+          .select('receipt_no, invoice_no')
+          .inFilter('receipt_no', receiptNos)
+          .eq('team_id', AuthService.currentTeam);
+      final map = <String, List<String>>{};
+      for (final row in data) {
+        final rcpt = row['receipt_no'] as String? ?? '';
+        final inv = row['invoice_no'] as String? ?? '';
+        if (rcpt.isNotEmpty && inv.isNotEmpty) {
+          map.putIfAbsent(rcpt, () => []);
+          if (!map[rcpt]!.contains(inv)) map[rcpt]!.add(inv);
+        }
+      }
+      if (mounted) setState(() => _receiptBillMap = map);
+    } catch (e) {
+      debugPrint('⚠️ _loadReceiptBillMap error: $e');
+    }
+  }
+
   void _goToNewOrder() {
     CartService.instance.setCustomerSession(_customer!, _beat);
     Navigator.pushNamed(context, AppRoutes.productsScreen);
@@ -114,14 +214,14 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
 
   // ─── Payment methods ───
 
-  void _showPaymentBottomSheet({double? presetAmount, List<OrderModel>? presetOrders}) {
+  void _showPaymentBottomSheet({double? presetAmount, List<OrderModel>? presetOrders, String? presetBillNo}) {
     final amountController = TextEditingController(text: presetAmount?.toStringAsFixed(2) ?? '');
     final billNoController = TextEditingController(
-      text: presetOrders?.map((o) =>
+      text: presetBillNo ?? (presetOrders?.map((o) =>
         o.finalBillNo != null && o.finalBillNo!.isNotEmpty
             ? o.finalBillNo!
             : o.id.split('-').last.toUpperCase()
-      ).join(', ') ?? '',
+      ).join(', ') ?? ''),
     );
     String selectedMethod = 'UPI';
 
@@ -167,7 +267,7 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
                   children: [
                     Expanded(
                       child: RadioListTile<String>(
-                        title: Text('UPI (QR)', style: GoogleFonts.manrope(fontSize: 14, fontWeight: FontWeight.bold)),
+                        title: Text('UPI', style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.bold)),
                         value: 'UPI',
                         groupValue: selectedMethod,
                         onChanged: (val) => setModalState(() => selectedMethod = val!),
@@ -177,12 +277,22 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
                     ),
                     Expanded(
                       child: RadioListTile<String>(
-                        title: Text('Cash', style: GoogleFonts.manrope(fontSize: 14, fontWeight: FontWeight.bold)),
+                        title: Text('Cash', style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.bold)),
                         value: 'CASH',
                         groupValue: selectedMethod,
                         onChanged: (val) => setModalState(() => selectedMethod = val!),
                         contentPadding: EdgeInsets.zero,
                         activeColor: Colors.orange,
+                      ),
+                    ),
+                    Expanded(
+                      child: RadioListTile<String>(
+                        title: Text('Cheque', style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.bold)),
+                        value: 'Cheque',
+                        groupValue: selectedMethod,
+                        onChanged: (val) => setModalState(() => selectedMethod = val!),
+                        contentPadding: EdgeInsets.zero,
+                        activeColor: Colors.purple,
                       ),
                     ),
                   ],
@@ -243,26 +353,27 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
                       }
                       Navigator.pop(ctx);
                       final activeOrders = (presetOrders?.isNotEmpty == true) ? presetOrders : null;
-                      if (selectedMethod == 'CASH') {
-                        if (activeOrders != null) {
-                          await _processMultiPayment(orders: activeOrders, amount: double.parse(amount), method: 'CASH');
-                        } else {
-                          await _processPayment(billNo: billNo, amount: double.parse(amount), method: 'CASH');
-                        }
-                      } else {
+                      if (selectedMethod == 'UPI') {
                         _showQrDialog(amount, billNo,
                           onCaptured: activeOrders != null
                               ? (driveFileId) => _processMultiPayment(orders: activeOrders, amount: double.parse(amount), method: 'UPI', driveFileId: driveFileId)
                               : null,
                         );
+                      } else {
+                        // Cash or Cheque — direct record, no QR
+                        if (activeOrders != null) {
+                          await _processMultiPayment(orders: activeOrders, amount: double.parse(amount), method: selectedMethod);
+                        } else {
+                          await _processPayment(billNo: billNo, amount: double.parse(amount), method: selectedMethod);
+                        }
                       }
                     },
                     style: ElevatedButton.styleFrom(
-                      backgroundColor: selectedMethod == 'CASH' ? Colors.orange : AppTheme.primary,
+                      backgroundColor: selectedMethod == 'UPI' ? AppTheme.primary : selectedMethod == 'Cheque' ? Colors.purple : Colors.orange,
                       foregroundColor: Colors.white,
                       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
                     ),
-                    child: Text(selectedMethod == 'CASH' ? 'Record Cash Payment' : 'Generate QR & Capture Proof'),
+                    child: Text(selectedMethod == 'UPI' ? 'Generate QR & Capture Proof' : 'Record ${selectedMethod} Payment'),
                   ),
                 ),
               ],
@@ -309,24 +420,41 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
               ),
             ],
           ),
-          // No Cancel — only the mandatory capture button
           actions: [
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton.icon(
-                onPressed: () async {
-                  Navigator.pop(ctx);
-                  await _captureProofAndProcess(billNo, double.parse(amount), onCaptured: onCaptured);
-                },
-                icon: const Icon(Icons.camera_alt_rounded),
-                label: const Text('Capture Customer Screen & Pay'),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.green,
-                  foregroundColor: Colors.white,
-                  padding: const EdgeInsets.symmetric(vertical: 14),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+            Row(
+              children: [
+                Expanded(
+                  flex: 1,
+                  child: OutlinedButton(
+                    onPressed: () => Navigator.pop(ctx),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.red,
+                      side: const BorderSide(color: Colors.red),
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                    ),
+                    child: const Text('Cancel', style: TextStyle(fontWeight: FontWeight.w700)),
+                  ),
                 ),
-              ),
+                const SizedBox(width: 10),
+                Expanded(
+                  flex: 2,
+                  child: ElevatedButton.icon(
+                    onPressed: () async {
+                      Navigator.pop(ctx);
+                      await _captureProofAndProcess(billNo, double.parse(amount), onCaptured: onCaptured);
+                    },
+                    icon: const Icon(Icons.camera_alt_rounded),
+                    label: const Text('Capture Proof'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.green,
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                    ),
+                  ),
+                ),
+              ],
             ),
           ],
         ),
@@ -364,28 +492,20 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
     }
 
     try {
-      // ── Step 2: Immediately share to WhatsApp ──
+      // ── Step 2: Share proof to group via share sheet ──
       final customerName = _customer?.name ?? 'Customer';
-      final phoneRaw = _customer?.phone?.replaceAll(RegExp(r'[^0-9]'), '') ?? '';
-      final phone = phoneRaw.length == 10 ? '91$phoneRaw' : phoneRaw;
+      final date = DateFormat('dd-MM-yyyy').format(DateTime.now());
 
-      await Share.shareXFiles(
-        [XFile(photo.path)],
-        text: 'UPI Payment Proof — Bill: $billNo | Amount: ₹$amount | $customerName',
-        // If the customer's phone is known, deep-link directly to their WhatsApp chat
+      await SharePlus.instance.share(
+        ShareParams(
+          files: [XFile(photo.path)],
+          text: 'UPI Payment Proof\n$customerName\nBill: $billNo\nAmount: ₹$amount\nDate: $date',
+        ),
       );
 
-      // If we have a phone number, also open WhatsApp directly to that contact
-      if (phone.isNotEmpty && mounted) {
-        final waUri = Uri.parse('whatsapp://send?phone=$phone&text=${Uri.encodeComponent("UPI Payment Proof - Bill: $billNo | ₹$amount")}');
-        if (await canLaunchUrl(waUri)) {
-          await launchUrl(waUri, mode: LaunchMode.externalApplication);
-        }
-      }
-
-      // ── Step 3: Record payment (no Drive upload — WhatsApp sharing is sufficient) ──
+      // ── Step 3: Record payment ──
       if (onCaptured != null) {
-        await onCaptured('whatsapp_shared');
+        await onCaptured('shared');
       } else {
         await _processPayment(billNo: billNo, amount: amount, method: 'UPI');
       }
@@ -497,7 +617,7 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
     final phonePresent = c.phone.isNotEmpty && c.phone != 'No Phone';
 
     return DefaultTabController(
-      length: _isBrandRep ? 2 : 4,
+      length: _isBrandRep ? 2 : 5,
       child: Scaffold(
         backgroundColor: AppTheme.background,
         appBar: AppBar(
@@ -528,6 +648,7 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
                 labelStyle: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.w700),
                 tabs: [
                   if (!_isBrandRep) const Tab(text: 'Orders'),
+                  if (!_isBrandRep) const Tab(text: 'Billed'),
                   const Tab(text: 'Outstanding'),
                   if (!_isBrandRep) const Tab(text: 'Collections'),
                   const Tab(text: 'Info'),
@@ -538,6 +659,7 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
               child: TabBarView(
                 children: [
                   if (!_isBrandRep) _buildOrdersTab(),
+                  if (!_isBrandRep) _buildBilledTab(),
                   _buildOutstandingTab(),
                   if (!_isBrandRep) _buildCollectionsTab(),
                   _buildInfoTab(c),
@@ -739,12 +861,162 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
     );
   }
 
+  // ─── BILLED TAB (ITTR data) ──────────────────────────────────
+
+  Widget _buildBilledTab() {
+    if (_billedItemsLoading) return const Center(child: CircularProgressIndicator());
+    if (_billedItems.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.receipt_outlined, size: 64, color: AppTheme.onSurfaceVariant.withValues(alpha: 0.5)),
+            const SizedBox(height: 16),
+            Text('No billed items', style: GoogleFonts.manrope(fontSize: 16, fontWeight: FontWeight.w600)),
+            const SizedBox(height: 4),
+            Text('ITTR data will appear after sync', style: GoogleFonts.manrope(fontSize: 13, color: AppTheme.onSurfaceVariant)),
+          ],
+        ),
+      );
+    }
+
+    // Group by invoice_no
+    final Map<String, List<Map<String, dynamic>>> byInvoice = {};
+    for (final item in _billedItems) {
+      final inv = item['invoice_no'] as String? ?? '';
+      byInvoice.putIfAbsent(inv, () => []);
+      byInvoice[inv]!.add(item);
+    }
+    final invoices = byInvoice.entries.toList();
+
+    // Build invoice_no → bill_amount lookup from customer_bills (INV data)
+    // This gives us the net/final amount per invoice instead of gross from ITTR
+    final Map<String, double> invBillAmount = {};
+    for (final bill in _outstandingBills) {
+      final inv = bill['invoice_no'] as String? ?? '';
+      final book = bill['book'] as String? ?? '';
+      final key = book.isNotEmpty ? '$book$inv' : inv;
+      invBillAmount[key] = (bill['bill_amount'] as num?)?.toDouble() ?? 0;
+      invBillAmount[inv] = (bill['bill_amount'] as num?)?.toDouble() ?? 0;
+    }
+
+    // Total billed: prefer INV bill_amount per invoice, fall back to ITTR sum
+    double totalBilled = 0;
+    for (final inv in invoices) {
+      final invoiceNo = inv.key;
+      final invTotal = invBillAmount[invoiceNo];
+      if (invTotal != null) {
+        totalBilled += invTotal;
+      } else {
+        totalBilled += inv.value.fold(0.0, (sum, i) => sum + ((i['amount'] as num?)?.toDouble() ?? 0));
+      }
+    }
+    final totalItems = _billedItems.fold(0, (sum, i) => sum + ((i['quantity'] as int?) ?? 0));
+
+    return Column(
+      children: [
+        Container(
+          color: AppTheme.surface,
+          padding: const EdgeInsets.all(16),
+          child: Row(children: [
+            Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text('Total Billed', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w600)),
+              Text('\u20B9${totalBilled.toStringAsFixed(0)}',
+                  style: GoogleFonts.manrope(fontSize: 18, fontWeight: FontWeight.w800, color: AppTheme.primary)),
+            ]),
+            const Spacer(),
+            Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+              Text('${invoices.length} invoices', style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
+              Text('$totalItems items', style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
+            ]),
+          ]),
+        ),
+        const Divider(height: 1),
+        Expanded(
+          child: ListView.builder(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 100),
+            itemCount: invoices.length,
+            itemBuilder: (context, index) {
+              final inv = invoices[index];
+              final invoiceNo = inv.key;
+              final items = inv.value;
+              final billDate = items.first['bill_date'] as String? ?? '';
+              // Prefer INV bill_amount (net), fall back to ITTR item sum (gross)
+              final double invoiceTotal = invBillAmount[invoiceNo]
+                  ?? items.fold<double>(0.0, (sum, i) => sum + ((i['amount'] as num?)?.toDouble() ?? 0));
+              final dateStr = billDate.isNotEmpty
+                  ? DateFormat('dd MMM yyyy').format(DateTime.parse(billDate))
+                  : '';
+
+              return Container(
+                margin: const EdgeInsets.only(bottom: 10),
+                decoration: BoxDecoration(
+                  color: AppTheme.surface,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: AppTheme.outlineVariant),
+                ),
+                child: ExpansionTile(
+                  tilePadding: const EdgeInsets.symmetric(horizontal: 14),
+                  childrenPadding: const EdgeInsets.fromLTRB(14, 0, 14, 12),
+                  shape: const Border(),
+                  title: Row(children: [
+                    Expanded(child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('Invoice #$invoiceNo', style: GoogleFonts.manrope(fontSize: 14, fontWeight: FontWeight.w700)),
+                        Text('$dateStr \u2022 ${items.length} items', style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
+                      ],
+                    )),
+                    Text('\u20B9${invoiceTotal.toStringAsFixed(0)}',
+                        style: GoogleFonts.manrope(fontSize: 15, fontWeight: FontWeight.w800, color: AppTheme.primary)),
+                  ]),
+                  children: items.map((item) {
+                    final itemName = item['item_name'] as String? ?? '';
+                    final qty = item['quantity'] as int? ?? 0;
+                    final mrp = (item['mrp'] as num?)?.toDouble() ?? 0;
+                    final rate = (item['rate'] as num?)?.toDouble() ?? 0;
+                    final amt = (item['amount'] as num?)?.toDouble() ?? 0;
+
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 6),
+                      child: Row(children: [
+                        Expanded(child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(itemName, style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w600), overflow: TextOverflow.ellipsis),
+                            Text('MRP: \u20B9${mrp.toStringAsFixed(0)} \u2022 Rate: \u20B9${rate.toStringAsFixed(0)}',
+                                style: GoogleFonts.manrope(fontSize: 10, color: AppTheme.onSurfaceVariant)),
+                          ],
+                        )),
+                        const SizedBox(width: 8),
+                        Text('x$qty', style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.w700)),
+                        const SizedBox(width: 12),
+                        SizedBox(width: 60, child: Text('\u20B9${amt.toStringAsFixed(0)}',
+                            textAlign: TextAlign.right,
+                            style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700, color: AppTheme.primary))),
+                      ]),
+                    );
+                  }).toList(),
+                ),
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+
   Widget _buildOutstandingTab() {
-    if (_ordersLoading) return const Center(child: CircularProgressIndicator());
-    // Show pending orders (not Paid/Cancelled) as bill-wise outstanding
-    final pendingOrders = _orders.where((o) =>
-        o.status != 'Paid' && o.status != 'Cancelled' && o.grandTotal > 0).toList();
-    if (pendingOrders.isEmpty) {
+    if (_billsLoading) return const Center(child: CircularProgressIndicator());
+
+    // Use OPNBIL data, filter to non-cleared bills with pending amount > 0
+    final pendingBills = _outstandingBills.where((b) {
+      final pending = (b['pending_amount'] as num?)?.toDouble() ?? 0;
+      final cleared = b['cleared'] as bool? ?? false;
+      return !cleared && pending > 0;
+    }).toList();
+
+    if (pendingBills.isEmpty) {
       return Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
@@ -758,37 +1030,63 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
         ),
       );
     }
-    final totalDue = pendingOrders.fold(0.0, (sum, o) => sum + o.grandTotal);
+
+    final totalDue = pendingBills.fold(0.0, (sum, b) => sum + ((b['pending_amount'] as num?)?.toDouble() ?? 0));
+    final totalBillAmt = pendingBills.fold(0.0, (sum, b) => sum + ((b['bill_amount'] as num?)?.toDouble() ?? 0));
+    final totalReceived = pendingBills.fold(0.0, (sum, b) => sum + ((b['received_amount'] as num?)?.toDouble() ?? 0));
+
     return Column(
       children: [
+        // Summary header
         Container(
           color: AppTheme.surface,
           padding: const EdgeInsets.all(16),
-          child: Row(
-            children: [
+          child: Column(children: [
+            Row(children: [
               Text('Total Outstanding:', style: GoogleFonts.manrope(fontSize: 14, fontWeight: FontWeight.w600)),
               const Spacer(),
               Text('\u20B9${totalDue.toStringAsFixed(0)}',
                   style: GoogleFonts.manrope(fontSize: 18, fontWeight: FontWeight.w800, color: Colors.red.shade700)),
-            ],
-          ),
+            ]),
+            const SizedBox(height: 4),
+            Row(children: [
+              Text('Billed: \u20B9${totalBillAmt.toStringAsFixed(0)}', style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
+              const Spacer(),
+              Text('Received: \u20B9${totalReceived.toStringAsFixed(0)}', style: GoogleFonts.manrope(fontSize: 11, color: Colors.green.shade700)),
+            ]),
+          ]),
         ),
         const Divider(height: 1),
+        // Bill list
         Expanded(
           child: ListView.builder(
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 100),
-            itemCount: pendingOrders.length,
+            itemCount: pendingBills.length,
             itemBuilder: (context, index) {
-              final o = pendingOrders[index];
-              final billNo = o.finalBillNo ?? o.id.split('-').last.toUpperCase();
-              final dateStr = DateFormat('dd MMM yyyy').format(o.orderDate);
+              final b = pendingBills[index];
+              final invoiceNo = b['invoice_no'] as String? ?? '';
+              final book = b['book'] as String? ?? '';
+              final billDate = b['bill_date'] as String? ?? '';
+              final billAmt = (b['bill_amount'] as num?)?.toDouble() ?? 0;
+              final pending = (b['pending_amount'] as num?)?.toDouble() ?? 0;
+              final received = (b['received_amount'] as num?)?.toDouble() ?? 0;
+              final creditDays = b['credit_days'] as int? ?? 0;
+              final dateStr = billDate.isNotEmpty ? DateFormat('dd MMM yyyy').format(DateTime.parse(billDate)) : '';
+
+              // Check if overdue
+              bool isOverdue = false;
+              if (creditDays > 0 && billDate.isNotEmpty) {
+                final dueDate = DateTime.parse(billDate).add(Duration(days: creditDays));
+                isOverdue = DateTime.now().isAfter(dueDate);
+              }
+
               return Container(
                 margin: const EdgeInsets.only(bottom: 8),
                 padding: const EdgeInsets.all(14),
                 decoration: BoxDecoration(
-                  color: AppTheme.surface,
+                  color: isOverdue ? Colors.red.shade50 : AppTheme.surface,
                   borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: AppTheme.outlineVariant),
+                  border: Border.all(color: isOverdue ? Colors.red.shade200 : AppTheme.outlineVariant),
                 ),
                 child: Row(
                   children: [
@@ -796,26 +1094,41 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text('Bill #$billNo', style: GoogleFonts.manrope(fontSize: 14, fontWeight: FontWeight.w700)),
+                          Row(children: [
+                            Text('$book-$invoiceNo', style: GoogleFonts.manrope(fontSize: 14, fontWeight: FontWeight.w700)),
+                            if (isOverdue) ...[
+                              const SizedBox(width: 6),
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+                                decoration: BoxDecoration(color: Colors.red, borderRadius: BorderRadius.circular(4)),
+                                child: Text('OVERDUE', style: GoogleFonts.manrope(fontSize: 8, fontWeight: FontWeight.w800, color: Colors.white)),
+                              ),
+                            ],
+                          ]),
                           const SizedBox(height: 2),
-                          Text(dateStr, style: GoogleFonts.manrope(fontSize: 12, color: AppTheme.onSurfaceVariant)),
+                          Text(dateStr, style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
+                          if (received > 0)
+                            Text('Paid: \u20B9${received.toStringAsFixed(0)} / \u20B9${billAmt.toStringAsFixed(0)}',
+                                style: GoogleFonts.manrope(fontSize: 10, color: Colors.green.shade700)),
                         ],
                       ),
                     ),
                     Column(
                       crossAxisAlignment: CrossAxisAlignment.end,
                       children: [
-                        Text('\u20B9${o.grandTotal.toStringAsFixed(0)}',
+                        Text('\u20B9${pending.toStringAsFixed(0)}',
                             style: GoogleFonts.manrope(fontSize: 15, fontWeight: FontWeight.w800, color: Colors.red.shade700)),
-                        const SizedBox(height: 2),
-                        Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                          decoration: BoxDecoration(
-                            color: Colors.orange.withValues(alpha: 0.1),
-                            borderRadius: BorderRadius.circular(6),
+                        if (!_isBrandRep) ...[
+                          const SizedBox(height: 4),
+                          GestureDetector(
+                            onTap: () => _showPaymentBottomSheet(presetAmount: pending, presetBillNo: '$book-$invoiceNo'),
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                              decoration: BoxDecoration(color: AppTheme.primary, borderRadius: BorderRadius.circular(8)),
+                              child: Text('Settle', style: GoogleFonts.manrope(fontSize: 11, fontWeight: FontWeight.w700, color: Colors.white)),
+                            ),
                           ),
-                          child: Text(o.status, style: GoogleFonts.manrope(fontSize: 10, fontWeight: FontWeight.w700, color: Colors.orange.shade800)),
-                        ),
+                        ],
                       ],
                     ),
                   ],
@@ -844,7 +1157,12 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
         ),
       );
     }
-    if (_orders.isEmpty) {
+    // Reps only see their own app orders, not office-billed
+    final isRep = !SupabaseService.instance.isAdmin;
+    final visibleOrders = isRep
+        ? _orders.where((o) => o.source != 'office').toList()
+        : _orders;
+    if (visibleOrders.isEmpty) {
       return Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
@@ -857,7 +1175,7 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
       );
     }
     return _OrdersTabView(
-      orders: _orders,
+      orders: visibleOrders,
       onMultiSettle: (amt, orders) => _showPaymentBottomSheet(presetAmount: amt, presetOrders: orders),
     );
   }
@@ -923,7 +1241,37 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
   }
 
   Widget _buildCollectionsList() {
-    if (_collections.isEmpty) {
+    // Merge app collections + RECT billing software receipts
+    final allCollections = <Map<String, dynamic>>[];
+
+    // App collections (existing)
+    for (final c in _collections) {
+      allCollections.add({
+        'source': 'app',
+        'date': c['created_at']?.toString().substring(0, 10) ?? '',
+        'amount': (c['amount_paid'] as num?)?.toDouble() ?? 0,
+        'method': c['payment_mode'] ?? c['payment_method'] ?? 'Cash',
+        'bill_no': c['bill_no'] ?? '',
+        'drive_id': c['drive_file_id'],
+      });
+    }
+
+    // RECT receipts from billing software
+    for (final r in _receipts) {
+      allCollections.add({
+        'source': 'billing',
+        'date': r['receipt_date'] as String? ?? '',
+        'amount': (r['amount'] as num?)?.toDouble() ?? 0,
+        'method': (r['cash_yn'] as bool? ?? false) ? 'CASH' : 'Bank',
+        'bank': r['bank_name'] as String? ?? '',
+        'receipt_no': r['receipt_no'] as String? ?? '',
+      });
+    }
+
+    // Sort by date descending
+    allCollections.sort((a, b) => (b['date'] as String).compareTo(a['date'] as String));
+
+    if (allCollections.isEmpty) {
       return Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
@@ -936,65 +1284,171 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
       );
     }
 
-    final reversed = _collections.reversed.toList();
-    return ListView.builder(
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 100),
-      itemCount: reversed.length,
-      itemBuilder: (context, index) {
-        final c = reversed[index];
-        final method = c['payment_mode'] ?? c['payment_method'] ?? 'Cash';
-        final driveId = c['drive_file_id'];
-        final dateStr = c['created_at']?.toString().substring(0, 10) ?? '';
-        final amt = c['amount_paid'];
-        return Container(
-          margin: const EdgeInsets.only(bottom: 10),
-          padding: const EdgeInsets.all(14),
-          decoration: BoxDecoration(
-            color: AppTheme.surface,
-            borderRadius: BorderRadius.circular(14),
-            border: Border.all(color: AppTheme.outlineVariant),
-          ),
-          child: Row(
-            children: [
-              CircleAvatar(
-                radius: 18,
-                backgroundColor: method == 'CASH' ? Colors.orange.shade50 : Colors.green.shade50,
-                child: Icon(
-                  method == 'CASH' ? Icons.money : Icons.qr_code,
-                  size: 16,
-                  color: method == 'CASH' ? Colors.orange.shade700 : Colors.green.shade700,
+    final totalCollected = allCollections.fold(0.0, (sum, c) => sum + ((c['amount'] as num?)?.toDouble() ?? 0));
+
+    return Column(
+      children: [
+        Container(
+          color: AppTheme.surface,
+          padding: const EdgeInsets.all(16),
+          child: Row(children: [
+            Text('Total Collected:', style: GoogleFonts.manrope(fontSize: 14, fontWeight: FontWeight.w600)),
+            const Spacer(),
+            Text('\u20B9${totalCollected.toStringAsFixed(0)}',
+                style: GoogleFonts.manrope(fontSize: 18, fontWeight: FontWeight.w800, color: Colors.green.shade700)),
+          ]),
+        ),
+        const Divider(height: 1),
+        Expanded(
+          child: ListView.builder(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 100),
+            itemCount: allCollections.length,
+            itemBuilder: (context, index) {
+              final c = allCollections[index];
+              final isApp = c['source'] == 'app';
+              final method = c['method'] as String? ?? '';
+              final isCash = method == 'CASH' || method == 'Cash';
+              final dateStr = (c['date'] as String).isNotEmpty
+                  ? DateFormat('dd MMM yyyy').format(DateTime.parse(c['date'] as String))
+                  : '';
+              final amt = (c['amount'] as num?)?.toDouble() ?? 0;
+
+              return Container(
+                margin: const EdgeInsets.only(bottom: 8),
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: AppTheme.surface,
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(color: AppTheme.outlineVariant),
                 ),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
+                child: Row(
                   children: [
-                    Text('₹$amt', style: GoogleFonts.manrope(fontSize: 15, fontWeight: FontWeight.w800, color: AppTheme.onSurface)),
-                    Text('Bill #${c['bill_no']} • $dateStr', style: GoogleFonts.manrope(fontSize: 12, color: AppTheme.onSurfaceVariant)),
+                    CircleAvatar(
+                      radius: 18,
+                      backgroundColor: isCash ? Colors.orange.shade50 : Colors.green.shade50,
+                      child: Icon(
+                        isCash ? Icons.money : Icons.account_balance_rounded,
+                        size: 16,
+                        color: isCash ? Colors.orange.shade700 : Colors.green.shade700,
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text('\u20B9${amt.toStringAsFixed(0)}',
+                              style: GoogleFonts.manrope(fontSize: 15, fontWeight: FontWeight.w800, color: AppTheme.onSurface)),
+                          Text(
+                            isApp
+                                ? 'Bill #${c['bill_no']} \u2022 $dateStr'
+                                : () {
+                                    final rcptNo = c['receipt_no'] as String? ?? '';
+                                    final bills = _receiptBillMap[rcptNo];
+                                    final billLabel = bills != null && bills.isNotEmpty
+                                        ? 'Against ${bills.join(', ')}'
+                                        : 'Rcpt #$rcptNo';
+                                    final bank = c['bank'] as String? ?? '';
+                                    return '$billLabel${bank.isNotEmpty ? ' \u2022 $bank' : ''} \u2022 $dateStr';
+                                  }(),
+                            style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant),
+                          ),
+                        ],
+                      ),
+                    ),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: isApp ? Colors.blue.withValues(alpha: 0.1) : Colors.teal.withValues(alpha: 0.1),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: Text(
+                        isApp ? 'App' : 'Billing',
+                        style: GoogleFonts.manrope(fontSize: 9, fontWeight: FontWeight.w700,
+                            color: isApp ? Colors.blue : Colors.teal),
+                      ),
+                    ),
+                    if (isApp && c['drive_id'] != null)
+                      IconButton(
+                        icon: Icon(Icons.camera_alt_outlined, color: AppTheme.primary, size: 18),
+                        onPressed: () => _viewPaymentPhoto(context, c['drive_id']),
+                      ),
                   ],
                 ),
-              ),
-              if (driveId != null)
-                IconButton(
-                  icon: Icon(Icons.camera_alt_outlined, color: AppTheme.primary),
-                  onPressed: () => _viewPaymentPhoto(context, driveId),
-                )
-              else
-                Text('No proof', style: GoogleFonts.manrope(fontSize: 10, color: AppTheme.onSurfaceVariant)),
-            ],
+              );
+            },
           ),
-        );
-      },
+        ),
+      ],
     );
   }
 
   Widget _buildInfoTab(CustomerModel c) {
-    final balance = c.outstandingForTeam(AuthService.currentTeam);
+    // Calculate totals from OPNBIL data
+    final pendingBills = _outstandingBills.where((b) => !(b['cleared'] as bool? ?? false) && ((b['pending_amount'] as num?)?.toDouble() ?? 0) > 0);
+    final totalOutstanding = pendingBills.fold(0.0, (sum, b) => sum + ((b['pending_amount'] as num?)?.toDouble() ?? 0));
+    final totalBilled = _outstandingBills.fold(0.0, (sum, b) => sum + ((b['bill_amount'] as num?)?.toDouble() ?? 0));
+    final totalReceived = _outstandingBills.fold(0.0, (sum, b) => sum + ((b['received_amount'] as num?)?.toDouble() ?? 0));
+    final pendingBillCount = pendingBills.length;
+    final overdueBills = pendingBills.where((b) {
+      final cd = b['credit_days'] as int? ?? 0;
+      final bd = b['bill_date'] as String? ?? '';
+      if (cd <= 0 || bd.isEmpty) return false;
+      return DateTime.now().isAfter(DateTime.parse(bd).add(Duration(days: cd)));
+    }).length;
+
+    // Use OPNBIL total if available, fall back to profile outstanding
+    final balance = totalOutstanding > 0 ? totalOutstanding : c.outstandingForTeam(AuthService.currentTeam);
+
     return SingleChildScrollView(
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 100),
       child: Column(
         children: [
+          // Outstanding summary card
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: balance > 0 ? Colors.red.shade50 : Colors.green.shade50,
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: balance > 0 ? Colors.red.shade300 : Colors.green.shade300, width: 1.5),
+            ),
+            child: Column(children: [
+              Row(children: [
+                Icon(balance > 0 ? Icons.warning_amber_rounded : Icons.check_circle_outline, color: balance > 0 ? Colors.red : Colors.green, size: 28),
+                const SizedBox(width: 12),
+                Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text('Total Outstanding', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w600)),
+                  Text('\u20B9${balance.toStringAsFixed(0)}',
+                      style: GoogleFonts.manrope(fontSize: 22, fontWeight: FontWeight.w800, color: balance > 0 ? Colors.red.shade700 : Colors.green.shade700)),
+                ]),
+              ]),
+              if (totalBilled > 0) ...[
+                const SizedBox(height: 12),
+                Row(children: [
+                  _infoStat('Bills', '$pendingBillCount pending', Colors.orange),
+                  const SizedBox(width: 8),
+                  _infoStat('Billed', '\u20B9${totalBilled.toStringAsFixed(0)}', Colors.blue),
+                  const SizedBox(width: 8),
+                  _infoStat('Received', '\u20B9${totalReceived.toStringAsFixed(0)}', Colors.green),
+                ]),
+                if (overdueBills > 0) ...[
+                  const SizedBox(height: 8),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    decoration: BoxDecoration(color: Colors.red.shade100, borderRadius: BorderRadius.circular(8)),
+                    child: Row(mainAxisSize: MainAxisSize.min, children: [
+                      Icon(Icons.schedule_rounded, size: 14, color: Colors.red.shade700),
+                      const SizedBox(width: 4),
+                      Text('$overdueBills overdue bill${overdueBills == 1 ? '' : 's'}',
+                          style: GoogleFonts.manrope(fontSize: 11, fontWeight: FontWeight.w700, color: Colors.red.shade700)),
+                    ]),
+                  ),
+                ],
+              ],
+            ]),
+          ),
+          const SizedBox(height: 16),
+          // Customer details
           Container(
             decoration: BoxDecoration(
               color: AppTheme.surface,
@@ -1003,51 +1457,57 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
             ),
             child: Column(
               children: [
-                _infoTile(Icons.location_on_outlined, 'Address', c.address.isNotEmpty ? c.address : '—'),
+                _infoTile(Icons.location_on_outlined, 'Address', c.address.isNotEmpty ? c.address : '\u2014'),
                 Divider(height: 1, color: AppTheme.outlineVariant),
-                _infoTile(Icons.route_outlined, 'Route', c.deliveryRoute.isNotEmpty ? c.deliveryRoute : '—'),
+                _infoTile(Icons.route_outlined, 'Route', c.deliveryRoute.isNotEmpty ? c.deliveryRoute : '\u2014'),
                 Divider(height: 1, color: AppTheme.outlineVariant),
-                _infoTile(Icons.map_outlined, 'Beat', c.beatNameForTeam(AuthService.currentTeam).isNotEmpty ? c.beatNameForTeam(AuthService.currentTeam) : '—'),
+                _infoTile(Icons.map_outlined, 'Beat', c.beatNameForTeam(AuthService.currentTeam).isNotEmpty ? c.beatNameForTeam(AuthService.currentTeam) : '\u2014'),
                 Divider(height: 1, color: AppTheme.outlineVariant),
                 _infoTile(Icons.category_outlined, 'Type', c.type),
+                if (c.gstin != null && c.gstin!.isNotEmpty) ...[
+                  Divider(height: 1, color: AppTheme.outlineVariant),
+                  _infoTile(Icons.receipt_outlined, 'GSTIN', c.gstin!),
+                ],
+                if (c.creditDays > 0) ...[
+                  Divider(height: 1, color: AppTheme.outlineVariant),
+                  _infoTile(Icons.schedule_outlined, 'Credit Days', '${c.creditDays} days'),
+                ],
+                if (c.creditLimit > 0) ...[
+                  Divider(height: 1, color: AppTheme.outlineVariant),
+                  _infoTile(Icons.credit_card_outlined, 'Credit Limit', '\u20B9${c.creditLimit.toStringAsFixed(0)}'),
+                ],
+                if (c.lockBill) ...[
+                  Divider(height: 1, color: AppTheme.outlineVariant),
+                  _infoTile(Icons.lock_outlined, 'Bill Lock', 'Locked'),
+                ],
                 Divider(height: 1, color: AppTheme.outlineVariant),
                 _infoTile(Icons.badge_outlined, 'Customer ID', c.id),
-              ],
-            ),
-          ),
-          const SizedBox(height: 16),
-          Container(
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: AppTheme.surface,
-              borderRadius: BorderRadius.circular(14),
-              border: Border.all(
-                color: balance > 0 ? Colors.red.shade300 : AppTheme.outlineVariant,
-                width: balance > 0 ? 1.5 : 1,
-              ),
-            ),
-            child: Row(
-              children: [
-                Icon(
-                  balance > 0 ? Icons.warning_amber_rounded : Icons.check_circle_outline,
-                  color: balance > 0 ? Colors.red : Colors.green,
-                  size: 28,
-                ),
-                const SizedBox(width: 12),
-                Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('Outstanding Balance', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w600, color: Colors.black87)),
-                    Text(
-                      '₹${balance.toStringAsFixed(2)}',
-                      style: GoogleFonts.manrope(fontSize: 22, fontWeight: FontWeight.w800, color: balance > 0 ? Colors.red.shade700 : Colors.green.shade700),
-                    ),
-                  ],
-                ),
+                if (c.accCodeJa != null && c.accCodeJa!.isNotEmpty) ...[
+                  Divider(height: 1, color: AppTheme.outlineVariant),
+                  _infoTile(Icons.numbers_outlined, 'JA Code', c.accCodeJa!),
+                ],
+                if (c.accCodeMa != null && c.accCodeMa!.isNotEmpty) ...[
+                  Divider(height: 1, color: AppTheme.outlineVariant),
+                  _infoTile(Icons.numbers_outlined, 'MA Code', c.accCodeMa!),
+                ],
               ],
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _infoStat(String label, String value, Color color) {
+    return Expanded(
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 6),
+        decoration: BoxDecoration(color: color.withValues(alpha: 0.08), borderRadius: BorderRadius.circular(8)),
+        child: Column(children: [
+          Text(value, style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w800, color: color)),
+          const SizedBox(height: 2),
+          Text(label, style: GoogleFonts.manrope(fontSize: 9, color: AppTheme.onSurfaceVariant)),
+        ]),
       ),
     );
   }

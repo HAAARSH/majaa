@@ -1,0 +1,5 @@
+-- Add GSTIN and billing metadata to customers from ACMAST
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS gstin TEXT;
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS lock_bill BOOLEAN DEFAULT false;
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS credit_days INTEGER DEFAULT 0;
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS credit_limit NUMERIC(12,2) DEFAULT 0;

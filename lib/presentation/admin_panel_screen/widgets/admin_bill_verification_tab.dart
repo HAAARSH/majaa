@@ -44,6 +44,15 @@ class _AdminBillVerificationTabState extends State<AdminBillVerificationTab> wit
   List<Map<String, dynamic>> _dataChanges = [];
   bool _csvLoading = false;
 
+  // Stock sync pending changes (new products + price changes from ITMRP)
+  List<Map<String, dynamic>> _pendingNewProducts = [];
+  List<Map<String, dynamic>> _pendingPriceChanges = [];
+
+  // Customer sync pending changes (new + changed from ACMAST)
+  List<Map<String, dynamic>> _pendingNewCustomers = [];
+  List<Map<String, dynamic>> _pendingChangedCustomers = [];
+  List<Map<String, dynamic>> _accCodeMismatches = [];
+
   // Date filter for uploads
   DateTime? _filterStartDate;
   DateTime? _filterEndDate;
@@ -62,6 +71,8 @@ class _AdminBillVerificationTabState extends State<AdminBillVerificationTab> wit
     _loadOrders();
     _loadDropdownData();
     _loadDriveDiscrepancies();
+    _loadStockSyncPendingChanges();
+    _loadCustomerSyncPendingChanges();
   }
 
   @override
@@ -100,6 +111,30 @@ class _AdminBillVerificationTabState extends State<AdminBillVerificationTab> wit
         });
       }
     } catch (_) {}
+  }
+
+  // ─── LOAD STOCK SYNC PENDING CHANGES ────────────────────────
+  Future<void> _loadStockSyncPendingChanges() async {
+    final result = DriveSyncService.instance.lastStockSyncResult;
+    if (result != null && mounted) {
+      setState(() {
+        _pendingNewProducts = List<Map<String, dynamic>>.from(result.newProducts);
+        _pendingPriceChanges = List<Map<String, dynamic>>.from(result.priceChanges);
+      });
+    }
+  }
+
+  // ─── LOAD CUSTOMER SYNC PENDING CHANGES ─────────────────────
+  Future<void> _loadCustomerSyncPendingChanges() async {
+    final result = DriveSyncService.instance.lastCustomerSyncResult;
+    if (result != null && mounted) {
+      setState(() {
+        _pendingNewCustomers = List<Map<String, dynamic>>.from(result.newCustomers);
+        _accCodeMismatches = List<Map<String, dynamic>>.from(result.accCodeMismatches);
+        // Changed customers are now auto-applied, no pending list
+        _pendingChangedCustomers = [];
+      });
+    }
   }
 
   // ─── LOAD ORDERS ─────────────────────────────────────────────
@@ -416,7 +451,7 @@ class _AdminBillVerificationTabState extends State<AdminBillVerificationTab> wit
               Tab(text: 'Returned (${_returnedOrders.length})'),
               const Tab(text: 'Upload PDF'),
               const Tab(text: 'Upload CSV'),
-              Tab(text: 'Data Changes (${_dataChanges.length})'),
+              Tab(text: 'Data Changes (${_dataChanges.length + _pendingNewProducts.length + _pendingPriceChanges.length + _pendingNewCustomers.length + _pendingChangedCustomers.length + _accCodeMismatches.length})'),
               Tab(text: 'Item Match (${_unmatchedItems.length})'),
               Tab(text: 'Customers (${_unmatchedCustomers.length})'),
             ],
@@ -837,7 +872,11 @@ class _AdminBillVerificationTabState extends State<AdminBillVerificationTab> wit
   // ─── DATA CHANGES TAB ────────────────────────────────────────
 
   Widget _buildDataChangesTab() {
-    if (_dataChanges.isEmpty) {
+    final hasStockChanges = _pendingNewProducts.isNotEmpty || _pendingPriceChanges.isNotEmpty;
+    final hasCustomerChanges = _pendingNewCustomers.isNotEmpty || _pendingChangedCustomers.isNotEmpty;
+    final totalChanges = _dataChanges.length + _pendingNewProducts.length + _pendingPriceChanges.length + _pendingNewCustomers.length + _pendingChangedCustomers.length + _accCodeMismatches.length;
+
+    if (totalChanges == 0) {
       return Center(child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
         const Icon(Icons.check_circle_rounded, size: 56, color: Colors.green),
         const SizedBox(height: 12),
@@ -854,107 +893,618 @@ class _AdminBillVerificationTabState extends State<AdminBillVerificationTab> wit
         child: Row(children: [
           Icon(Icons.warning_amber_rounded, size: 18, color: Colors.orange.shade700),
           const SizedBox(width: 8),
-          Expanded(child: Text('${_dataChanges.length} differences found', style: GoogleFonts.manrope(fontWeight: FontWeight.w700, fontSize: 13, color: Colors.orange.shade800))),
-          FilledButton.icon(
-            onPressed: _applyAllChanges,
-            icon: const Icon(Icons.update_rounded, size: 16),
-            label: Text('Apply All', style: GoogleFonts.manrope(fontWeight: FontWeight.w700, fontSize: 12)),
-            style: FilledButton.styleFrom(backgroundColor: Colors.orange.shade700, padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8)),
-          ),
+          Expanded(child: Text('$totalChanges changes to review', style: GoogleFonts.manrope(fontWeight: FontWeight.w700, fontSize: 13, color: Colors.orange.shade800))),
+          if (hasStockChanges || hasCustomerChanges)
+            Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: OutlinedButton.icon(
+                onPressed: _clearAllSyncChanges,
+                icon: const Icon(Icons.delete_sweep_rounded, size: 14),
+                label: Text('Clear All', style: GoogleFonts.manrope(fontWeight: FontWeight.w700, fontSize: 11)),
+                style: OutlinedButton.styleFrom(foregroundColor: Colors.red, side: const BorderSide(color: Colors.red), padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6)),
+              ),
+            ),
+          if (_dataChanges.isNotEmpty)
+            FilledButton.icon(
+              onPressed: _applyAllChanges,
+              icon: const Icon(Icons.update_rounded, size: 16),
+              label: Text('Apply Bills', style: GoogleFonts.manrope(fontWeight: FontWeight.w700, fontSize: 12)),
+              style: FilledButton.styleFrom(backgroundColor: Colors.orange.shade700, padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8)),
+            ),
         ]),
       ),
       // Changes list
       Expanded(
-        child: ListView.builder(
+        child: ListView(
           padding: const EdgeInsets.all(12),
-          itemCount: _dataChanges.length,
-          itemBuilder: (ctx, i) {
-            final change = _dataChanges[i];
-            final type = change['type'] as String;
-            final billNo = change['bill_no'] as String? ?? '';
-            final message = change['message'] as String? ?? '';
+          children: [
+            // ── Stock Sync: New Products in Existing Categories ──
+            if (_pendingNewProducts.isNotEmpty) ...[
+              _buildSectionHeader('New Products from ITMRP', Icons.inventory_2_rounded, Colors.teal, _pendingNewProducts.length),
+              const SizedBox(height: 6),
+              ...List.generate(_pendingNewProducts.length, (i) => _buildNewProductCard(i)),
+              const SizedBox(height: 16),
+            ],
 
-            Color cardColor;
-            IconData icon;
-            String badge;
+            // ── Stock Sync: Price Changes (RATE → unit_price) ──
+            if (_pendingPriceChanges.isNotEmpty) ...[
+              _buildSectionHeader('Price Changes from ITMRP', Icons.price_change_rounded, Colors.deepPurple, _pendingPriceChanges.length),
+              const SizedBox(height: 6),
+              ...List.generate(_pendingPriceChanges.length, (i) => _buildPriceChangeCard(i)),
+              const SizedBox(height: 16),
+            ],
 
-            switch (type) {
-              case 'new_bill':
-                cardColor = Colors.blue.shade50;
-                icon = Icons.add_circle_rounded;
-                badge = 'NEW';
-                break;
-              case 'amount_mismatch':
-                cardColor = Colors.red.shade50;
-                icon = Icons.currency_rupee_rounded;
-                badge = 'AMOUNT';
-                break;
-              case 'item_changes':
-                cardColor = Colors.amber.shade50;
-                icon = Icons.swap_horiz_rounded;
-                badge = 'ITEMS';
-                break;
-              case 'can_auto_verify':
-                cardColor = Colors.green.shade50;
-                icon = Icons.verified_rounded;
-                badge = 'VERIFY';
-                break;
-              default:
-                cardColor = Colors.grey.shade50;
-                icon = Icons.info_rounded;
-                badge = 'INFO';
-            }
-
-            return Container(
-              margin: const EdgeInsets.only(bottom: 8),
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(color: cardColor, borderRadius: BorderRadius.circular(12), border: Border.all(color: cardColor)),
-              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Row(children: [
-                  Icon(icon, size: 18, color: AppTheme.onSurface),
-                  const SizedBox(width: 8),
-                  Expanded(child: Text('Bill: $billNo', style: GoogleFonts.manrope(fontWeight: FontWeight.w700, fontSize: 13), overflow: TextOverflow.ellipsis)),
-                  const SizedBox(width: 8),
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                    decoration: BoxDecoration(color: AppTheme.primary, borderRadius: BorderRadius.circular(6)),
-                    child: Text(badge, style: GoogleFonts.manrope(fontSize: 9, fontWeight: FontWeight.w800, color: Colors.white)),
+            // ── Acc Code Mismatches (auto-fixed) ──
+            if (_accCodeMismatches.isNotEmpty) ...[
+              _buildSectionHeader('Acc Code Mismatches (Auto-Fixed)', Icons.warning_amber_rounded, Colors.red, _accCodeMismatches.length),
+              const SizedBox(height: 6),
+              ...List.generate(_accCodeMismatches.length, (i) {
+                final m = _accCodeMismatches[i];
+                return Card(
+                  margin: const EdgeInsets.symmetric(vertical: 4),
+                  color: Colors.red.shade50,
+                  child: ListTile(
+                    leading: const Icon(Icons.link_off, color: Colors.red),
+                    title: Text('acc_code ${m['acc_code']} (${m['team']})', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                    subtitle: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const SizedBox(height: 4),
+                        Text('CSV: ${m['csv_name']}', style: const TextStyle(fontSize: 12, color: Colors.green)),
+                        Text('DB was: ${m['db_name']}', style: const TextStyle(fontSize: 12, color: Colors.red)),
+                        Text('Only ${m['similarity']}% similar — wrong acc_code cleared from "${m['db_name']}"', style: const TextStyle(fontSize: 11, color: Colors.grey)),
+                      ],
+                    ),
+                    isThreeLine: true,
                   ),
-                ]),
+                );
+              }),
+              const SizedBox(height: 16),
+            ],
+
+            // ── Customer Sync: New Customers from ACMAST ──
+            if (_pendingNewCustomers.isNotEmpty) ...[
+              _buildSectionHeader('New Customers from ACMAST', Icons.person_add_rounded, Colors.indigo, _pendingNewCustomers.length),
+              const SizedBox(height: 6),
+              ...List.generate(_pendingNewCustomers.length, (i) => _buildNewCustomerCard(i)),
+              const SizedBox(height: 16),
+            ],
+
+            // ── Customer Sync: Changed Customers ──
+            if (_pendingChangedCustomers.isNotEmpty) ...[
+              _buildSectionHeader('Customer Changes from ACMAST', Icons.edit_rounded, Colors.brown, _pendingChangedCustomers.length),
+              const SizedBox(height: 6),
+              ...List.generate(_pendingChangedCustomers.length, (i) => _buildChangedCustomerCard(i)),
+              const SizedBox(height: 16),
+            ],
+
+            // ── Bill CSV Changes ──
+            if (_dataChanges.isNotEmpty) ...[
+              if (hasStockChanges || hasCustomerChanges) ...[
+                _buildSectionHeader('Bill CSV Differences', Icons.receipt_long_rounded, Colors.orange, _dataChanges.length),
                 const SizedBox(height: 6),
-                Text(message, style: GoogleFonts.manrope(fontSize: 12, color: AppTheme.onSurfaceVariant)),
-                if (change['csv_customer'] != null)
-                  Text('Customer: ${change['csv_customer']}', style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
-                if (type == 'amount_mismatch') ...[
-                  const SizedBox(height: 4),
-                  Wrap(spacing: 12, runSpacing: 4, children: [
-                    Text('CSV: \u20B9${(change['csv_total'] as num).toStringAsFixed(2)}', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700, color: Colors.green.shade700)),
-                    Text('App: \u20B9${(change['db_total'] as num).toStringAsFixed(2)}', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700, color: Colors.red.shade700)),
-                    Text('Diff: \u20B9${(change['difference'] as num).toStringAsFixed(2)}', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w800)),
-                  ]),
-                ],
-                if (type == 'item_changes') ...[
-                  const SizedBox(height: 6),
-                  ...(change['item_changes'] as List).map((ic) => Padding(
-                    padding: const EdgeInsets.only(left: 8, bottom: 4),
-                    child: Row(children: [
-                      Icon(
-                        ic['change'] == 'item_removed' ? Icons.remove_circle_rounded :
-                        ic['change'] == 'qty_reduced' ? Icons.arrow_downward_rounded :
-                        ic['change'] == 'new_item' ? Icons.add_circle_rounded :
-                        Icons.swap_horiz_rounded,
-                        size: 14, color: ic['change'] == 'item_removed' || ic['change'] == 'qty_reduced' ? Colors.red : Colors.green),
-                      const SizedBox(width: 6),
-                      Expanded(child: Text('${ic['item_name']}: ${ic['message']}', style: GoogleFonts.manrope(fontSize: 11))),
-                    ]),
-                  )),
-                ],
-              ]),
-            );
-          },
+              ],
+              ...List.generate(_dataChanges.length, (i) => _buildBillChangeCard(i)),
+            ],
+          ],
         ),
       ),
     ]);
+  }
+
+  Widget _buildSectionHeader(String title, IconData icon, Color color, int count) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: color.withValues(alpha: 0.2)),
+      ),
+      child: Row(children: [
+        Icon(icon, size: 16, color: color),
+        const SizedBox(width: 8),
+        Expanded(child: Text('$title ($count)', style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.w700, color: color))),
+      ]),
+    );
+  }
+
+  // ── New Product Card ────────────────────────────────────────
+  Widget _buildNewProductCard(int index) {
+    final item = _pendingNewProducts[index];
+    final name = item['itemName'] as String? ?? '';
+    final company = item['company'] as String? ?? '';
+    final teamId = item['team_id'] as String? ?? '';
+    final qty = item['qty'] as int? ?? 0;
+    final mrp = item['mrp'] as double?;
+    final rate = item['rate'] as double?;
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.teal.shade50,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.teal.shade200),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Icon(Icons.add_box_rounded, size: 18, color: Colors.teal.shade700),
+          const SizedBox(width: 8),
+          Expanded(child: Text(name, style: GoogleFonts.manrope(fontWeight: FontWeight.w700, fontSize: 13), overflow: TextOverflow.ellipsis)),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+            decoration: BoxDecoration(color: Colors.teal.shade700, borderRadius: BorderRadius.circular(6)),
+            child: Text('NEW PRODUCT', style: GoogleFonts.manrope(fontSize: 9, fontWeight: FontWeight.w800, color: Colors.white)),
+          ),
+        ]),
+        const SizedBox(height: 6),
+        Wrap(spacing: 12, runSpacing: 4, children: [
+          Text('Category: $company', style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
+          if (teamId.isNotEmpty) Container(
+            padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+            decoration: BoxDecoration(
+              color: teamId == 'JA' ? Colors.blue.withValues(alpha: 0.12) : Colors.orange.withValues(alpha: 0.12),
+              borderRadius: BorderRadius.circular(4),
+            ),
+            child: Text(teamId, style: GoogleFonts.manrope(fontSize: 9, fontWeight: FontWeight.w800,
+              color: teamId == 'JA' ? Colors.blue : Colors.orange)),
+          ),
+          Text('Stock: $qty', style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
+          if (mrp != null) Text('MRP: \u20B9${mrp.toStringAsFixed(2)}', style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
+          if (rate != null) Text('Rate: \u20B9${rate.toStringAsFixed(2)}', style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
+        ]),
+        const SizedBox(height: 8),
+        Row(children: [
+          Expanded(child: OutlinedButton.icon(
+            onPressed: () => _dismissNewProduct(index),
+            icon: const Icon(Icons.close_rounded, size: 14),
+            label: Text('Dismiss', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w600)),
+            style: OutlinedButton.styleFrom(foregroundColor: Colors.grey, padding: const EdgeInsets.symmetric(vertical: 8)),
+          )),
+          const SizedBox(width: 8),
+          Expanded(child: FilledButton.icon(
+            onPressed: () => _approveNewProduct(index),
+            icon: const Icon(Icons.add_rounded, size: 14),
+            label: Text('Add Product', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w600)),
+            style: FilledButton.styleFrom(backgroundColor: Colors.teal, padding: const EdgeInsets.symmetric(vertical: 8)),
+          )),
+        ]),
+      ]),
+    );
+  }
+
+  // ── Price Change Card ───────────────────────────────────────
+  Widget _buildPriceChangeCard(int index) {
+    final item = _pendingPriceChanges[index];
+    final name = item['productName'] as String? ?? '';
+    final category = item['category'] as String? ?? '';
+    final currentPrice = (item['currentPrice'] as num?)?.toDouble() ?? 0;
+    final newPrice = (item['newPrice'] as num?)?.toDouble() ?? 0;
+    final mrp = (item['mrp'] as num?)?.toDouble() ?? 0;
+    final stockQty = item['stockQty'] as int? ?? 0;
+    final priceDiff = newPrice - currentPrice;
+    final isIncrease = priceDiff > 0;
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.deepPurple.shade50,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.deepPurple.shade200),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Icon(Icons.price_change_rounded, size: 18, color: Colors.deepPurple.shade700),
+          const SizedBox(width: 8),
+          Expanded(child: Text(name, style: GoogleFonts.manrope(fontWeight: FontWeight.w700, fontSize: 13), overflow: TextOverflow.ellipsis)),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+            decoration: BoxDecoration(color: Colors.deepPurple.shade700, borderRadius: BorderRadius.circular(6)),
+            child: Text('PRICE', style: GoogleFonts.manrope(fontSize: 9, fontWeight: FontWeight.w800, color: Colors.white)),
+          ),
+        ]),
+        const SizedBox(height: 6),
+        Text(category, style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
+        const SizedBox(height: 4),
+        Wrap(spacing: 12, runSpacing: 4, children: [
+          Text('Current: \u20B9${currentPrice.toStringAsFixed(2)}', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700, color: Colors.red.shade700)),
+          Row(mainAxisSize: MainAxisSize.min, children: [
+            Icon(isIncrease ? Icons.arrow_upward_rounded : Icons.arrow_downward_rounded, size: 12, color: isIncrease ? Colors.red : Colors.green),
+            Text(' New: \u20B9${newPrice.toStringAsFixed(2)}', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700, color: Colors.green.shade700)),
+          ]),
+          Text('Diff: ${isIncrease ? '+' : ''}\u20B9${priceDiff.toStringAsFixed(2)}', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w800)),
+        ]),
+        const SizedBox(height: 2),
+        Text('MRP: \u20B9${mrp.toStringAsFixed(2)}  •  Stock: $stockQty', style: GoogleFonts.manrope(fontSize: 10, color: AppTheme.onSurfaceVariant)),
+        const SizedBox(height: 8),
+        Row(children: [
+          Expanded(child: OutlinedButton.icon(
+            onPressed: () => _dismissPriceChange(index),
+            icon: const Icon(Icons.close_rounded, size: 14),
+            label: Text('Dismiss', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w600)),
+            style: OutlinedButton.styleFrom(foregroundColor: Colors.grey, padding: const EdgeInsets.symmetric(vertical: 8)),
+          )),
+          const SizedBox(width: 8),
+          Expanded(child: FilledButton.icon(
+            onPressed: () => _approvePriceChange(index),
+            icon: const Icon(Icons.check_rounded, size: 14),
+            label: Text('Update Price', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w600)),
+            style: FilledButton.styleFrom(backgroundColor: Colors.deepPurple, padding: const EdgeInsets.symmetric(vertical: 8)),
+          )),
+        ]),
+      ]),
+    );
+  }
+
+  // ── Bill Change Card (existing logic) ───────────────────────
+  Widget _buildBillChangeCard(int index) {
+    final change = _dataChanges[index];
+    final type = change['type'] as String;
+    final billNo = change['bill_no'] as String? ?? '';
+    final message = change['message'] as String? ?? '';
+
+    Color cardColor;
+    IconData icon;
+    String badge;
+
+    switch (type) {
+      case 'new_bill':
+        cardColor = Colors.blue.shade50;
+        icon = Icons.add_circle_rounded;
+        badge = 'NEW';
+        break;
+      case 'amount_mismatch':
+        cardColor = Colors.red.shade50;
+        icon = Icons.currency_rupee_rounded;
+        badge = 'AMOUNT';
+        break;
+      case 'item_changes':
+        cardColor = Colors.amber.shade50;
+        icon = Icons.swap_horiz_rounded;
+        badge = 'ITEMS';
+        break;
+      case 'can_auto_verify':
+        cardColor = Colors.green.shade50;
+        icon = Icons.verified_rounded;
+        badge = 'VERIFY';
+        break;
+      default:
+        cardColor = Colors.grey.shade50;
+        icon = Icons.info_rounded;
+        badge = 'INFO';
+    }
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(color: cardColor, borderRadius: BorderRadius.circular(12), border: Border.all(color: cardColor)),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Icon(icon, size: 18, color: AppTheme.onSurface),
+          const SizedBox(width: 8),
+          Expanded(child: Text('Bill: $billNo', style: GoogleFonts.manrope(fontWeight: FontWeight.w700, fontSize: 13), overflow: TextOverflow.ellipsis)),
+          const SizedBox(width: 8),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+            decoration: BoxDecoration(color: AppTheme.primary, borderRadius: BorderRadius.circular(6)),
+            child: Text(badge, style: GoogleFonts.manrope(fontSize: 9, fontWeight: FontWeight.w800, color: Colors.white)),
+          ),
+        ]),
+        const SizedBox(height: 6),
+        Text(message, style: GoogleFonts.manrope(fontSize: 12, color: AppTheme.onSurfaceVariant)),
+        if (change['csv_customer'] != null)
+          Text('Customer: ${change['csv_customer']}', style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
+        if (type == 'amount_mismatch') ...[
+          const SizedBox(height: 4),
+          Wrap(spacing: 12, runSpacing: 4, children: [
+            Text('CSV: \u20B9${(change['csv_total'] as num).toStringAsFixed(2)}', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700, color: Colors.green.shade700)),
+            Text('App: \u20B9${(change['db_total'] as num).toStringAsFixed(2)}', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700, color: Colors.red.shade700)),
+            Text('Diff: \u20B9${(change['difference'] as num).toStringAsFixed(2)}', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w800)),
+          ]),
+        ],
+        if (type == 'item_changes') ...[
+          const SizedBox(height: 6),
+          ...(change['item_changes'] as List).map((ic) => Padding(
+            padding: const EdgeInsets.only(left: 8, bottom: 4),
+            child: Row(children: [
+              Icon(
+                ic['change'] == 'item_removed' ? Icons.remove_circle_rounded :
+                ic['change'] == 'qty_reduced' ? Icons.arrow_downward_rounded :
+                ic['change'] == 'new_item' ? Icons.add_circle_rounded :
+                Icons.swap_horiz_rounded,
+                size: 14, color: ic['change'] == 'item_removed' || ic['change'] == 'qty_reduced' ? Colors.red : Colors.green),
+              const SizedBox(width: 6),
+              Expanded(child: Text('${ic['item_name']}: ${ic['message']}', style: GoogleFonts.manrope(fontSize: 11))),
+            ]),
+          )),
+        ],
+      ]),
+    );
+  }
+
+  // ── Apply / Dismiss Stock Sync Changes ──────────────────────
+
+  Future<void> _approveNewProduct(int index) async {
+    final item = _pendingNewProducts[index];
+    try {
+      await DriveSyncService.instance.applyNewProduct(item);
+      // Removed from in-memory list via setState below
+      setState(() => _pendingNewProducts.removeAt(index));
+      await SupabaseService.instance.invalidateCache('products');
+      await _loadDropdownData();
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Added "${item['itemName']}" to products'), backgroundColor: Colors.green),
+        );
+      }
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red));
+    }
+  }
+
+  Future<void> _dismissNewProduct(int index) async {
+    // In-memory only
+    setState(() => _pendingNewProducts.removeAt(index));
+  }
+
+  Future<void> _approvePriceChange(int index) async {
+    final item = _pendingPriceChanges[index];
+    try {
+      await DriveSyncService.instance.applyPriceChange(
+        item['productId'] as String,
+        (item['newPrice'] as num).toDouble(),
+      );
+      // Removed from in-memory list via setState below
+      setState(() => _pendingPriceChanges.removeAt(index));
+      await SupabaseService.instance.invalidateCache('products');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Price updated for "${item['productName']}"'), backgroundColor: Colors.green),
+        );
+      }
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red));
+    }
+  }
+
+  Future<void> _dismissPriceChange(int index) async {
+    // In-memory only
+    setState(() => _pendingPriceChanges.removeAt(index));
+  }
+
+  Future<void> _clearAllSyncChanges() async {
+    final total = _pendingNewProducts.length + _pendingPriceChanges.length + _pendingNewCustomers.length + _pendingChangedCustomers.length;
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Text('Clear All Sync Changes?', style: GoogleFonts.manrope(fontWeight: FontWeight.w800)),
+        content: Text('This will dismiss $total pending changes (stock + customer).',
+          style: GoogleFonts.manrope(fontSize: 14, color: AppTheme.onSurfaceVariant)),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: Colors.red),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text('Clear All', style: GoogleFonts.manrope(fontWeight: FontWeight.w700)),
+          ),
+        ],
+      ),
+    );
+    if (confirm != true) return;
+    // In-memory only — clear lists via setState below
+    setState(() {
+      _pendingNewProducts.clear();
+      _pendingPriceChanges.clear();
+      _pendingNewCustomers.clear();
+      _pendingChangedCustomers.clear();
+      _accCodeMismatches.clear();
+    });
+  }
+
+  // ── New Customer Card ───────────────────────────────────────
+  Widget _buildNewCustomerCard(int index) {
+    final item = _pendingNewCustomers[index];
+    final name = item['name'] as String? ?? '';
+    final address = item['address'] as String? ?? '';
+    final phone = item['phone'] as String? ?? '';
+    final group = item['group'] as String? ?? '';
+    final amount = (item['amount'] as num?)?.toDouble() ?? 0;
+    final accCode = item['acc_code'] as String? ?? '';
+    final teamId = item['team_id'] as String? ?? '';
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.indigo.shade50,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.indigo.shade200),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Icon(Icons.person_add_rounded, size: 18, color: Colors.indigo.shade700),
+          const SizedBox(width: 8),
+          Expanded(child: Text(name, style: GoogleFonts.manrope(fontWeight: FontWeight.w700, fontSize: 13), overflow: TextOverflow.ellipsis)),
+          if (teamId.isNotEmpty) ...[
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+              margin: const EdgeInsets.only(right: 6),
+              decoration: BoxDecoration(
+                color: teamId == 'JA' ? Colors.blue.withValues(alpha: 0.12) : Colors.orange.withValues(alpha: 0.12),
+                borderRadius: BorderRadius.circular(4),
+              ),
+              child: Text(teamId, style: GoogleFonts.manrope(fontSize: 9, fontWeight: FontWeight.w800,
+                color: teamId == 'JA' ? Colors.blue : Colors.orange)),
+            ),
+          ],
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+            decoration: BoxDecoration(color: Colors.indigo.shade700, borderRadius: BorderRadius.circular(6)),
+            child: Text('NEW CUSTOMER', style: GoogleFonts.manrope(fontSize: 9, fontWeight: FontWeight.w800, color: Colors.white)),
+          ),
+        ]),
+        const SizedBox(height: 6),
+        if (address.isNotEmpty)
+          Text(address, style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
+        Wrap(spacing: 12, runSpacing: 4, children: [
+          if (accCode.isNotEmpty) Text('Code: $accCode', style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
+          if (phone.isNotEmpty) Text('Ph: $phone', style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
+          if (group.isNotEmpty) Text('Area: $group', style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
+          if (amount != 0) Text('Bal: \u20B9${amount.toStringAsFixed(0)}', style: GoogleFonts.manrope(fontSize: 11, fontWeight: FontWeight.w600, color: amount > 0 ? Colors.red : Colors.green)),
+        ]),
+        const SizedBox(height: 8),
+        Row(children: [
+          Expanded(child: OutlinedButton.icon(
+            onPressed: () => _dismissNewCustomer(index),
+            icon: const Icon(Icons.close_rounded, size: 14),
+            label: Text('Dismiss', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w600)),
+            style: OutlinedButton.styleFrom(foregroundColor: Colors.grey, padding: const EdgeInsets.symmetric(vertical: 8)),
+          )),
+          const SizedBox(width: 8),
+          Expanded(child: FilledButton.icon(
+            onPressed: () => _approveNewCustomer(index),
+            icon: const Icon(Icons.person_add_rounded, size: 14),
+            label: Text('Add Customer', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w600)),
+            style: FilledButton.styleFrom(backgroundColor: Colors.indigo, padding: const EdgeInsets.symmetric(vertical: 8)),
+          )),
+        ]),
+      ]),
+    );
+  }
+
+  // ── Changed Customer Card ───────────────────────────────────
+  Widget _buildChangedCustomerCard(int index) {
+    final item = _pendingChangedCustomers[index];
+    final customerName = item['customerName'] as String? ?? item['name'] as String? ?? '';
+    final accCode = item['acc_code'] as String? ?? '';
+    final teamId = item['team_id'] as String? ?? '';
+    final changesRaw = item['changes'];
+    final changes = changesRaw is Map
+        ? Map<String, dynamic>.from(changesRaw)
+        : <String, dynamic>{};
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.brown.shade50,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.brown.shade200),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Icon(Icons.edit_rounded, size: 18, color: Colors.brown.shade700),
+          const SizedBox(width: 8),
+          Expanded(child: Text(customerName, style: GoogleFonts.manrope(fontWeight: FontWeight.w700, fontSize: 13), overflow: TextOverflow.ellipsis)),
+          if (teamId.isNotEmpty) ...[
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+              margin: const EdgeInsets.only(right: 6),
+              decoration: BoxDecoration(
+                color: teamId == 'JA' ? Colors.blue.withValues(alpha: 0.12) : Colors.orange.withValues(alpha: 0.12),
+                borderRadius: BorderRadius.circular(4),
+              ),
+              child: Text(teamId, style: GoogleFonts.manrope(fontSize: 9, fontWeight: FontWeight.w800,
+                color: teamId == 'JA' ? Colors.blue : Colors.orange)),
+            ),
+          ],
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+            decoration: BoxDecoration(color: Colors.brown.shade700, borderRadius: BorderRadius.circular(6)),
+            child: Text('CHANGED', style: GoogleFonts.manrope(fontSize: 9, fontWeight: FontWeight.w800, color: Colors.white)),
+          ),
+        ]),
+        if (accCode.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 2),
+            child: Text('Code: $accCode', style: GoogleFonts.manrope(fontSize: 10, color: AppTheme.onSurfaceVariant)),
+          ),
+        const SizedBox(height: 6),
+        ...changes.entries.map((e) {
+          final field = e.key;
+          final change = e.value is Map ? Map<String, dynamic>.from(e.value as Map) : <String, dynamic>{};
+          final oldVal = change['old']?.toString() ?? '';
+          final newVal = change['new']?.toString() ?? '';
+          final fieldLabel = field == 'acc_code' ? 'Account Code' : field[0].toUpperCase() + field.substring(1);
+          return Padding(
+            padding: const EdgeInsets.only(bottom: 4),
+            child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              SizedBox(width: 70, child: Text('$fieldLabel:', style: GoogleFonts.manrope(fontSize: 11, fontWeight: FontWeight.w600))),
+              Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                if (oldVal.isNotEmpty) Text(oldVal, style: GoogleFonts.manrope(fontSize: 11, color: Colors.red.shade700, decoration: TextDecoration.lineThrough)),
+                Text(newVal, style: GoogleFonts.manrope(fontSize: 11, color: Colors.green.shade700, fontWeight: FontWeight.w600)),
+              ])),
+            ]),
+          );
+        }),
+        const SizedBox(height: 8),
+        Row(children: [
+          Expanded(child: OutlinedButton.icon(
+            onPressed: () => _dismissChangedCustomer(index),
+            icon: const Icon(Icons.close_rounded, size: 14),
+            label: Text('Dismiss', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w600)),
+            style: OutlinedButton.styleFrom(foregroundColor: Colors.grey, padding: const EdgeInsets.symmetric(vertical: 8)),
+          )),
+          const SizedBox(width: 8),
+          Expanded(child: FilledButton.icon(
+            onPressed: () => _approveChangedCustomer(index),
+            icon: const Icon(Icons.check_rounded, size: 14),
+            label: Text('Apply Changes', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w600)),
+            style: FilledButton.styleFrom(backgroundColor: Colors.brown, padding: const EdgeInsets.symmetric(vertical: 8)),
+          )),
+        ]),
+      ]),
+    );
+  }
+
+  // ── Customer Apply / Dismiss ────────────────────────────────
+
+  Future<void> _approveNewCustomer(int index) async {
+    final item = _pendingNewCustomers[index];
+    try {
+      await DriveSyncService.instance.applyNewCustomer(item);
+      // Removed from in-memory list via setState below
+      setState(() => _pendingNewCustomers.removeAt(index));
+      await SupabaseService.instance.invalidateCache('customers');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Added "${item['name']}"'), backgroundColor: Colors.green),
+        );
+      }
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red));
+    }
+  }
+
+  Future<void> _dismissNewCustomer(int index) async {
+    // In-memory only
+    setState(() => _pendingNewCustomers.removeAt(index));
+  }
+
+  Future<void> _approveChangedCustomer(int index) async {
+    final item = _pendingChangedCustomers[index];
+    try {
+      final changesRaw = item['changes'];
+      final changes = changesRaw is Map ? Map<String, dynamic>.from(changesRaw) : <String, dynamic>{};
+      await DriveSyncService.instance.applyCustomerChange(item['customerId'] as String, changes);
+      // Removed from in-memory list via setState below
+      setState(() => _pendingChangedCustomers.removeAt(index));
+      await SupabaseService.instance.invalidateCache('customers');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Updated "${item['customerName'] ?? item['name']}"'), backgroundColor: Colors.green),
+        );
+      }
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red));
+    }
+  }
+
+  Future<void> _dismissChangedCustomer(int index) async {
+    // In-memory only
+    setState(() => _pendingChangedCustomers.removeAt(index));
   }
 
   Future<void> _applyAllChanges() async {

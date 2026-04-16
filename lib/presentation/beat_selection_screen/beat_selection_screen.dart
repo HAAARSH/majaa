@@ -1,12 +1,18 @@
 import 'dart:math' as math;
+import 'dart:typed_data' show Uint8List;
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:intl/intl.dart';
 import 'package:hive_flutter/hive_flutter.dart';
+import 'package:share_plus/share_plus.dart';
+import 'package:http/http.dart' as http;
 
 import '../../routes/app_routes.dart';
 import '../../services/auth_service.dart';
+import 'package:supabase_flutter/supabase_flutter.dart' show FileOptions;
 import '../../services/supabase_service.dart';
+import '../../services/cart_service.dart';
 import '../../services/pdf_service.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/hero_selfie_modal.dart';
@@ -19,7 +25,7 @@ class BeatSelectionScreen extends StatefulWidget {
   State<BeatSelectionScreen> createState() => _BeatSelectionScreenState();
 }
 
-class _BeatSelectionScreenState extends State<BeatSelectionScreen> {
+class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerProviderStateMixin {
   List<BeatModel> _beats = [];
   Map<String, int> _totalOutlets = {};
   Map<String, int> _ordersToday = {};
@@ -34,10 +40,32 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> {
   // Cache user data to avoid redundant network calls
   AppUserModel? _cachedUser;
 
+  // Tab data
+  late TabController _tabController;
+  List<Map<String, dynamic>> _todayOrders = [];
+  List<CollectionModel> _todayCollections = [];
+  List<CustomerModel> _nextDayOutstanding = [];
+  String _nextDayLabel = '';
+  // Cross-team tracking for next day outstanding
+  Map<String, String> _nextDayCustomerTeam = {}; // customer ID -> team that found them
+  String? _nextDayCrossTeamId; // the other team if cross-team beats detected
+
+  bool get _isBrandRep => SupabaseService.instance.currentUserRole == 'brand_rep';
+  bool get _isSalesRep => SupabaseService.instance.currentUserRole == 'sales_rep';
+
+  int get _tabCount => _isBrandRep ? 1 : 3; // brand_rep: Orders only; sales_rep: Orders + Collections + Next Day
+
   @override
   void initState() {
     super.initState();
+    _tabController = TabController(length: _tabCount, vsync: this);
     _loadData();
+  }
+
+  @override
+  void dispose() {
+    _tabController.dispose();
+    super.dispose();
   }
 
   Future<void> _loadData({bool forceRefresh = false}) async {
@@ -120,10 +148,83 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> {
           _collectionsToday = collectionsMap;
           _outstandingByBeat = outstandingMap;
           _isLoading = false;
+          _todayOrders = orders
+            ..sort((a, b) => ((a['customer_name'] as String?) ?? '').toLowerCase()
+                .compareTo(((b['customer_name'] as String?) ?? '').toLowerCase()));
         });
+
+        // Load tab data in background (non-blocking)
+        _loadTabData(allCustomers, beats);
       }
     } catch (e) {
       if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  Future<void> _loadTabData(List<CustomerModel> allCustomers, List<BeatModel> allBeats) async {
+    try {
+      final today = DateTime.now();
+      final todayStr = today.toIso8601String().substring(0, 10);
+
+      // Load today's collections for logged-in rep only
+      if (!_isBrandRep) {
+        final repEmail = SupabaseService.instance.client.auth.currentUser?.email ?? '';
+        final allCollections = await SupabaseService.instance.getCollections(
+          startDate: today,
+          endDate: today,
+        );
+        // Filter by current user's email
+        final myCollections = repEmail.isNotEmpty
+            ? allCollections.where((c) => c.repEmail == repEmail).toList()
+            : allCollections;
+        if (mounted) setState(() => _todayCollections = myCollections);
+      }
+
+      // Load next day beat outstanding (sales_rep only)
+      if (!_isBrandRep) {
+        final tomorrow = today.add(const Duration(days: 1));
+        final tomorrowName = _weekdayNames[tomorrow.weekday - 1];
+        _nextDayLabel = DateFormat('EEEE').format(tomorrow);
+
+        final tomorrowBeats = allBeats.where((b) =>
+            b.weekdays.any((d) => d.toLowerCase().trim() == tomorrowName)).toList();
+
+        // Auto-detect cross-team: check if tomorrow's beats span both teams
+        final tomorrowTeams = tomorrowBeats.map((b) => b.teamId).toSet();
+        final crossTeamId = tomorrowTeams.length > 1
+            ? tomorrowTeams.firstWhere((t) => t != AuthService.currentTeam, orElse: () => '')
+            : null;
+
+        final outstandingCustomers = <CustomerModel>[];
+        final customerTeamMap = <String, String>{};
+        for (final b in tomorrowBeats) {
+          final beatTeam = b.teamId;
+          final beatCustomers = allCustomers.where((c) {
+            final bid = c.beatIdForTeam(beatTeam);
+            return bid == b.id;
+          });
+          for (final c in beatCustomers) {
+            final outstanding = c.outstandingForTeam(beatTeam);
+            if (outstanding > 0 && !outstandingCustomers.any((oc) => oc.id == c.id)) {
+              outstandingCustomers.add(c);
+              customerTeamMap[c.id] = beatTeam;
+            }
+          }
+        }
+        // Sort A-Z by customer name
+        outstandingCustomers.sort((a, b) =>
+            a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+
+        if (mounted) {
+          setState(() {
+            _nextDayOutstanding = outstandingCustomers;
+            _nextDayCustomerTeam = customerTeamMap;
+            _nextDayCrossTeamId = crossTeamId != null && crossTeamId.isNotEmpty ? crossTeamId : null;
+          });
+        }
+      }
+    } catch (e) {
+      debugPrint('⚠️ _loadTabData error: $e');
     }
   }
 
@@ -514,45 +615,68 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> {
         ),
       );
     } else {
-      body = ListView(
-        padding: const EdgeInsets.all(16),
-        children: [
-          _buildGreetingHeader(),
-          const SizedBox(height: 16),
-          _buildSummaryStrip(totalOutlets, totalOrders, coverage),
-          const SizedBox(height: 20),
-          if (_beats.isEmpty)
-            Padding(
-              padding: const EdgeInsets.only(top: 40),
+      body = NestedScrollView(
+        headerSliverBuilder: (context, innerBoxIsScrolled) => [
+          SliverToBoxAdapter(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
               child: Column(
-                mainAxisSize: MainAxisSize.min,
                 children: [
-                  Icon(Icons.event_busy_rounded,
-                      size: 64, color: AppTheme.onSurfaceVariant.withAlpha(100)),
+                  _buildGreetingHeader(),
                   const SizedBox(height: 16),
-                  Text(
-                    'No beats scheduled for today',
-                    style: GoogleFonts.manrope(
-                      fontSize: 16,
-                      fontWeight: FontWeight.w600,
-                      color: AppTheme.onSurface,
-                    ),
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    "Use 'Out of Beat Order' below to visit any customer",
-                    textAlign: TextAlign.center,
-                    style: GoogleFonts.manrope(
-                      fontSize: 13,
-                      color: AppTheme.onSurfaceVariant,
-                    ),
-                  ),
+                  _buildSummaryStrip(totalOutlets, totalOrders, coverage),
+                  const SizedBox(height: 20),
+                  if (_beats.isEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 20, bottom: 20),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.event_busy_rounded,
+                              size: 48, color: AppTheme.onSurfaceVariant.withAlpha(100)),
+                          const SizedBox(height: 12),
+                          Text("No beats scheduled for today",
+                              style: GoogleFonts.manrope(fontSize: 14, fontWeight: FontWeight.w600, color: AppTheme.onSurface)),
+                          const SizedBox(height: 4),
+                          Text("Use 'Out of Beat Order' below",
+                              style: GoogleFonts.manrope(fontSize: 12, color: AppTheme.onSurfaceVariant)),
+                        ],
+                      ),
+                    )
+                  else
+                    _buildTodaysBeatsCard(),
                 ],
               ),
-            )
-          else
-            _buildTodaysBeatsCard(),
+            ),
+          ),
+          // Pinned tab bar — sticks below AppBar when scrolled
+          SliverPersistentHeader(
+            pinned: true,
+            delegate: _TabBarDelegate(
+              TabBar(
+                controller: _tabController,
+                labelColor: AppTheme.primary,
+                unselectedLabelColor: AppTheme.onSurfaceVariant,
+                indicatorColor: AppTheme.primary,
+                labelStyle: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700),
+                unselectedLabelStyle: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w500),
+                tabs: [
+                  const Tab(text: 'Today Orders'),
+                  if (!_isBrandRep) const Tab(text: 'Collections'),
+                  if (!_isBrandRep) const Tab(text: 'Next Day Due'),
+                ],
+              ),
+            ),
+          ),
         ],
+        body: TabBarView(
+          controller: _tabController,
+          children: [
+            _buildTodayOrdersTab(),
+            if (!_isBrandRep) _buildTodayCollectionsTab(),
+            if (!_isBrandRep) _buildNextDayOutstandingTab(),
+          ],
+        ),
       );
     }
 
@@ -789,6 +913,940 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> {
         Text(label, style: GoogleFonts.manrope(fontSize: 10, color: Colors.white.withValues(alpha: 0.7))),
       ],
     );
+  }
+
+  // ─── TAB: Today Orders ─────────────────────────────────────────
+  Widget _buildTodayOrdersTab() {
+    if (_todayOrders.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.receipt_long_outlined, size: 48, color: AppTheme.onSurfaceVariant.withAlpha(80)),
+            const SizedBox(height: 12),
+            Text('No orders today', style: GoogleFonts.manrope(fontSize: 14, fontWeight: FontWeight.w600, color: AppTheme.onSurfaceVariant)),
+          ],
+        ),
+      );
+    }
+    final totalAmt = _todayOrders.fold(0.0, (sum, o) => sum + ((o['grand_total'] as num?)?.toDouble() ?? 0));
+    return Column(
+      children: [
+        Container(
+          color: AppTheme.surface,
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          child: Row(children: [
+            Text('${_todayOrders.length} orders', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w600, color: AppTheme.onSurfaceVariant)),
+            const Spacer(),
+            Text('\u20B9${totalAmt.toStringAsFixed(0)}', style: GoogleFonts.manrope(fontSize: 15, fontWeight: FontWeight.w800, color: AppTheme.primary)),
+          ]),
+        ),
+        const Divider(height: 1),
+        Expanded(
+          child: ListView.builder(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 80),
+            itemCount: _todayOrders.length + 1, // +1 for export button
+            itemBuilder: (_, i) {
+              // Last item = export button
+              if (i == _todayOrders.length) {
+                return Padding(
+                  padding: const EdgeInsets.only(top: 8, bottom: 16),
+                  child: SizedBox(
+                    width: double.infinity,
+                    height: 46,
+                    child: FilledButton.icon(
+                      onPressed: _exportTodayOrdersPdf,
+                      icon: const Icon(Icons.picture_as_pdf_rounded, size: 18),
+                      label: Text('Export & Share on WhatsApp', style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.w700)),
+                      style: FilledButton.styleFrom(
+                        backgroundColor: Colors.green.shade700,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                      ),
+                    ),
+                  ),
+                );
+              }
+              final o = _todayOrders[i];
+              final name = o['customer_name'] as String? ?? '';
+              final total = (o['grand_total'] as num?)?.toDouble() ?? 0;
+              final items = (o['order_items'] as List?)?.length ?? 0;
+              final status = o['status'] as String? ?? '';
+              final beat = o['beat_name'] as String? ?? '';
+              final orderId = o['id'] as String? ?? '';
+              return GestureDetector(
+                onTap: () => _showOrderActions(o),
+                child: Container(
+                  margin: const EdgeInsets.only(bottom: 8),
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: AppTheme.surface,
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: AppTheme.outlineVariant),
+                  ),
+                  child: Row(children: [
+                    Expanded(child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(name, style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.w700), overflow: TextOverflow.ellipsis),
+                        const SizedBox(height: 2),
+                        Text('$items items \u2022 $beat', style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
+                      ],
+                    )),
+                    Column(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                      Text('\u20B9${total.toStringAsFixed(0)}', style: GoogleFonts.manrope(fontSize: 14, fontWeight: FontWeight.w800, color: AppTheme.primary)),
+                      const SizedBox(height: 2),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+                        decoration: BoxDecoration(
+                          color: status == 'Delivered' ? Colors.green.shade50 : Colors.orange.shade50,
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: Text(status, style: GoogleFonts.manrope(fontSize: 9, fontWeight: FontWeight.w700,
+                            color: status == 'Delivered' ? Colors.green.shade700 : Colors.orange.shade700)),
+                      ),
+                    ]),
+                    const SizedBox(width: 4),
+                    Icon(Icons.more_vert_rounded, size: 16, color: AppTheme.onSurfaceVariant),
+                  ]),
+                ),
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+
+  void _showOrderActions(Map<String, dynamic> order) {
+    final orderId = order['id'] as String? ?? '';
+    final customerName = order['customer_name'] as String? ?? '';
+    final total = (order['grand_total'] as num?)?.toDouble() ?? 0;
+    final customerId = order['customer_id'] as String?;
+
+    showModalBottomSheet(
+      context: context,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      builder: (ctx) => Padding(
+        padding: const EdgeInsets.fromLTRB(20, 16, 20, 30),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text('$customerName — \u20B9${total.toStringAsFixed(0)}',
+                style: GoogleFonts.manrope(fontSize: 15, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 16),
+            ListTile(
+              leading: Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(color: AppTheme.primary.withAlpha(20), borderRadius: BorderRadius.circular(10)),
+                child: Icon(Icons.edit_rounded, color: AppTheme.primary, size: 20),
+              ),
+              title: Text('Edit Order', style: GoogleFonts.manrope(fontWeight: FontWeight.w600)),
+              subtitle: Text('Load items into cart and modify', style: GoogleFonts.manrope(fontSize: 12, color: AppTheme.onSurfaceVariant)),
+              onTap: () async {
+                Navigator.pop(ctx);
+                await _editOrder(order);
+              },
+            ),
+            ListTile(
+              leading: Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(color: Colors.red.shade50, borderRadius: BorderRadius.circular(10)),
+                child: Icon(Icons.delete_outline_rounded, color: Colors.red, size: 20),
+              ),
+              title: Text('Delete Order', style: GoogleFonts.manrope(fontWeight: FontWeight.w600, color: Colors.red)),
+              subtitle: Text('Permanently remove this order', style: GoogleFonts.manrope(fontSize: 12, color: AppTheme.onSurfaceVariant)),
+              onTap: () {
+                Navigator.pop(ctx);
+                _confirmDeleteOrder(orderId, customerName, total);
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _editOrder(Map<String, dynamic> order) async {
+    try {
+      final customerId = order['customer_id'] as String?;
+      if (customerId == null) {
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Customer not found for this order'), backgroundColor: Colors.red));
+        return;
+      }
+
+      final customer = await SupabaseService.instance.getCustomerById(customerId);
+      if (customer == null) {
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Customer no longer exists'), backgroundColor: Colors.red));
+        return;
+      }
+      if (!mounted) return;
+
+      // Build OrderModel and load to cart (stores editingOrderId — old order stays until submit)
+      final orderModel = OrderModel.fromJson(order);
+      await CartService.instance.loadOrderToCart(orderModel, customer, null);
+      if (!mounted) return;
+
+      // Warn if some products were missing
+      final skipped = CartService.instance.editingSkippedItems;
+      if (skipped.isNotEmpty && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('${skipped.length} item(s) no longer available: ${skipped.join(", ")}'),
+          backgroundColor: Colors.orange,
+          duration: const Duration(seconds: 4),
+        ));
+      }
+
+      Navigator.pushNamed(context, AppRoutes.productsScreen);
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red));
+    }
+  }
+
+  void _confirmDeleteOrder(String orderId, String customerName, double total) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Delete Order', style: GoogleFonts.manrope(fontWeight: FontWeight.w700)),
+        content: Text('Delete order for "$customerName" (\u20B9${total.toStringAsFixed(0)})?\n\nThis cannot be undone.',
+            style: GoogleFonts.manrope(fontSize: 14)),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: Text('Cancel', style: GoogleFonts.manrope(color: Colors.grey))),
+          TextButton(
+            onPressed: () async {
+              Navigator.pop(ctx);
+              try {
+                await SupabaseService.instance.deleteOrder(orderId, isSuperAdmin: true);
+                if (!mounted) return;
+                setState(() => _todayOrders.removeWhere((o) => o['id'] == orderId));
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Order deleted'), backgroundColor: Colors.green));
+              } catch (e) {
+                if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red));
+              }
+            },
+            child: Text('Delete', style: GoogleFonts.manrope(color: Colors.red, fontWeight: FontWeight.w700)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showCollectionActions(CollectionModel collection) {
+    showModalBottomSheet(
+      context: context,
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      builder: (ctx) => Padding(
+        padding: const EdgeInsets.fromLTRB(20, 16, 20, 30),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text('${collection.customerName} — \u20B9${collection.amountCollected.toStringAsFixed(0)}',
+                style: GoogleFonts.manrope(fontSize: 15, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 16),
+            ListTile(
+              leading: Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(color: AppTheme.primary.withAlpha(20), borderRadius: BorderRadius.circular(10)),
+                child: Icon(Icons.edit_rounded, color: AppTheme.primary, size: 20),
+              ),
+              title: Text('Edit Collection', style: GoogleFonts.manrope(fontWeight: FontWeight.w600)),
+              subtitle: Text('Change amount, method, or bill no', style: GoogleFonts.manrope(fontSize: 12, color: AppTheme.onSurfaceVariant)),
+              onTap: () {
+                Navigator.pop(ctx);
+                _showEditCollectionDialog(collection);
+              },
+            ),
+            ListTile(
+              leading: Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(color: Colors.red.shade50, borderRadius: BorderRadius.circular(10)),
+                child: Icon(Icons.delete_outline_rounded, color: Colors.red, size: 20),
+              ),
+              title: Text('Delete Collection', style: GoogleFonts.manrope(fontWeight: FontWeight.w600, color: Colors.red)),
+              subtitle: Text('Remove and restore outstanding', style: GoogleFonts.manrope(fontSize: 12, color: AppTheme.onSurfaceVariant)),
+              onTap: () {
+                Navigator.pop(ctx);
+                _confirmDeleteCollection(collection);
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showEditCollectionDialog(CollectionModel collection) {
+    final amountCtrl = TextEditingController(text: collection.amountCollected.toStringAsFixed(0));
+    final billNoCtrl = TextEditingController(text: collection.billNo ?? '');
+    String method = collection.paymentMode;
+
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          title: Text('Edit Collection', style: GoogleFonts.manrope(fontWeight: FontWeight.w700)),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: amountCtrl,
+                keyboardType: TextInputType.number,
+                decoration: InputDecoration(labelText: 'Amount (\u20B9)', border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)), prefixIcon: const Icon(Icons.currency_rupee)),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: billNoCtrl,
+                decoration: InputDecoration(labelText: 'Bill Number', border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)), prefixIcon: const Icon(Icons.receipt_outlined)),
+              ),
+              const SizedBox(height: 12),
+              Row(children: [
+                _methodChip('UPI', method, (v) => setDialogState(() => method = v)),
+                const SizedBox(width: 8),
+                _methodChip('CASH', method, (v) => setDialogState(() => method = v)),
+                const SizedBox(width: 8),
+                _methodChip('Cheque', method, (v) => setDialogState(() => method = v)),
+              ]),
+            ],
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: Text('Cancel', style: GoogleFonts.manrope(color: Colors.grey))),
+            FilledButton(
+              onPressed: () async {
+                Navigator.pop(ctx);
+                final newAmt = double.tryParse(amountCtrl.text.trim());
+                final success = await SupabaseService.instance.updateCollection(
+                  collection.id,
+                  newAmount: newAmt,
+                  newMethod: method,
+                  newBillNo: billNoCtrl.text.trim(),
+                );
+                if (success && mounted) {
+                  _loadTabData(await SupabaseService.instance.getCustomers(),
+                      await SupabaseService.instance.getUserBeats(
+                          SupabaseService.instance.currentUserId ?? '', allTeams: true));
+                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Collection updated'), backgroundColor: Colors.green));
+                }
+              },
+              child: const Text('Save'),
+            ),
+          ],
+        ),
+      ),
+    ).then((_) { amountCtrl.dispose(); billNoCtrl.dispose(); });
+  }
+
+  Widget _methodChip(String label, String selected, ValueChanged<String> onTap) {
+    final isSelected = selected == label || (label == 'CASH' && (selected == 'Cash' || selected == 'CASH'));
+    return Expanded(
+      child: GestureDetector(
+        onTap: () => onTap(label),
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          decoration: BoxDecoration(
+            color: isSelected ? AppTheme.primary : AppTheme.surfaceVariant,
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Center(child: Text(label, style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w600,
+              color: isSelected ? Colors.white : AppTheme.onSurfaceVariant))),
+        ),
+      ),
+    );
+  }
+
+  void _confirmDeleteCollection(CollectionModel collection) {
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Delete Collection', style: GoogleFonts.manrope(fontWeight: FontWeight.w700)),
+        content: Text('Delete \u20B9${collection.amountCollected.toStringAsFixed(0)} collection from "${collection.customerName}"?\n\nOutstanding will be restored.',
+            style: GoogleFonts.manrope(fontSize: 14)),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: Text('Cancel', style: GoogleFonts.manrope(color: Colors.grey))),
+          TextButton(
+            onPressed: () async {
+              Navigator.pop(ctx);
+              final success = await SupabaseService.instance.deleteCollection(collection.id);
+              if (success && mounted) {
+                setState(() => _todayCollections.removeWhere((c) => c.id == collection.id));
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Collection deleted, outstanding restored'), backgroundColor: Colors.green));
+              }
+            },
+            child: Text('Delete', style: GoogleFonts.manrope(color: Colors.red, fontWeight: FontWeight.w700)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _exportTodayOrdersPdf() async {
+    try {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Generating report...'), duration: Duration(seconds: 1)),
+      );
+      final filePath = await PdfService.generateOrderReportFile(DateTime.now());
+      // Share directly to WhatsApp
+      await SharePlus.instance.share(
+        ShareParams(
+          files: [XFile(filePath)],
+          text: 'MAJAA Sales — Today\'s Order Report (${DateFormat('dd MMM yyyy').format(DateTime.now())})',
+        ),
+      );
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('$e'), backgroundColor: Colors.red),
+        );
+      }
+    }
+  }
+
+  // ─── TAB: Today Collections ───────────────────────────────────
+  Widget _buildTodayCollectionsTab() {
+    if (_todayCollections.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.payments_outlined, size: 48, color: AppTheme.onSurfaceVariant.withAlpha(80)),
+            const SizedBox(height: 12),
+            Text('No collections today', style: GoogleFonts.manrope(fontSize: 14, fontWeight: FontWeight.w600, color: AppTheme.onSurfaceVariant)),
+          ],
+        ),
+      );
+    }
+    final totalAmt = _todayCollections.fold(0.0, (sum, c) => sum + c.amountCollected);
+    final cashAmt = _todayCollections.where((c) => c.paymentMode == 'CASH' || c.paymentMode == 'Cash').fold(0.0, (sum, c) => sum + c.amountCollected);
+    final upiAmt = _todayCollections.where((c) => c.paymentMode == 'UPI').fold(0.0, (sum, c) => sum + c.amountCollected);
+    final chequeAmt = _todayCollections.where((c) => c.paymentMode == 'Cheque' || c.paymentMode == 'CHEQUE').fold(0.0, (sum, c) => sum + c.amountCollected);
+    final cashCount = _todayCollections.where((c) => c.paymentMode == 'CASH' || c.paymentMode == 'Cash').length;
+    final upiCount = _todayCollections.where((c) => c.paymentMode == 'UPI').length;
+    final chequeCount = _todayCollections.where((c) => c.paymentMode == 'Cheque' || c.paymentMode == 'CHEQUE').length;
+
+    return Column(
+      children: [
+        Container(
+          color: AppTheme.surface,
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          child: Column(children: [
+            Row(children: [
+              Text('${_todayCollections.length} collections', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w600, color: AppTheme.onSurfaceVariant)),
+              const Spacer(),
+              Text('\u20B9${totalAmt.toStringAsFixed(0)}', style: GoogleFonts.manrope(fontSize: 15, fontWeight: FontWeight.w800, color: Colors.green.shade700)),
+            ]),
+            const SizedBox(height: 8),
+            Row(children: [
+              if (cashCount > 0) _collectionMethodChip(Icons.money, 'Cash', cashAmt, cashCount, Colors.orange),
+              if (cashCount > 0) const SizedBox(width: 8),
+              if (upiCount > 0) _collectionMethodChip(Icons.qr_code_rounded, 'UPI', upiAmt, upiCount, Colors.blue),
+              if (upiCount > 0) const SizedBox(width: 8),
+              if (chequeCount > 0) _collectionMethodChip(Icons.description_outlined, 'Cheque', chequeAmt, chequeCount, Colors.purple),
+            ]),
+          ]),
+        ),
+        const Divider(height: 1),
+        Expanded(
+          child: Builder(builder: (_) {
+            // Sort alphabetically by customer name, then by bill number
+            final sorted = List<CollectionModel>.from(_todayCollections)
+              ..sort((a, b) {
+                final nameCompare = a.customerName.toLowerCase().compareTo(b.customerName.toLowerCase());
+                if (nameCompare != 0) return nameCompare;
+                return (a.billNo ?? '').compareTo(b.billNo ?? '');
+              });
+
+            // Group by customer
+            final Map<String, List<CollectionModel>> byCustomer = {};
+            for (final c in sorted) {
+              byCustomer.putIfAbsent(c.customerName, () => []);
+              byCustomer[c.customerName]!.add(c);
+            }
+            final customers = byCustomer.entries.toList();
+
+            return ListView.builder(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 80),
+              itemCount: customers.length + 1, // +1 for overlay buttons
+              itemBuilder: (_, i) {
+                // Last item = overlay buttons
+                if (i == customers.length) {
+                  return Padding(
+                    padding: const EdgeInsets.only(top: 8, bottom: 16),
+                    child: Row(children: [
+                      Expanded(
+                        child: SizedBox(
+                          height: 44,
+                          child: OutlinedButton.icon(
+                            onPressed: _printCollectionOverlay,
+                            icon: Icon(Icons.print_rounded, size: 16, color: AppTheme.primary),
+                            label: Text('Print Overlay', style: GoogleFonts.manrope(fontSize: 11, fontWeight: FontWeight.w700, color: AppTheme.primary)),
+                            style: OutlinedButton.styleFrom(
+                              side: BorderSide(color: AppTheme.primary),
+                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: SizedBox(
+                          height: 44,
+                          child: FilledButton.icon(
+                            onPressed: _shareCollectionOverlay,
+                            icon: const Icon(Icons.share_rounded, size: 16),
+                            label: Text('Share Overlay', style: GoogleFonts.manrope(fontSize: 11, fontWeight: FontWeight.w700)),
+                            style: FilledButton.styleFrom(
+                              backgroundColor: Colors.green.shade700,
+                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ]),
+                  );
+                }
+                final entry = customers[i];
+                final custName = entry.key;
+                final bills = entry.value;
+                final custTotal = bills.fold(0.0, (sum, c) => sum + c.amountCollected);
+
+                return Container(
+                  margin: const EdgeInsets.only(bottom: 10),
+                  decoration: BoxDecoration(
+                    color: AppTheme.surface,
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: AppTheme.outlineVariant),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      // Customer header
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(14, 12, 14, 6),
+                        child: Row(children: [
+                          Expanded(child: Text(custName, style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.w700), overflow: TextOverflow.ellipsis)),
+                          Text('\u20B9${custTotal.toStringAsFixed(0)}', style: GoogleFonts.manrope(fontSize: 14, fontWeight: FontWeight.w800, color: Colors.green.shade700)),
+                        ]),
+                      ),
+                      // Bill-wise rows
+                      ...bills.map((c) {
+                        final isCash = c.paymentMode == 'CASH' || c.paymentMode == 'Cash';
+                        final isUpi = c.paymentMode == 'UPI';
+                        final methodColor = isCash ? Colors.orange : isUpi ? Colors.blue : Colors.purple;
+                        final methodIcon = isCash ? Icons.money : isUpi ? Icons.qr_code_rounded : Icons.description_outlined;
+                        return GestureDetector(
+                          onTap: () => _showCollectionActions(c),
+                          child: Padding(
+                          padding: const EdgeInsets.fromLTRB(14, 0, 14, 8),
+                          child: Row(children: [
+                            Icon(methodIcon, size: 14, color: methodColor),
+                            const SizedBox(width: 6),
+                            Text('Bill #${c.billNo ?? '-'}', style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
+                            const SizedBox(width: 8),
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                              decoration: BoxDecoration(color: methodColor.withAlpha(20), borderRadius: BorderRadius.circular(4)),
+                              child: Text(c.paymentMode, style: GoogleFonts.manrope(fontSize: 9, fontWeight: FontWeight.w700, color: methodColor)),
+                            ),
+                            const Spacer(),
+                            Text('\u20B9${c.amountCollected.toStringAsFixed(0)}', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w600, color: AppTheme.onSurface)),
+                            const SizedBox(width: 4),
+                            Icon(Icons.edit_outlined, size: 12, color: AppTheme.onSurfaceVariant),
+                          ]),
+                        ),
+                        );
+                      }),
+                    ],
+                  ),
+                );
+              },
+            );
+          }),
+        ),
+      ],
+    );
+  }
+
+  Future<void> _printCollectionOverlay() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Print Collections Overlay', style: GoogleFonts.manrope(fontWeight: FontWeight.w700)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('This prints ONLY the UPI/CHQ/CASH amounts.', style: GoogleFonts.manrope(fontSize: 13)),
+            const SizedBox(height: 8),
+            Text('Re-feed your printed outstanding sheet into the printer tray, then confirm.',
+                style: GoogleFonts.manrope(fontSize: 12, color: AppTheme.onSurfaceVariant)),
+            const SizedBox(height: 12),
+            Row(children: [
+              Icon(Icons.print_rounded, size: 16, color: AppTheme.primary),
+              const SizedBox(width: 8),
+              Text('HP LaserJet M1136 MFP', style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
+            ]),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: Text('Cancel', style: GoogleFonts.manrope(color: Colors.grey))),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Print')),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
+    try {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Generating overlay...'), duration: Duration(seconds: 1)));
+      final allCustomers = await SupabaseService.instance.getCustomers();
+      final allBills = await SupabaseService.instance.getCustomerBillsForTeam();
+      final pdfBytes = await PdfService.generateCollectionOverlayBytes(
+        customers: allCustomers, allBills: allBills,
+        collections: _todayCollections,
+        teamId: AuthService.currentTeam,
+        beatNames: _todayBeatNames,
+      );
+      if (kIsWeb) {
+        final fileName = 'collection_overlay_${DateTime.now().millisecondsSinceEpoch}.pdf';
+        await SupabaseService.instance.client.storage
+            .from('print_queue')
+            .uploadBinary(fileName, Uint8List.fromList(pdfBytes), fileOptions: const FileOptions(contentType: 'application/pdf'));
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Sent to print queue!'), backgroundColor: Colors.green));
+      } else {
+        final uri = Uri.parse('http://192.168.29.149:5000/print');
+        final request = http.MultipartRequest('POST', uri)
+          ..files.add(http.MultipartFile.fromBytes('file', pdfBytes, filename: 'collection_overlay.pdf'));
+        final response = await request.send().timeout(const Duration(seconds: 15));
+        if (!mounted) return;
+        if (response.statusCode == 200) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Sent to printer!'), backgroundColor: Colors.green));
+        } else {
+          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Printer error: ${response.statusCode}'), backgroundColor: Colors.red));
+        }
+      }
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red));
+    }
+  }
+
+
+  Future<void> _shareCollectionOverlay() async {
+    try {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Generating overlay PDF...'), duration: Duration(seconds: 1)));
+      final allCustomers = await SupabaseService.instance.getCustomers();
+      final allBills = await SupabaseService.instance.getCustomerBillsForTeam();
+      final filePath = await PdfService.generateCollectionOverlayFile(
+        customers: allCustomers, allBills: allBills,
+        collections: _todayCollections,
+        teamId: AuthService.currentTeam,
+        beatNames: _todayBeatNames,
+      );
+      await SharePlus.instance.share(ShareParams(
+        files: [XFile(filePath)],
+        text: 'Collection Overlay — ${DateFormat('dd MMM yyyy').format(DateTime.now())}',
+      ));
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red));
+    }
+  }
+
+  Widget _collectionMethodChip(IconData icon, String label, double amount, int count, Color color) {
+    return Expanded(
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+        decoration: BoxDecoration(
+          color: color.withAlpha(15),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: color.withAlpha(40)),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 14, color: color),
+            const SizedBox(width: 4),
+            Flexible(child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('\u20B9${amount.toStringAsFixed(0)}', style: GoogleFonts.manrope(fontSize: 11, fontWeight: FontWeight.w800, color: color)),
+                Text('$count $label', style: GoogleFonts.manrope(fontSize: 8, color: color.withAlpha(180))),
+              ],
+            )),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ─── TAB: Next Day Outstanding ────────────────────────────────
+  Widget _buildNextDayOutstandingTab() {
+    if (_nextDayOutstanding.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.check_circle_outline, size: 48, color: Colors.green.shade300),
+            const SizedBox(height: 12),
+            Text('No outstanding for $_nextDayLabel', style: GoogleFonts.manrope(fontSize: 14, fontWeight: FontWeight.w600, color: AppTheme.onSurfaceVariant)),
+          ],
+        ),
+      );
+    }
+    final totalDue = _nextDayOutstanding.fold(0.0, (sum, c) {
+      final team = _nextDayCustomerTeam[c.id] ?? AuthService.currentTeam;
+      return sum + c.outstandingForTeam(team);
+    });
+    return Column(
+      children: [
+        Container(
+          color: AppTheme.surface,
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          child: Row(children: [
+            Text('$_nextDayLabel \u2022 ${_nextDayOutstanding.length} customers', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w600, color: AppTheme.onSurfaceVariant)),
+            const Spacer(),
+            Text('\u20B9${totalDue.toStringAsFixed(0)}', style: GoogleFonts.manrope(fontSize: 15, fontWeight: FontWeight.w800, color: Colors.red.shade700)),
+          ]),
+        ),
+        const Divider(height: 1),
+        Expanded(
+          child: ListView.builder(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 80),
+            itemCount: _nextDayOutstanding.length + 1, // +1 for buttons
+            itemBuilder: (_, i) {
+              // Last item = export/print buttons
+              if (i == _nextDayOutstanding.length) {
+                return Padding(
+                  padding: const EdgeInsets.only(top: 8, bottom: 16),
+                  child: Row(children: [
+                    Expanded(
+                      child: SizedBox(
+                        height: 46,
+                        child: FilledButton.icon(
+                          onPressed: _shareOutstandingReport,
+                          icon: const Icon(Icons.share_rounded, size: 16),
+                          label: Text('Share', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700)),
+                          style: FilledButton.styleFrom(
+                            backgroundColor: Colors.green.shade700,
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: SizedBox(
+                        height: 46,
+                        child: OutlinedButton.icon(
+                          onPressed: _printOutstandingReport,
+                          icon: Icon(Icons.print_rounded, size: 16, color: AppTheme.primary),
+                          label: Text('Print', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700, color: AppTheme.primary)),
+                          style: OutlinedButton.styleFrom(
+                            side: BorderSide(color: AppTheme.primary),
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ]),
+                );
+              }
+              final c = _nextDayOutstanding[i];
+              final custTeam = _nextDayCustomerTeam[c.id] ?? AuthService.currentTeam;
+              final outstanding = c.outstandingForTeam(custTeam);
+              final beat = c.beatNameForTeam(custTeam);
+              return Container(
+                margin: const EdgeInsets.only(bottom: 8),
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: AppTheme.surface,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: AppTheme.outlineVariant),
+                ),
+                child: Row(children: [
+                  Expanded(child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(c.name, style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.w700), overflow: TextOverflow.ellipsis),
+                      const SizedBox(height: 2),
+                      Row(children: [
+                        Text(beat, style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
+                        if (custTeam != AuthService.currentTeam) ...[
+                          const SizedBox(width: 6),
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                            decoration: BoxDecoration(
+                              color: custTeam == 'JA'
+                                  ? Colors.blue.withValues(alpha: 0.12)
+                                  : Colors.orange.withValues(alpha: 0.12),
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                            child: Text(custTeam, style: GoogleFonts.manrope(
+                              fontSize: 9, fontWeight: FontWeight.w800,
+                              color: custTeam == 'JA' ? Colors.blue : Colors.orange,
+                            )),
+                          ),
+                        ],
+                      ]),
+                    ],
+                  )),
+                  Text('\u20B9${outstanding.toStringAsFixed(0)}', style: GoogleFonts.manrope(fontSize: 14, fontWeight: FontWeight.w800, color: Colors.red.shade700)),
+                ]),
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// Beat names for the primary (current) team in next day outstanding
+  List<String> get _nextDayBeatNames =>
+      _nextDayOutstanding
+          .where((c) => (_nextDayCustomerTeam[c.id] ?? AuthService.currentTeam) == AuthService.currentTeam)
+          .map((c) => c.beatNameForTeam(AuthService.currentTeam))
+          .toSet().toList();
+
+  /// Beat names for the cross team in next day outstanding
+  List<String> get _nextDayCrossBeatNames {
+    if (_nextDayCrossTeamId == null) return [];
+    return _nextDayOutstanding
+        .where((c) => _nextDayCustomerTeam[c.id] == _nextDayCrossTeamId)
+        .map((c) => c.beatNameForTeam(_nextDayCrossTeamId!))
+        .toSet().toList();
+  }
+
+  List<String> get _todayBeatNames =>
+      _beats.map((b) => b.beatName).toSet().toList();
+
+  Future<void> _shareOutstandingReport() async {
+    try {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Generating report...'), duration: Duration(seconds: 1)),
+      );
+      final allCustomers = await SupabaseService.instance.getCustomers();
+      final allBills = await SupabaseService.instance.getCustomerBillsForTeam();
+
+      // Fetch cross-team bills if cross-team beats detected
+      List<Map<String, dynamic>>? crossBills;
+      if (_nextDayCrossTeamId != null && _nextDayCrossBeatNames.isNotEmpty) {
+        crossBills = await SupabaseService.instance.getCustomerBillsForTeam(teamId: _nextDayCrossTeamId);
+      }
+
+      final filePath = await PdfService.generateOutstandingReportFile(
+        customers: allCustomers, allBills: allBills, teamId: AuthService.currentTeam,
+        beatNames: _nextDayBeatNames,
+        crossTeamId: _nextDayCrossTeamId,
+        crossTeamBills: crossBills,
+        crossTeamBeatNames: _nextDayCrossBeatNames,
+      );
+      await SharePlus.instance.share(
+        ShareParams(
+          files: [XFile(filePath)],
+          text: 'MAJAA — Outstanding Report (${DateFormat('dd MMM yyyy').format(DateTime.now())})',
+        ),
+      );
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e'), backgroundColor: Colors.red));
+    }
+  }
+
+  Future<void> _printOutstandingReport() async {
+    final isWeb = kIsWeb;
+    // Confirmation dialog
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Print Outstanding Report', style: GoogleFonts.manrope(fontWeight: FontWeight.w700)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Send to office printer?', style: GoogleFonts.manrope(fontSize: 14)),
+            const SizedBox(height: 8),
+            Row(children: [
+              Icon(Icons.print_rounded, size: 16, color: AppTheme.primary),
+              const SizedBox(width: 8),
+              Text('HP LaserJet M1136 MFP', style: GoogleFonts.manrope(fontSize: 12, color: AppTheme.onSurfaceVariant)),
+            ]),
+            if (!isWeb) Row(children: [
+              Icon(Icons.wifi_rounded, size: 16, color: AppTheme.primary),
+              const SizedBox(width: 8),
+              Text('192.168.29.149', style: GoogleFonts.manrope(fontSize: 12, color: AppTheme.onSurfaceVariant)),
+            ]),
+            if (isWeb) Row(children: [
+              Icon(Icons.cloud_upload_rounded, size: 16, color: AppTheme.primary),
+              const SizedBox(width: 8),
+              Flexible(child: Text('Via cloud print queue', style: GoogleFonts.manrope(fontSize: 12, color: AppTheme.onSurfaceVariant))),
+            ]),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: Text('Cancel', style: GoogleFonts.manrope(color: Colors.grey))),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Print'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+
+    try {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(isWeb ? 'Generating & uploading to print queue...' : 'Generating & sending to printer...'), duration: const Duration(seconds: 2)),
+        );
+      }
+      final allCustomers = await SupabaseService.instance.getCustomers();
+      final allBills = await SupabaseService.instance.getCustomerBillsForTeam();
+
+      // Fetch cross-team bills if cross-team beats detected
+      List<Map<String, dynamic>>? crossBills;
+      if (_nextDayCrossTeamId != null && _nextDayCrossBeatNames.isNotEmpty) {
+        crossBills = await SupabaseService.instance.getCustomerBillsForTeam(teamId: _nextDayCrossTeamId);
+      }
+
+      final pdfBytes = await PdfService.generateOutstandingReportBytes(
+        customers: allCustomers, allBills: allBills, teamId: AuthService.currentTeam,
+        beatNames: _nextDayBeatNames,
+        crossTeamId: _nextDayCrossTeamId,
+        crossTeamBills: crossBills,
+        crossTeamBeatNames: _nextDayCrossBeatNames,
+      );
+
+      if (isWeb) {
+        // Web/iOS: Upload to Supabase Storage print_queue bucket
+        final fileName = 'outstanding_${DateTime.now().millisecondsSinceEpoch}.pdf';
+        await SupabaseService.instance.client.storage
+            .from('print_queue')
+            .uploadBinary(fileName, Uint8List.fromList(pdfBytes), fileOptions: const FileOptions(contentType: 'application/pdf'));
+
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Sent to print queue! Will print shortly.'), backgroundColor: Colors.green),
+        );
+      } else {
+        // Android: Direct network print
+        final uri = Uri.parse('http://192.168.29.149:5000/print');
+        final request = http.MultipartRequest('POST', uri)
+          ..files.add(http.MultipartFile.fromBytes('file', pdfBytes, filename: 'outstanding.pdf'));
+        final response = await request.send().timeout(const Duration(seconds: 15));
+
+        if (!mounted) return;
+        if (response.statusCode == 200) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Sent to printer!'), backgroundColor: Colors.green),
+          );
+        } else {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Printer error: ${response.statusCode}'), backgroundColor: Colors.red),
+          );
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Cannot connect to printer: $e'), backgroundColor: Colors.red),
+        );
+      }
+    }
   }
 
   Widget _buildBeatCard(
@@ -1035,4 +2093,29 @@ class _CoveragePainter extends CustomPainter {
   @override
   bool shouldRepaint(_CoveragePainter old) =>
       old.progress != progress || old.color != color;
+}
+
+// ─── Tab Bar Delegate for pinned SliverPersistentHeader ─────────────────────
+class _TabBarDelegate extends SliverPersistentHeaderDelegate {
+  final TabBar tabBar;
+  const _TabBarDelegate(this.tabBar);
+
+  @override
+  double get minExtent => tabBar.preferredSize.height;
+  @override
+  double get maxExtent => tabBar.preferredSize.height;
+
+  @override
+  Widget build(BuildContext context, double shrinkOffset, bool overlapsContent) {
+    return Container(
+      decoration: BoxDecoration(
+        color: AppTheme.surface,
+        border: Border(bottom: BorderSide(color: AppTheme.outlineVariant)),
+      ),
+      child: tabBar,
+    );
+  }
+
+  @override
+  bool shouldRebuild(covariant _TabBarDelegate oldDelegate) => false;
 }

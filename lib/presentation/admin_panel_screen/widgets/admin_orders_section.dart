@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'admin_section_wrapper.dart';
 import 'admin_orders_tab.dart';
+import 'admin_beat_orders_tab.dart';
 import 'admin_bill_verification_tab.dart';
 
 class AdminOrdersSection extends StatelessWidget {
@@ -19,6 +20,11 @@ class AdminOrdersSection extends StatelessWidget {
           label: 'Orders',
           icon: Icons.receipt_long_rounded,
           child: AdminOrdersTab(),
+        ),
+        AdminSectionItem(
+          label: 'Beat Orders',
+          icon: Icons.map_rounded,
+          child: AdminBeatOrdersTab(),
         ),
       ],
     );

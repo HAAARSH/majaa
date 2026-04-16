@@ -51,6 +51,11 @@
 	<string>Photo library access is used to attach payment proof images to orders.</string>
 	<key>NSPhotoLibraryAddOnlyUsageDescription</key>
 	<string>Used to save order-related images to your photo library.</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 	<key>LSApplicationQueriesSchemes</key>
 	<array>
 		<string>whatsapp</string>

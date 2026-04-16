@@ -12,7 +12,7 @@ Future<void> triggerCsvDownload(String csvContent, String filename) async {
     await file.writeAsString(csvContent);
     await SharePlus.instance.share(
       ShareParams(
-        files: [XFile(file.path, mimeType: 'text/csv')],
+        files: [XFile(file.path, mimeType: 'application/vnd.ms-excel')],
         text: 'Order Export: $filename',
       ),
     );

@@ -7,9 +7,13 @@ class CustomerTeamProfile {
   final String? beatIdJa;
   final String beatNameJa;
   final double outstandingJa;
+  final double creditNotesJa;
+  final double currentYearBilledJa;
   final String? beatIdMa;
   final String beatNameMa;
   final double outstandingMa;
+  final double creditNotesMa;
+  final double currentYearBilledMa;
 
   const CustomerTeamProfile({
     required this.id,
@@ -19,9 +23,13 @@ class CustomerTeamProfile {
     this.beatIdJa,
     this.beatNameJa = '',
     this.outstandingJa = 0.0,
+    this.creditNotesJa = 0.0,
+    this.currentYearBilledJa = 0.0,
     this.beatIdMa,
     this.beatNameMa = '',
     this.outstandingMa = 0.0,
+    this.creditNotesMa = 0.0,
+    this.currentYearBilledMa = 0.0,
   });
 
   factory CustomerTeamProfile.fromJson(Map<String, dynamic> json) =>
@@ -33,9 +41,13 @@ class CustomerTeamProfile {
         beatIdJa: json['beat_id_ja'] as String?,
         beatNameJa: json['beat_name_ja'] as String? ?? '',
         outstandingJa: (json['outstanding_ja'] as num?)?.toDouble() ?? 0.0,
+        creditNotesJa: (json['credit_notes_ja'] as num?)?.toDouble() ?? 0.0,
+        currentYearBilledJa: (json['current_year_billed_ja'] as num?)?.toDouble() ?? 0.0,
         beatIdMa: json['beat_id_ma'] as String?,
         beatNameMa: json['beat_name_ma'] as String? ?? '',
         outstandingMa: (json['outstanding_ma'] as num?)?.toDouble() ?? 0.0,
+        creditNotesMa: (json['credit_notes_ma'] as num?)?.toDouble() ?? 0.0,
+        currentYearBilledMa: (json['current_year_billed_ma'] as num?)?.toDouble() ?? 0.0,
       );
 
   Map<String, dynamic> toJson() => {
@@ -45,9 +57,13 @@ class CustomerTeamProfile {
         'beat_id_ja': beatIdJa,
         'beat_name_ja': beatNameJa,
         'outstanding_ja': outstandingJa,
+        'credit_notes_ja': creditNotesJa,
+        'current_year_billed_ja': currentYearBilledJa,
         'beat_id_ma': beatIdMa,
         'beat_name_ma': beatNameMa,
         'outstanding_ma': outstandingMa,
+        'credit_notes_ma': creditNotesMa,
+        'current_year_billed_ma': currentYearBilledMa,
       };
 
   /// Helper: does this customer belong to a given team?
@@ -61,6 +77,12 @@ class CustomerTeamProfile {
 
   /// Helper: outstanding for a given team
   double outstandingFor(String team) => team == 'JA' ? outstandingJa : outstandingMa;
+
+  /// Helper: credit notes for a given team
+  double creditNotesFor(String team) => team == 'JA' ? creditNotesJa : creditNotesMa;
+
+  /// Helper: current year billed for a given team
+  double currentYearBilledFor(String team) => team == 'JA' ? currentYearBilledJa : currentYearBilledMa;
 }
 
 class CustomerModel {
@@ -72,6 +94,12 @@ class CustomerModel {
   final double lastOrderValue;
   final DateTime? lastOrderDate;
   final String deliveryRoute;
+  final String? accCodeJa; // Billing software account code from JA ACMAST
+  final String? accCodeMa; // Billing software account code from MA ACMAST
+  final String? gstin;     // GSTIN from ACMAST
+  final bool lockBill;     // Whether customer is bill-locked in billing software
+  final int creditDays;    // Credit period allowed (days)
+  final double creditLimit; // Credit limit from billing software
 
   /// Unified profile — one row per customer with both team data.
   /// List kept for backward compatibility but will have at most 1 element.
@@ -86,6 +114,12 @@ class CustomerModel {
     required this.lastOrderValue,
     this.lastOrderDate,
     this.deliveryRoute = 'Unassigned',
+    this.accCodeJa,
+    this.accCodeMa,
+    this.gstin,
+    this.lockBill = false,
+    this.creditDays = 0,
+    this.creditLimit = 0,
     this.teamProfiles = const [],
   });
 
@@ -114,6 +148,12 @@ class CustomerModel {
           ? DateTime.tryParse(json['last_order_date'] as String)
           : null,
       deliveryRoute: json['delivery_route'] as String? ?? 'Unassigned',
+      accCodeJa: json['acc_code_ja'] as String?,
+      accCodeMa: json['acc_code_ma'] as String?,
+      gstin: json['gstin'] as String?,
+      lockBill: json['lock_bill'] as bool? ?? false,
+      creditDays: json['credit_days'] as int? ?? 0,
+      creditLimit: (json['credit_limit'] as num?)?.toDouble() ?? 0,
       teamProfiles: profiles,
     );
   }
@@ -123,6 +163,12 @@ class CustomerModel {
 
   /// Outstanding balance for [team].
   double outstandingForTeam(String team) => _profile?.outstandingFor(team) ?? 0.0;
+
+  /// Credit notes for [team].
+  double creditNotesForTeam(String team) => _profile?.creditNotesFor(team) ?? 0.0;
+
+  /// Current year billed for [team].
+  double currentYearBilledForTeam(String team) => _profile?.currentYearBilledFor(team) ?? 0.0;
 
   /// Beat ID for [team].
   String? beatIdForTeam(String team) => _profile?.beatIdFor(team);
@@ -139,6 +185,12 @@ class CustomerModel {
       name: name,
       address: address,
       phone: phone ?? this.phone,
+      accCodeJa: accCodeJa,
+      accCodeMa: accCodeMa,
+      gstin: gstin,
+      lockBill: lockBill,
+      creditDays: creditDays,
+      creditLimit: creditLimit,
       type: type,
       lastOrderValue: lastOrderValue,
       lastOrderDate: lastOrderDate,
@@ -156,5 +208,11 @@ class CustomerModel {
         'last_order_value': lastOrderValue,
         'last_order_date': lastOrderDate?.toIso8601String(),
         'delivery_route': deliveryRoute,
+        if (accCodeJa != null) 'acc_code_ja': accCodeJa,
+        if (accCodeMa != null) 'acc_code_ma': accCodeMa,
+        if (gstin != null) 'gstin': gstin,
+        'lock_bill': lockBill,
+        'credit_days': creditDays,
+        'credit_limit': creditLimit,
       };
 }

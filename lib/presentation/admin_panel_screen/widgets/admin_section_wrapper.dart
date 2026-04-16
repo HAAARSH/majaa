@@ -18,15 +18,16 @@ class AdminSectionItem {
 /// Uses IndexedStack to preserve state across sub-tab switches.
 class AdminSectionWrapper extends StatefulWidget {
   final List<AdminSectionItem> items;
+  final int initialIndex;
 
-  const AdminSectionWrapper({super.key, required this.items});
+  const AdminSectionWrapper({super.key, required this.items, this.initialIndex = 0});
 
   @override
   State<AdminSectionWrapper> createState() => _AdminSectionWrapperState();
 }
 
 class _AdminSectionWrapperState extends State<AdminSectionWrapper> {
-  int _selectedIndex = 0;
+  late int _selectedIndex = widget.initialIndex;
 
   @override
   Widget build(BuildContext context) {
