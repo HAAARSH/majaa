@@ -55,6 +55,7 @@ class AuthService {
       currentTeam = newTeam;
       teamUpi = userData['upi_id'] ?? '';
       SupabaseService.instance.currentUserId = res.user!.id;
+      SupabaseService.instance.clearResolvedUserId(); // Reset cached user ID on new login
       try {
         SupabaseService.instance.currentUserName = userData['full_name'] as String?;
       } catch (_) {
@@ -87,7 +88,7 @@ class AuthService {
       currentTeam = savedTeam;
       teamUpi = prefs.getString('team_upi') ?? '';
       await initTeamCache(currentTeam);
-      return session != null || kIsWeb; // On web/offline we might want to allow entry if team is cached
+      return session != null;
     }
     return false;
   }

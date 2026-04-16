@@ -22,7 +22,6 @@ import 'theme/app_theme.dart';
 final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
 
 /// Track last update check to avoid excessive checks
-DateTime? _lastUpdateCheck;
 
 // WorkManager callback — only runs on mobile, never on web
 @pragma('vm:entry-point')
@@ -144,11 +143,8 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
         // Update timestamp on every resume (app came back to foreground)
         SessionService.instance.markActive();
         
-        // Check for updates if not checked in last 24 hours
-        final now = DateTime.now();
-        if (_lastUpdateCheck == null || 
-            now.difference(_lastUpdateCheck!).inHours >= 24) {
-          _lastUpdateCheck = now;
+        // Check for updates on every app resume
+        if (!kIsWeb) {
           WidgetsBinding.instance.addPostFrameCallback((_) {
             final ctx = navigatorKey.currentContext;
             if (ctx != null && ctx.mounted) {

@@ -6,6 +6,7 @@ import 'package:url_launcher/url_launcher.dart';
 import '../../services/supabase_service.dart';
 import '../../services/auth_service.dart';
 import '../../services/cart_service.dart';
+import '../../services/offline_service.dart';
 import '../../theme/app_theme.dart';
 import './widgets/order_header_widget.dart';
 import './widgets/order_line_item_widget.dart';
@@ -22,6 +23,7 @@ class OrderCreationScreen extends StatefulWidget {
 
 class _OrderCreationScreenState extends State<OrderCreationScreen> {
   bool _isSubmitting = false;
+  bool _submitLock = false;
   final _notesController = TextEditingController();
 
   // 1. The Order Number variable
@@ -35,11 +37,15 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
   CustomerModel? get _selectedCustomer => CartService.instance.currentCustomer;
   BeatModel? get _selectedBeat => CartService.instance.currentBeat;
 
+  bool get _isEditing => CartService.instance.editingOrderId != null;
+
   @override
   void initState() {
     super.initState();
 
-    _orderNumber = 'ORD-${DateTime.now().millisecondsSinceEpoch.toString().substring(7)}';
+    // Reuse original order ID when editing, generate new one for fresh orders
+    _orderNumber = CartService.instance.editingOrderId ??
+        'ORD-${DateTime.now().millisecondsSinceEpoch.toString().substring(7)}';
   }
 
   @override
@@ -106,29 +112,53 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
   }
 
   Future<void> _submitOrder() async {
+    if (_submitLock) return;
+    _submitLock = true;
+
     final cartItems = CartService.instance.cartNotifier.value;
 
     if (cartItems.isEmpty) {
       Fluttertoast.showToast(msg: 'Your cart is empty');
+      _submitLock = false;
       return;
     }
 
     if (_selectedCustomer == null) {
       Fluttertoast.showToast(msg: 'Please select a customer');
+      _submitLock = false;
       return;
+    }
+
+    // Brand access guard — remove items not in allowed brands
+    final userId = SupabaseService.instance.client.auth.currentUser?.id;
+    if (userId != null) {
+      final allowedBrands = await SupabaseService.instance.getUserBrandAccess(userId);
+      if (allowedBrands.isNotEmpty) {
+        final violating = cartItems.where((ci) => !allowedBrands.contains(ci.product.category)).toList();
+        if (violating.isNotEmpty) {
+          for (final item in violating) {
+            CartService.instance.deleteItemEntirely(item.product);
+          }
+          Fluttertoast.showToast(
+            msg: '${violating.length} item(s) removed — not in your allowed brands',
+            toastLength: Toast.LENGTH_LONG,
+          );
+          _submitLock = false;
+          return; // let user review the updated cart before re-submitting
+        }
+      }
     }
 
     setState(() => _isSubmitting = true);
 
-    try {
-      // Calculate totals
-      double subtotal = 0;
-      double totalGst = 0;
-      int totalUnits = 0;
+    // Calculate totals outside try so catch can access them for offline queue
+    double subtotal = 0;
+    double totalGst = 0;
+    int totalUnits = 0;
 
-      final List<Map<String, dynamic>> itemsJson = cartItems.map((item) {
+    final List<Map<String, dynamic>> itemsJson = cartItems.map((item) {
         final lineTotal = item.product.unitPrice * item.quantity;
-        final gst = lineTotal * (item.product.gstRate);
+        final gst = (lineTotal * item.product.gstRate * 100).round() / 100;
 
         subtotal += lineTotal;
         totalGst += gst;
@@ -141,17 +171,25 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
           'sku': item.product.sku,
           'quantity': item.quantity,
           'unit_price': item.product.unitPrice,
+          'mrp': item.product.mrp,
           'line_total': lineTotal,
         };
       }).toList();
 
-      final grandTotal = subtotal + totalGst;
+    final grandTotal = subtotal + totalGst;
+
+    try {
+      // If editing, delete the old order first (order ID is reused)
+      if (_isEditing) {
+        await SupabaseService.instance.deleteOrder(_orderNumber);
+        CartService.instance.editingOrderId = null;
+      }
 
       await SupabaseService.instance.createOrder(
         orderId: _orderNumber,
         customerId: _selectedCustomer!.id,
         customerName: _selectedCustomer!.name,
-        beat: _selectedBeat?.beatName ?? _selectedCustomer!.beatNameForTeam(AuthService.currentTeam),
+        beat: _selectedCustomer!.beatNameForTeam(AuthService.currentTeam).isNotEmpty ? _selectedCustomer!.beatNameForTeam(AuthService.currentTeam) : _selectedBeat?.beatName ?? '',
         deliveryDate: _selectedDate,
         subtotal: subtotal,
         vat: totalGst,
@@ -169,11 +207,37 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
 
       if (mounted) {
         setState(() => _isSubmitting = false);
+        _submitLock = false;
         _showSuccessDialog(total: grandTotal);
       }
     } catch (e) {
+      // Offline fallback — queue order for later sync
+      try {
+        await OfflineService.instance.queueOperation('order', {
+          'order_id': _orderNumber,
+          'customer_id': _selectedCustomer!.id,
+          'customer_name': _selectedCustomer!.name,
+          'beat': _selectedCustomer!.beatNameForTeam(AuthService.currentTeam).isNotEmpty ? _selectedCustomer!.beatNameForTeam(AuthService.currentTeam) : _selectedBeat?.beatName ?? '',
+          'delivery_date': _selectedDate.toIso8601String(),
+          'subtotal': subtotal,
+          'vat': totalGst,
+          'grand_total': grandTotal,
+          'item_count': cartItems.length,
+          'total_units': totalUnits,
+          'notes': _notesController.text,
+          'items': itemsJson,
+        });
+        if (mounted) {
+          setState(() => _isSubmitting = false);
+          _submitLock = false;
+          Fluttertoast.showToast(msg: 'Order queued offline — will sync when connected');
+          _showSuccessDialog(total: grandTotal);
+        }
+        return;
+      } catch (_) {}
       if (mounted) {
         setState(() => _isSubmitting = false);
+        _submitLock = false;
         Fluttertoast.showToast(msg: "Error: $e");
       }
     }
@@ -181,7 +245,6 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
 
   void _showSuccessDialog({required double total}) {
     final currentOrderId = _orderNumber;
-    CartService.instance.clearCart();
 
     showDialog(
       context: context,
@@ -223,6 +286,7 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
               height: 50,
               child: FilledButton(
                 onPressed: () {
+                  CartService.instance.clearCart();
                   // Safely pop back to root, avoiding crashes if stack is shorter than expected
                   int popCount = 0;
                   Navigator.of(context).popUntil((route) => popCount++ >= 4 || route.isFirst);
@@ -277,7 +341,7 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
           for (var item in cartItems) {
             final lineTotal = item.product.unitPrice * item.quantity;
             subtotal += lineTotal;
-            totalGst += lineTotal * item.product.gstRate;
+            totalGst += (lineTotal * item.product.gstRate * 100).round() / 100;
             totalUnits += item.quantity;
           }
 

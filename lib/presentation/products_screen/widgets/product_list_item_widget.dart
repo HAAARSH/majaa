@@ -122,33 +122,53 @@ class ProductListItemWidget extends StatelessWidget {
                     },
                   )
                 else
-                  IconButton(
-                    icon: Icon(
-                      _canAddToCart
-                          ? Icons.add_circle_outline_rounded
-                          : Icons.block_rounded,
-                      color: _canAddToCart
-                          ? AppTheme.secondary
-                          : AppTheme.outline,
-                      size: 28,
-                    ),
-                    onPressed:
-                        _canAddToCart ? () => onAddToCart(product.stepSize) : null,
-                    padding: EdgeInsets.zero,
-                    constraints: const BoxConstraints(),
-                  ),
+                  _canAddToCart
+                      ? GestureDetector(
+                          onTap: () => onAddToCart(product.stepSize),
+                          child: Container(
+                            width: 36,
+                            height: 36,
+                            decoration: BoxDecoration(
+                              color: AppTheme.secondary.withAlpha(20),
+                              borderRadius: BorderRadius.circular(10),
+                              border: Border.all(color: AppTheme.secondary.withAlpha(80)),
+                            ),
+                            child: const Icon(
+                              Icons.add_rounded,
+                              color: AppTheme.secondary,
+                              size: 22,
+                            ),
+                          ),
+                        )
+                      : Icon(
+                          Icons.block_rounded,
+                          color: AppTheme.outline,
+                          size: 28,
+                        ),
               ],
             ),
 
             const SizedBox(height: 8),
 
-            // ─── META ROW: Price, Pack, Stock ──────────────────────────────
+            // ─── META ROW: Price, MRP, Pack, Stock ────────────────────────
             Wrap(
               spacing: 6,
               runSpacing: 4,
               crossAxisAlignment: WrapCrossAlignment.center,
               children: [
-                // Price
+                // MRP strikethrough (if MRP > selling price)
+                if (product.mrp > 0 && product.mrp > product.unitPrice)
+                  Text(
+                    '₹${product.mrp.toStringAsFixed(0)}',
+                    style: GoogleFonts.manrope(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w500,
+                      color: AppTheme.onSurfaceVariant,
+                      decoration: TextDecoration.lineThrough,
+                      decorationColor: AppTheme.onSurfaceVariant,
+                    ),
+                  ),
+                // Selling price
                 Text(
                   '₹${product.unitPrice.toStringAsFixed(2)}',
                   style: GoogleFonts.manrope(
@@ -157,33 +177,18 @@ class ProductListItemWidget extends StatelessWidget {
                     color: AppTheme.primary,
                   ),
                 ),
-                // Unit
-                Text(
-                  '/ ${product.unit}',
-                  style: GoogleFonts.manrope(
-                    fontSize: 11,
-                    color: AppTheme.onSurfaceVariant,
-                  ),
-                ),
                 // Pack size
-                if (product.packSize.isNotEmpty)
+                if (product.packSize.isNotEmpty && product.packSize != '0')
                   _MetaChip(
                     label: product.packSize,
                     color: AppTheme.onSurfaceVariant,
                     bgColor: AppTheme.surfaceVariant,
                   ),
-                // SKU
-                if (product.sku.isNotEmpty)
-                  _MetaChip(
-                    label: product.sku,
-                    color: AppTheme.onSurfaceVariant,
-                    bgColor: AppTheme.surfaceVariant,
-                  ),
-                // Stock badge — CHANGED: only show when showStock is true
+                // Stock badge — color-coded: green > 50, orange > 0, red = 0
                 if (showStock)
                   _MetaChip(
                     icon: Icons.inventory_2_outlined,
-                    label: '${product.stockQty} ${product.unit}',
+                    label: '${product.stockQty} ${product.unit.toUpperCase()}',
                     color: stockColor,
                     bgColor: stockBgColor,
                   ),

@@ -352,19 +352,17 @@ IMPORTANT:
 
         debugPrint('Auto-verified bill $billNo → order ${matchingOrder['id']}');
       } else {
-        // Amount mismatch — auto-verify with new amount
+        // Amount mismatch — flag for manual review, do NOT auto-verify
         await _client.from('bill_extractions')
-            .update({'auto_verified': true})
+            .update({'auto_verified': false, 'verification_failed': true})
             .eq('id', extractionId);
 
         await _client.from('orders').update({
           'final_bill_no': billNo,
           'actual_billed_amount': extractedTotal,
-          'verified_by_office': true,
-          'status': 'Verified',
         }).eq('id', matchingOrder['id']);
 
-        debugPrint('Auto-verified bill $billNo with updated amount $extractedTotal');
+        debugPrint('Bill $billNo amount mismatch (bill: $extractedTotal, order: $orderTotal) — flagged for manual review');
       }
     }
   }

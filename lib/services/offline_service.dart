@@ -76,6 +76,21 @@ class OfflineService {
   /// [type]: 'order', 'collection', 'delivery_status', 'bill_upload', etc.
   /// [data]: operation-specific payload.
   Future<void> queueOperation(String type, Map<String, dynamic> data) async {
+    // Check for duplicate before adding
+    final existingOps = _operationBox.values.toList();
+    final isDuplicate = existingOps.any((op) {
+      final existingType = (op as Map)['type'];
+      final existingData = op['data'] as Map?;
+      final newData = data;
+      return existingType == type &&
+          existingData?['order_id'] == newData['order_id'] &&
+          newData.containsKey('order_id');
+    });
+    if (isDuplicate) {
+      debugPrint('\u26a0\ufe0f OfflineService: Skipping duplicate $type for order ${data['order_id']}');
+      return;
+    }
+
     await _operationBox.add({
       'type': type,
       'data': data,
@@ -202,6 +217,9 @@ class OfflineService {
         final data = Map<String, dynamic>.from(entry['data'] as Map);
 
         switch (type) {
+          case 'order':
+            await _syncOrderOperation(data);
+            break;
           case 'collection':
             await _syncCollection(data);
             break;
@@ -229,6 +247,28 @@ class OfflineService {
   }
 
   // ─── OPERATION HANDLERS ──────────────────────────────────────
+
+  Future<void> _syncOrderOperation(Map<String, dynamic> data) async {
+    final rawItems = data['items'];
+    final items = (rawItems is List)
+        ? rawItems.map((i) => i is Map ? Map<String, dynamic>.from(i) : <String, dynamic>{}).toList()
+        : <Map<String, dynamic>>[];
+
+    await SupabaseService.instance.createOrder(
+      orderId: data['order_id'] as String,
+      customerId: data['customer_id'] as String?,
+      customerName: data['customer_name'] as String,
+      beat: data['beat'] as String? ?? '',
+      deliveryDate: DateTime.parse(data['delivery_date'] as String),
+      subtotal: (data['subtotal'] as num).toDouble(),
+      vat: (data['vat'] as num).toDouble(),
+      grandTotal: (data['grand_total'] as num).toDouble(),
+      itemCount: data['item_count'] as int? ?? items.length,
+      totalUnits: data['total_units'] as int? ?? 0,
+      notes: data['notes'] as String? ?? '',
+      items: items,
+    );
+  }
 
   Future<void> _syncCollection(Map<String, dynamic> data) async {
     await SupabaseService.instance.createCollection(

@@ -18,6 +18,7 @@ class Product {
   final String imageUrl;
   final String semanticLabel;
   final String brand;
+  final double mrp;
   final double gstRate;
   final String unit;
   final int stepSize;
@@ -34,6 +35,7 @@ class Product {
     required this.imageUrl,
     required this.semanticLabel,
     required this.brand,
+    this.mrp = 0,
     this.gstRate = 0.18,
     this.unit = 'pcs',
     this.stepSize = 1,
@@ -52,6 +54,7 @@ class Product {
       imageUrl: model.imageUrl,
       semanticLabel: model.semanticLabel,
       brand: model.brand,
+      mrp: model.mrp,
       gstRate: model.gstRate,
       unit: model.unit,
       stepSize: model.stepSize,
@@ -109,6 +112,7 @@ class CartService {
         'imageUrl': ci.product.imageUrl,
         'semanticLabel': ci.product.semanticLabel,
         'brand': ci.product.brand,
+        'mrp': ci.product.mrp,
         'gstRate': ci.product.gstRate,
         'unit': ci.product.unit,
         'stepSize': ci.product.stepSize,
@@ -138,6 +142,7 @@ class CartService {
           status: ProductStatus.values.firstWhere((s) => s.name == raw['status'], orElse: () => ProductStatus.available),
           stockQty: raw['stockQty'] as int, imageUrl: raw['imageUrl'] ?? '',
           semanticLabel: raw['semanticLabel'] ?? '', brand: raw['brand'] ?? '',
+          mrp: (raw['mrp'] as num?)?.toDouble() ?? 0,
           gstRate: (raw['gstRate'] as num?)?.toDouble() ?? 0.18,
           unit: raw['unit'] ?? 'pcs', stepSize: raw['stepSize'] as int? ?? 1,
         );
@@ -175,6 +180,13 @@ class CartService {
   CustomerModel? currentCustomer;
   BeatModel? currentBeat;
 
+  /// When editing an existing order, this holds the original order ID.
+  /// On submit, the old order is deleted and the new one uses this ID.
+  /// Null means creating a new order.
+  String? editingOrderId;
+  /// Products that were in the original order but no longer exist in the catalog.
+  List<String> editingSkippedItems = [];
+
   // ─── SESSION LOGIC ───
   void setCustomerSession(CustomerModel customer, BeatModel? beat) {
     // If a NEW customer is selected, clear the cart.
@@ -190,6 +202,8 @@ class CartService {
   Future<void> loadOrderToCart(OrderModel order, CustomerModel customer, BeatModel? beat) async {
     currentCustomer = customer;
     currentBeat = beat;
+    editingOrderId = order.id;
+    editingSkippedItems = [];
 
     // Fetch all products to match with order items
     final allProducts = await SupabaseService.instance.getProducts();
@@ -203,6 +217,7 @@ class CartService {
           quantity: orderItem.quantity,
         ));
       } else {
+        editingSkippedItems.add(orderItem.productName);
         debugPrint('Product not found for order item: ${orderItem.productName}');
       }
     }
@@ -212,16 +227,25 @@ class CartService {
 
   void clearCart() {
     cartNotifier.value = [];
+    editingOrderId = null;
+    editingSkippedItems = [];
     clearPersistedCart();
   }
 
   // ─── CART OPERATIONS ───
   void addOrUpdateItem(Product product, int amount) {
+    if (amount <= 0) return;
+
     final items = List<CartItem>.from(cartNotifier.value);
     final index = items.indexWhere((item) => item.product.id == product.id);
 
     if (index >= 0) {
-      items[index].quantity += amount;
+      final newQty = items[index].quantity + amount;
+      if (newQty <= 0) {
+        items.removeAt(index);
+      } else {
+        items[index].quantity = newQty;
+      }
     } else {
       items.add(CartItem(product: product, quantity: amount));
     }
