@@ -106,17 +106,18 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
           // Admin / no-beat context: show all customers.
           _allCustomers = customers;
         } else if (_isOutOfBeat) {
-          // Out-of-Beat mode: show ALL customers for the beat's team (not
-          // currentTeam) — a rep who covers beats in both teams must see the
-          // right customer set when they pick a cross-team beat from the OOB
-          // sheet. Also switch currentTeam so the order is saved under the
-          // correct team.
+          // Out-of-Beat mode picking a SPECIFIC beat now mirrors today-beat
+          // behavior — show only that beat's customers. Rep tapped this beat
+          // from the OOB sheet, they expect the same tight filter they'd see
+          // on their scheduled route. Broader searches happen via the OOB
+          // sheet's customer-search field, which navigates directly to
+          // customer_detail and never enters this list.
           final beatTeam = _beat?.teamId ?? AuthService.currentTeam;
           if (beatTeam != AuthService.currentTeam) {
             AuthService.currentTeam = beatTeam;
           }
           _allCustomers = customers
-              .where((c) => c.belongsToTeam(beatTeam))
+              .where((c) => c.beatIdForTeam(beatTeam) == _beat!.id)
               .toList();
         } else {
           // Normal beat mode: strictly filter to this beat.

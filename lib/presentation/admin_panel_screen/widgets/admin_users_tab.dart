@@ -296,7 +296,14 @@ class _AdminUsersTabState extends State<AdminUsersTab> {
                           children: allCategories.map((cat) {
                             final selected = selectedBrands.contains(cat);
                             return FilterChip(
-                              label: Text(cat, style: GoogleFonts.manrope(fontSize: 12)),
+                              label: Text(
+                                cat,
+                                style: GoogleFonts.manrope(
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w700,
+                                  color: selected ? Colors.white : Colors.amber.shade900,
+                                ),
+                              ),
                               selected: selected,
                               onSelected: (v) => setD(() {
                                 if (v) {
@@ -305,8 +312,13 @@ class _AdminUsersTabState extends State<AdminUsersTab> {
                                   selectedBrands.remove(cat);
                                 }
                               }),
-                              selectedColor: Colors.amber.shade200,
-                              checkmarkColor: Colors.amber.shade900,
+                              backgroundColor: Colors.white,
+                              selectedColor: Colors.amber.shade700,
+                              checkmarkColor: Colors.white,
+                              side: BorderSide(
+                                color: selected ? Colors.amber.shade800 : Colors.amber.shade400,
+                                width: 1.2,
+                              ),
                             );
                           }).toList(),
                         ),

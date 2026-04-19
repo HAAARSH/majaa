@@ -484,6 +484,18 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen>
               arguments: {'beat': beat, 'isOutOfBeat': true},
             );
           },
+          onCustomerPicked: (customer, beat) {
+            Navigator.pop(ctx);
+            Navigator.pushNamed(
+              context,
+              AppRoutes.customerDetails,
+              arguments: {
+                'customer': customer,
+                'beat': beat,
+                'isOutOfBeat': true,
+              },
+            );
+          },
         ),
       ),
     );
@@ -2321,12 +2333,14 @@ class _OutOfBeatSheetContent extends StatefulWidget {
   final ScrollController scrollCtrl;
   final bool Function(BeatModel) isBeatToday;
   final void Function(BeatModel) onBeatPicked;
+  final void Function(CustomerModel, BeatModel) onCustomerPicked;
 
   const _OutOfBeatSheetContent({
     required this.userId,
     required this.scrollCtrl,
     required this.isBeatToday,
     required this.onBeatPicked,
+    required this.onCustomerPicked,
   });
 
   @override
@@ -2338,6 +2352,13 @@ class _OutOfBeatSheetContentState extends State<_OutOfBeatSheetContent> {
   final TextEditingController _searchCtrl = TextEditingController();
   String _query = '';
 
+  // Loaded lazily on first non-empty search. Customers are scoped to the
+  // beats this rep is actually allowed on — for brand_rep and sales_rep
+  // alike the list comes from getUserBeats, so no cross-rep leak.
+  List<CustomerModel> _customers = [];
+  bool _customersLoaded = false;
+  bool _customersLoading = false;
+
   @override
   void initState() {
     super.initState();
@@ -2348,6 +2369,57 @@ class _OutOfBeatSheetContentState extends State<_OutOfBeatSheetContent> {
   void dispose() {
     _searchCtrl.dispose();
     super.dispose();
+  }
+
+  Future<void> _ensureCustomersLoaded(List<BeatModel> allowedBeats) async {
+    if (_customersLoaded || _customersLoading) return;
+    _customersLoading = true;
+    try {
+      final allowedBeatIds = allowedBeats.map((b) => b.id).toSet();
+      final allCustomers = await SupabaseService.instance.getCustomers();
+      // A customer is "on" an allowed beat if their beat_id for either team
+      // matches one of the rep's allowed beat IDs. Works for both sales_rep
+      // and brand_rep since allowedBeats comes from getUserBeats (role-agnostic).
+      final scoped = allCustomers.where((c) {
+        final jaBeat = c.beatIdForTeam('JA');
+        final maBeat = c.beatIdForTeam('MA');
+        return (jaBeat != null && allowedBeatIds.contains(jaBeat)) ||
+            (maBeat != null && allowedBeatIds.contains(maBeat));
+      }).toList();
+      if (!mounted) return;
+      setState(() {
+        _customers = scoped;
+        _customersLoaded = true;
+        _customersLoading = false;
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _customersLoading = false;
+      });
+    }
+  }
+
+  /// Resolve which of the rep's allowed beats this customer should be opened
+  /// under. If the customer is on beats in both teams (dual-team customer),
+  /// prefer the one matching currentTeam, else fall back to the first match.
+  BeatModel? _resolveCustomerBeat(
+    CustomerModel customer,
+    List<BeatModel> allowedBeats,
+  ) {
+    final allowedById = {for (final b in allowedBeats) b.id: b};
+    final jaBeatId = customer.beatIdForTeam('JA');
+    final maBeatId = customer.beatIdForTeam('MA');
+    final current = AuthService.currentTeam;
+    if (current == 'JA' && jaBeatId != null && allowedById.containsKey(jaBeatId)) {
+      return allowedById[jaBeatId];
+    }
+    if (current == 'MA' && maBeatId != null && allowedById.containsKey(maBeatId)) {
+      return allowedById[maBeatId];
+    }
+    if (jaBeatId != null && allowedById.containsKey(jaBeatId)) return allowedById[jaBeatId];
+    if (maBeatId != null && allowedById.containsKey(maBeatId)) return allowedById[maBeatId];
+    return null;
   }
 
   @override
@@ -2388,7 +2460,7 @@ class _OutOfBeatSheetContentState extends State<_OutOfBeatSheetContent> {
           ),
         ),
         const SizedBox(height: 4),
-        // Warning box — explains the beat picker's role.
+        // Warning box — explains what the picker does.
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 20),
           child: Container(
@@ -2399,21 +2471,21 @@ class _OutOfBeatSheetContentState extends State<_OutOfBeatSheetContent> {
               border: Border.all(color: Colors.orange.shade200),
             ),
             child: Text(
-              'Pick the nearest route to tag this order — the customer list below will let you pick ANY customer on your team.',
+              'Type a customer name / phone to jump straight to the order — or pick a route below to browse its customer list.',
               style: GoogleFonts.manrope(
                   fontSize: 12, color: Colors.orange.shade900),
             ),
           ),
         ),
         const SizedBox(height: 12),
-        // Search
+        // Search — finds customers across all beats the rep is allowed on.
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 20),
           child: TextField(
             controller: _searchCtrl,
             onChanged: (v) => setState(() => _query = v.trim()),
             decoration: InputDecoration(
-              hintText: 'Search route or area…',
+              hintText: 'Search customer…',
               prefixIcon: const Icon(Icons.search_rounded),
               isDense: true,
               contentPadding: const EdgeInsets.symmetric(vertical: 10),
@@ -2452,14 +2524,6 @@ class _OutOfBeatSheetContentState extends State<_OutOfBeatSheetContent> {
                 );
               }
               final all = snap.data ?? <BeatModel>[];
-              // Today's beats are already on the main screen — OOB sheet is
-              // most useful for non-today routes. Hide today's.
-              final nonToday = all.where((b) => !widget.isBeatToday(b)).toList();
-              final filtered = _query.isEmpty
-                  ? nonToday
-                  : nonToday
-                      .where((b) => tokenMatch(_query, [b.beatName, b.area]))
-                      .toList();
 
               if (all.isEmpty) {
                 return _errorState(
@@ -2468,17 +2532,92 @@ class _OutOfBeatSheetContentState extends State<_OutOfBeatSheetContent> {
                   detail: 'Ask admin to assign a route so you can place orders.',
                 );
               }
-              if (filtered.isEmpty) {
-                return _errorState(
-                  icon: Icons.search_off_rounded,
-                  title: _query.isEmpty
-                      ? 'No non-today beats to show'
-                      : 'No matches for "$_query"',
-                  detail: _query.isEmpty
-                      ? 'Your other beats are already shown above.'
-                      : 'Try a different route or area name.',
+
+              // When the rep types anything, switch to customer-search mode:
+              // tokenized match across name / phone / address, scoped to
+              // customers on this rep's allowed beats (same pool for
+              // sales_rep and brand_rep — the visible filter comes from the
+              // rep's beat assignments, not their role).
+              if (_query.isNotEmpty) {
+                // Kick off a one-time customer fetch.
+                if (!_customersLoaded && !_customersLoading) {
+                  _ensureCustomersLoaded(all);
+                }
+                if (!_customersLoaded) {
+                  return const Center(
+                    child: Padding(
+                      padding: EdgeInsets.all(32),
+                      child: CircularProgressIndicator(),
+                    ),
+                  );
+                }
+                final matches = _customers
+                    .where((c) =>
+                        tokenMatch(_query, [c.name, c.phone, c.address]))
+                    .toList()
+                  ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+                if (matches.isEmpty) {
+                  return _errorState(
+                    icon: Icons.search_off_rounded,
+                    title: 'No customers matching "$_query"',
+                    detail: 'Try a different name or phone number.',
+                  );
+                }
+                return ListView.builder(
+                  controller: widget.scrollCtrl,
+                  padding: const EdgeInsets.only(bottom: 24),
+                  itemCount: matches.length,
+                  itemBuilder: (_, i) {
+                    final c = matches[i];
+                    final beat = _resolveCustomerBeat(c, all);
+                    return ListTile(
+                      leading: CircleAvatar(
+                        backgroundColor: AppTheme.primary.withValues(alpha: 0.1),
+                        child: Text(
+                          c.name.isNotEmpty ? c.name[0].toUpperCase() : '?',
+                          style: TextStyle(
+                            color: AppTheme.primary,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                      ),
+                      title: Text(
+                        c.name,
+                        style: GoogleFonts.manrope(
+                            fontSize: 14, fontWeight: FontWeight.w700),
+                      ),
+                      subtitle: Text(
+                        [
+                          if (c.phone.isNotEmpty && c.phone != 'No Phone') c.phone,
+                          if (beat != null) beat.beatName,
+                        ].join(' · '),
+                        style: GoogleFonts.manrope(
+                            fontSize: 12,
+                            color: AppTheme.onSurfaceVariant),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                      trailing: const Icon(Icons.arrow_forward_ios_rounded,
+                          size: 14, color: Colors.grey),
+                      onTap: beat == null
+                          ? null
+                          : () => widget.onCustomerPicked(c, beat),
+                    );
+                  },
                 );
               }
+
+              // No query — fall back to the original route picker, minus
+              // today's beats (those are already on the main screen).
+              final nonToday = all.where((b) => !widget.isBeatToday(b)).toList();
+              if (nonToday.isEmpty) {
+                return _errorState(
+                  icon: Icons.search_off_rounded,
+                  title: 'No non-today beats to show',
+                  detail: 'Your other beats are already shown above. Type a customer name to search directly.',
+                );
+              }
+              final filtered = nonToday;
               return ListView.builder(
                 controller: widget.scrollCtrl,
                 padding: const EdgeInsets.only(bottom: 24),
