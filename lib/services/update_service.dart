@@ -111,17 +111,30 @@ class UpdateService {
         // First request — may return HTML confirmation page for large files
         var response = await client.get(Uri.parse(downloadUrl));
 
-        // Google Drive large-file virus scan: returns HTML with a confirm token
+        // Google Drive large-file / executable interstitial: returns HTML.
+        // The current Drive UI uses a form with hidden fields that POSTs to
+        // drive.usercontent.google.com/download. We emulate that by rebuilding
+        // the URL using the form's action + its hidden inputs. Falls back to
+        // the known usercontent endpoint if action parsing fails.
         if (response.statusCode == 200 &&
             response.headers['content-type']?.contains('text/html') == true) {
-          final confirmMatch = RegExp(r'confirm=([0-9A-Za-z_-]+)').firstMatch(response.body);
-          final uuidMatch = RegExp(r'uuid=([0-9A-Za-z_-]+)').firstMatch(response.body);
-          if (confirmMatch != null) {
-            final confirm = confirmMatch.group(1)!;
-            final uuid = uuidMatch?.group(1) ?? '';
-            final idMatch = RegExp(r'id=([^&]+)').firstMatch(downloadUrl);
-            final fileId = idMatch?.group(1) ?? '';
-            downloadUrl = 'https://drive.google.com/uc?export=download&confirm=$confirm&uuid=$uuid&id=$fileId';
+          final body = response.body;
+          // Extract all hidden-input name/value pairs from the form.
+          final params = <String, String>{};
+          for (final m in RegExp(
+            r'name="([^"]+)"\s+value="([^"]*)"',
+          ).allMatches(body)) {
+            params[m.group(1)!] = m.group(2)!;
+          }
+          final actionMatch = RegExp(r'action="([^"]+)"').firstMatch(body);
+          final action = actionMatch?.group(1) ??
+              'https://drive.usercontent.google.com/download';
+          if (params.containsKey('id') && params.containsKey('confirm')) {
+            final query = params.entries
+                .map((e) =>
+                    '${Uri.encodeQueryComponent(e.key)}=${Uri.encodeQueryComponent(e.value)}')
+                .join('&');
+            downloadUrl = '$action?$query';
           }
         }
 
