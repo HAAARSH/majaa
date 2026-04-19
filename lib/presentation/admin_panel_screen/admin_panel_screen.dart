@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 
 import '../../routes/app_routes.dart';
@@ -14,6 +15,21 @@ import './widgets/admin_system_section.dart';
 import './widgets/team_split_wrapper.dart';
 import '../../services/drive_sync_service.dart';
 import '../../widgets/hero_selfie_modal.dart';
+
+/// Cross-tab drill-through payload. Dashboard cards set this before switching
+/// to the Orders tab so the Orders tab can apply the matching filter on its
+/// next build without needing to rebuild the whole panel.
+class AdminOrdersNavIntent {
+  final DateTime? startDate;
+  final DateTime? endDate;
+  final String? beatName;
+  final String? teamId;
+  const AdminOrdersNavIntent({this.startDate, this.endDate, this.beatName, this.teamId});
+}
+
+/// Module-level notifier — Dashboard writes, Orders tab listens+consumes.
+/// Cleared (set to null) once the Orders tab applies the filter.
+final ValueNotifier<AdminOrdersNavIntent?> adminOrdersNavIntent = ValueNotifier(null);
 
 class AdminPanelScreen extends StatefulWidget {
   const AdminPanelScreen({super.key});
@@ -188,63 +204,101 @@ class _AdminPanelScreenState extends State<AdminPanelScreen>
       );
     }
 
-    return Scaffold(
-      backgroundColor: AppTheme.background,
-      appBar: AppBar(
-        backgroundColor: AppTheme.primary,
-        elevation: 0,
-        title: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              'Admin Control Panel',
-              style: GoogleFonts.manrope(fontSize: 20, fontWeight: FontWeight.w800, color: Colors.white),
-            ),
-            if (_isSuperAdmin)
-              Text(
-                  'Super Admin Mode',
-                  style: TextStyle(fontSize: 10, color: Colors.amber.shade300, fontWeight: FontWeight.bold)
+    return PopScope(
+      // Dashboard is tab 0 and the "root" of the admin panel. Back button
+      // from any other tab walks us back to Dashboard first; a second back
+      // from Dashboard exits the app (SystemNavigator.pop — mirrors Android's
+      // HOME behavior, which is expected since admin_panel was entered via
+      // pushReplacementNamed and has no earlier route to pop to).
+      canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        if (didPop) return;
+        if (_tabController.index != 0) {
+          _tabController.animateTo(0);
+        } else {
+          SystemNavigator.pop();
+        }
+      },
+      child: Scaffold(
+        backgroundColor: AppTheme.background,
+        // AppBar + main TabBar live inside a SliverAppBar (floating: true,
+        // snap: true) so they collapse on scroll-down and reappear on
+        // scroll-up. Goal per user (2026-04-18): maximize content area by
+        // letting the top chrome slide away when scrolling the current tab.
+        // SafeArea(top: true) reserves the status-bar inset — without it,
+        // content bleeds under the Android status bar when the SliverAppBar
+        // is fully collapsed (user reported "top is getting merged with
+        // android top bar" on CPH2487).
+        body: SafeArea(
+          top: true,
+          bottom: false,
+          child: NestedScrollView(
+          floatHeaderSlivers: true,
+          headerSliverBuilder: (context, innerBoxIsScrolled) => [
+            SliverAppBar(
+              backgroundColor: AppTheme.primary,
+              elevation: 0,
+              floating: true,
+              snap: true,
+              pinned: false,
+              title: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Admin Control Panel',
+                    style: GoogleFonts.manrope(fontSize: 20, fontWeight: FontWeight.w800, color: Colors.white),
+                  ),
+                  if (_isSuperAdmin)
+                    Text(
+                        'Super Admin Mode',
+                        style: TextStyle(fontSize: 10, color: Colors.amber.shade300, fontWeight: FontWeight.bold)
+                    ),
+                ],
               ),
+              actions: [
+                IconButton(
+                  icon: const Icon(Icons.logout_rounded, color: Colors.white),
+                  tooltip: 'Log Out',
+                  onPressed: () async {
+                    final navigator = Navigator.of(context);
+                    await SupabaseService.instance.signOut();
+                    navigator.pushReplacementNamed(AppRoutes.loginScreen);
+                  },
+                )
+              ],
+              bottom: TabBar(
+                controller: _tabController,
+                isScrollable: true,
+                indicatorColor: Colors.white,
+                indicatorWeight: 4,
+                labelColor: Colors.white,
+                unselectedLabelColor: Colors.white70,
+                labelStyle: GoogleFonts.manrope(fontWeight: FontWeight.w700, fontSize: 13),
+                tabs: const [
+                  Tab(icon: Icon(Icons.dashboard_rounded), text: 'Dashboard'),
+                  Tab(icon: Icon(Icons.inventory_2_rounded), text: 'Catalog'),
+                  Tab(icon: Icon(Icons.groups_rounded), text: 'Field Ops'),
+                  Tab(icon: Icon(Icons.receipt_long_rounded), text: 'Orders'),
+                  Tab(icon: Icon(Icons.admin_panel_settings_rounded), text: 'System'),
+                ],
+              ),
+            ),
           ],
+          body: TabBarView(
+            controller: _tabController,
+            children: [
+              TeamSplitWrapper(builder: (team) => AdminDashboardTab(
+                key: ValueKey('dash_$team'),
+                onNavigateToTab: (i) => _tabController.animateTo(i),
+              )),
+              AdminCatalogSection(isSuperAdmin: _isSuperAdmin),
+              AdminFieldOpsSection(isSuperAdmin: _isSuperAdmin),
+              const AdminOrdersSection(),
+              AdminSystemSection(isSuperAdmin: _isSuperAdmin),
+            ],
+          ),
         ),
-        // CHANGED: removed global team switcher — each split tab has its own JA/MA toggle
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.logout_rounded, color: Colors.white),
-            tooltip: 'Log Out',
-            onPressed: () async {
-              final navigator = Navigator.of(context);
-              await SupabaseService.instance.signOut();
-              navigator.pushReplacementNamed(AppRoutes.loginScreen);
-            },
-          )
-        ],
-        bottom: TabBar(
-          controller: _tabController,
-          isScrollable: true,
-          indicatorColor: Colors.white,
-          indicatorWeight: 4,
-          labelColor: Colors.white,
-          unselectedLabelColor: Colors.white70,
-          labelStyle: GoogleFonts.manrope(fontWeight: FontWeight.w700, fontSize: 13),
-          tabs: const [
-            Tab(icon: Icon(Icons.dashboard_rounded), text: 'Dashboard'),
-            Tab(icon: Icon(Icons.inventory_2_rounded), text: 'Catalog'),
-            Tab(icon: Icon(Icons.groups_rounded), text: 'Field Ops'),
-            Tab(icon: Icon(Icons.receipt_long_rounded), text: 'Orders'),
-            Tab(icon: Icon(Icons.admin_panel_settings_rounded), text: 'System'),
-          ],
         ),
-      ),
-      body: TabBarView(
-        controller: _tabController,
-        children: [
-          TeamSplitWrapper(builder: (team) => AdminDashboardTab(key: ValueKey('dash_$team'))),
-          AdminCatalogSection(isSuperAdmin: _isSuperAdmin),
-          AdminFieldOpsSection(isSuperAdmin: _isSuperAdmin),
-          const AdminOrdersSection(),
-          AdminSystemSection(isSuperAdmin: _isSuperAdmin),
-        ],
       ),
     );
   }

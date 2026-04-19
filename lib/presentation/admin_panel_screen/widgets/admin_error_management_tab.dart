@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:intl/intl.dart';
+import '../../../core/search_utils.dart';
 import '../../../services/supabase_service.dart';
 import '../../../services/auth_service.dart';
 import '../../../theme/app_theme.dart';
@@ -66,15 +67,14 @@ class _AdminErrorManagementTabState extends State<AdminErrorManagementTab> {
       return true; // 'all'
     }).toList();
 
-    // Filter by search query
-    if (_searchQuery.isNotEmpty) {
+    // Tokenized search filter
+    if (_searchQuery.trim().isNotEmpty) {
       filtered = filtered.where((error) {
-        final message = (error['error_message'] as String? ?? '').toLowerCase();
-        final orderId = (error['order_id'] as String? ?? '').toLowerCase();
-        final errorType = (error['error_type'] as String? ?? '').toLowerCase();
-        return message.contains(_searchQuery.toLowerCase()) ||
-               orderId.contains(_searchQuery.toLowerCase()) ||
-               errorType.contains(_searchQuery.toLowerCase());
+        return tokenMatch(_searchQuery, [
+          error['error_message'] as String?,
+          error['order_id'] as String?,
+          error['error_type'] as String?,
+        ]);
       }).toList();
     }
 
@@ -170,6 +170,8 @@ class _AdminErrorManagementTabState extends State<AdminErrorManagementTab> {
         return Colors.purple.shade600;
       case 'balance_update_rpc':
         return Colors.blue.shade600;
+      case 'sync_unfinished_eod':
+        return Colors.deepOrange.shade700;
       default:
         return Colors.grey.shade600;
     }
@@ -185,6 +187,8 @@ class _AdminErrorManagementTabState extends State<AdminErrorManagementTab> {
         return 'OCR Processing';
       case 'balance_update_rpc':
         return 'Balance Update RPC';
+      case 'sync_unfinished_eod':
+        return 'Unsynced Orders at End of Day';
       default:
         return errorType?.replaceAll('_', ' ').toUpperCase() ?? 'UNKNOWN';
     }

@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
-import 'package:flutter_svg/flutter_svg.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../routes/app_routes.dart';
 import '../../services/supabase_service.dart';
@@ -42,26 +42,38 @@ class _LoginScreenState extends State<LoginScreen>
 
       SessionService.instance.markActive();
 
-      // Determine correct route based on user role
+      // Determine correct route based on user role. Try the live DB first,
+      // but if it fails (offline) fall back to the role persisted at last
+      // login so admins and delivery reps land on their correct home.
       String route = AppRoutes.beatSelectionScreen;
+      String? role;
       try {
         final email = SupabaseService.instance.client.auth.currentUser?.email;
         if (email != null) {
           final userData = await SupabaseService.instance.client
               .from('app_users')
-              .select('role')
+              .select('role, full_name')
               .eq('email', email)
               .maybeSingle();
-          final role = userData?['role'] as String? ?? 'sales_rep';
-          SupabaseService.instance.currentUserRole = role;
-          if (role == 'admin' || role == 'super_admin') {
-            route = AppRoutes.adminPanelScreen;
-          } else if (role == 'delivery_rep') {
-            route = AppRoutes.deliveryDashboardScreen;
+          role = userData?['role'] as String?;
+          final fullName = userData?['full_name'] as String?;
+          if (fullName != null && fullName.isNotEmpty) {
+            SupabaseService.instance.currentUserName = fullName;
           }
         }
       } catch (_) {
-        // If role fetch fails (offline), default to beat selection
+        // offline — try cached role
+      }
+      if (role == null || role.isEmpty) {
+        final prefs = await SharedPreferences.getInstance();
+        role = prefs.getString('last_role');
+      }
+      role ??= 'sales_rep';
+      SupabaseService.instance.currentUserRole = role;
+      if (role == 'admin' || role == 'super_admin') {
+        route = AppRoutes.adminPanelScreen;
+      } else if (role == 'delivery_rep') {
+        route = AppRoutes.deliveryDashboardScreen;
       }
 
       if (mounted) {
@@ -190,7 +202,7 @@ class _LoginScreenState extends State<LoginScreen>
         email,
         _passwordController.text,
       )
-          .timeout(const Duration(seconds: 10));
+          .timeout(const Duration(seconds: 30));
 
       if (!mounted) return;
 
@@ -384,9 +396,19 @@ class _LoginScreenState extends State<LoginScreen>
                   offset: const Offset(0, 10)),
             ],
           ),
-          child: SvgPicture.asset(
-            'assets/images/logo.png.svg',
-            fit: BoxFit.contain,
+          // Text-based brand mark. The project's logo.png is the Flutter
+          // default placeholder — swap this for an Image.asset once a real
+          // MAJAA logo is dropped into assets/images/.
+          child: Center(
+            child: Text(
+              'M&J',
+              style: GoogleFonts.manrope(
+                fontSize: 34,
+                fontWeight: FontWeight.w900,
+                color: dark ? AppTheme.primary : Colors.white,
+                letterSpacing: -1.2,
+              ),
+            ),
           ),
         ),
         const SizedBox(height: 24),

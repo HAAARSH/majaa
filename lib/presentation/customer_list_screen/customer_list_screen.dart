@@ -4,6 +4,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'dart:convert';
 import 'package:hive_flutter/hive_flutter.dart';
 
+import '../../core/search_utils.dart';
 import '../../routes/app_routes.dart';
 import '../../services/supabase_service.dart';
 import '../../theme/app_theme.dart';
@@ -30,6 +31,17 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
 
   // TASK 2C — set of customer IDs visited today
   Set<String> _visitedIds = {};
+
+  // Current search text, tracked so async callbacks (like _loadBrandCustomerIds)
+  // can re-apply filters without clobbering the rep's typed query.
+  String _searchQuery = '';
+
+  // Brand-rep only: customers in this team who have ordered any product
+  // from the rep's allowed brands. Used to pin those customers to the top
+  // with a "Your Brand" badge so reps see their active customers first.
+  bool get _isBrandRep =>
+      SupabaseService.instance.currentUserRole == 'brand_rep';
+  Set<String> _brandCustomerIds = {};
 
   // Multi-beat merged view
   List<BeatModel> _beats = [];
@@ -94,10 +106,17 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
           // Admin / no-beat context: show all customers.
           _allCustomers = customers;
         } else if (_isOutOfBeat) {
-          // Out-of-Beat mode: show ALL customers for the current team so reps
-          // can place orders for walk-in / out-of-route customers.
+          // Out-of-Beat mode: show ALL customers for the beat's team (not
+          // currentTeam) — a rep who covers beats in both teams must see the
+          // right customer set when they pick a cross-team beat from the OOB
+          // sheet. Also switch currentTeam so the order is saved under the
+          // correct team.
+          final beatTeam = _beat?.teamId ?? AuthService.currentTeam;
+          if (beatTeam != AuthService.currentTeam) {
+            AuthService.currentTeam = beatTeam;
+          }
           _allCustomers = customers
-              .where((c) => c.belongsToTeam(AuthService.currentTeam))
+              .where((c) => c.belongsToTeam(beatTeam))
               .toList();
         } else {
           // Normal beat mode: strictly filter to this beat.
@@ -109,17 +128,58 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
         _applyFilters('');
         _isLoading = false;
       });
+
+      // For brand_rep only: fetch brand history in background and refresh
+      // the list once it arrives so the "Your Brand" customers float to top.
+      if (_isBrandRep) {
+        _loadBrandCustomerIds();
+      }
     } catch (e) {
       if (mounted) setState(() => _isLoading = false);
     }
   }
 
+  Future<void> _loadBrandCustomerIds() async {
+    try {
+      final userId = SupabaseService.instance.client.auth.currentUser?.id;
+      if (userId == null) return;
+      final allowedBrands =
+          await SupabaseService.instance.getUserBrandAccess(userId);
+      if (allowedBrands.isEmpty) return;
+      final ids = await SupabaseService.instance
+          .getCustomerIdsWithBrandHistory(allowedBrands);
+      if (!mounted) return;
+      setState(() {
+        _brandCustomerIds = ids;
+        _applyFilters(_searchQuery);
+      });
+    } catch (_) {
+      // Silent fallback — list still works without the pin-to-top behavior.
+    }
+  }
+
   void _applyFilters(String query) {
-    List<CustomerModel> temp = _allCustomers.where((c) =>
-        c.name.toLowerCase().contains(query.toLowerCase())).toList();
+    _searchQuery = query;
+    List<CustomerModel> temp = _allCustomers
+        .where((c) => tokenMatch(query, [c.name, c.phone, c.address]))
+        .toList();
 
     if (_sortBy == 'Alphabetical') {
       temp.sort((a, b) => a.name.compareTo(b.name));
+      // Brand_rep: pin customers who have ordered the rep's brand before
+      // to the top. Both groups stay alphabetically sorted within themselves.
+      if (_isBrandRep && _brandCustomerIds.isNotEmpty) {
+        final brandFirst = <CustomerModel>[];
+        final others = <CustomerModel>[];
+        for (final c in temp) {
+          if (_brandCustomerIds.contains(c.id)) {
+            brandFirst.add(c);
+          } else {
+            others.add(c);
+          }
+        }
+        temp = [...brandFirst, ...others];
+      }
     } else if (_sortBy == 'High Value') {
       temp.sort((a, b) => b.lastOrderValue.compareTo(a.lastOrderValue));
     } else if (_sortBy == 'Recent Order') {
@@ -199,11 +259,14 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
         return;
       }
     }
-    // Navigate — dual-team customers handled inside customer detail screen
+    // Navigate — dual-team customers handled inside customer detail screen.
+    // Propagate OOB flag so the order header can badge the order as OOB and
+    // the DB row can be tagged.
     Navigator.pushNamed(context, AppRoutes.customerDetails, arguments: {
                   'customer': customer,
                   if (_beat != null) 'beat': _beat,
                   'isMergedView': _isMergedView && _isDualTeam,
+                  'isOutOfBeat': _isOutOfBeat,
                 });
   }
 
@@ -246,6 +309,7 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
                   'customer': customer,
                   if (_beat != null) 'beat': _beat,
                   'isMergedView': _isMergedView && _isDualTeam,
+                  'isOutOfBeat': _isOutOfBeat,
                 });
               },
             ),
@@ -266,6 +330,7 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
                   'customer': customer,
                   if (_beat != null) 'beat': _beat,
                   'isMergedView': _isMergedView && _isDualTeam,
+                  'isOutOfBeat': _isOutOfBeat,
                 });
               },
             ),
@@ -433,9 +498,37 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
                           Text(
                             customer.name,
                             style: GoogleFonts.manrope(fontSize: 16, fontWeight: FontWeight.w700),
-                            maxLines: 1,
+                            maxLines: 2,
                             overflow: TextOverflow.ellipsis,
                           ),
+                          // "Your Brand" chip — brand_rep only, for customers
+                          // who have ordered from the rep's allowed brands.
+                          if (_isBrandRep && _brandCustomerIds.contains(customer.id)) ...[
+                            const SizedBox(height: 4),
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                              decoration: BoxDecoration(
+                                color: Colors.amber.shade100,
+                                borderRadius: BorderRadius.circular(10),
+                                border: Border.all(color: Colors.amber.shade700, width: 0.8),
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(Icons.star_rounded, size: 12, color: Colors.amber.shade800),
+                                  const SizedBox(width: 3),
+                                  Text(
+                                    'Your Brand',
+                                    style: GoogleFonts.manrope(
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.w700,
+                                      color: Colors.amber.shade900,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
                           const SizedBox(height: 2),
                           Text(
                             customer.phone.isEmpty ? 'No Phone' : customer.phone,
@@ -610,7 +703,7 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
         borderRadius: BorderRadius.circular(20),
       ),
       child: Text(
-        'Action Required',
+        'Add Phone',
         style: GoogleFonts.manrope(
           fontSize: 9,
           fontWeight: FontWeight.w700,
@@ -679,7 +772,13 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
               title: Text(reason, style: GoogleFonts.manrope(fontSize: 14, fontWeight: FontWeight.w500)),
               onTap: () async {
                 Navigator.pop(ctx);
-                await _logVisit(customer, reason);
+                if (reason == 'Other') {
+                  final note = await _promptOtherReason(customer);
+                  if (note == null || note.trim().isEmpty) return;
+                  await _logVisit(customer, 'Other', notes: note.trim());
+                } else {
+                  await _logVisit(customer, reason);
+                }
               },
             )),
             const SizedBox(height: 12),
@@ -689,7 +788,53 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
     );
   }
 
-  Future<void> _logVisit(CustomerModel customer, String reason) async {
+  Future<String?> _promptOtherReason(CustomerModel customer) async {
+    final controller = TextEditingController();
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Text(
+          'Why — ${customer.name}?',
+          style: GoogleFonts.manrope(
+              fontSize: 15, fontWeight: FontWeight.w700),
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+        ),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          textCapitalization: TextCapitalization.sentences,
+          maxLines: 2,
+          decoration: InputDecoration(
+            labelText: 'Reason',
+            hintText: 'e.g. Renovation, power cut, owner travelling',
+            border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(12)),
+          ),
+          onSubmitted: (v) => Navigator.pop(ctx, v),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, null),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, controller.text),
+            child: const Text('Log Visit'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    return result;
+  }
+
+  Future<void> _logVisit(
+    CustomerModel customer,
+    String reason, {
+    String? notes,
+  }) async {
     try {
       // In merged view, use the customer's actual beat ID
       final beatId = _isMergedView
@@ -699,6 +844,8 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
         customerId: customer.id,
         beatId: beatId,
         reason: reason,
+        notes: notes,
+        isOutOfBeat: _isOutOfBeat,
       );
       if (mounted) {
         setState(() => _visitedIds.add(customer.id));
@@ -774,6 +921,7 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
                   'customer': customer,
                   if (_beat != null) 'beat': _beat,
                   'isMergedView': _isMergedView && _isDualTeam,
+                  'isOutOfBeat': _isOutOfBeat,
                 });
             },
             child: Text(
@@ -812,7 +960,14 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
             (c) => c.id == customer.id,
         orElse: () => customer,
       );
-      Navigator.pushNamed(context, AppRoutes.customerDetails, arguments: updated);
+      // Pass the full context map so customer_detail keeps the beat, OOB flag
+      // and merged-view state. The bare-CustomerModel fallback drops those.
+      Navigator.pushNamed(context, AppRoutes.customerDetails, arguments: {
+        'customer': updated,
+        if (_beat != null) 'beat': _beat,
+        'isMergedView': _isMergedView && _isDualTeam,
+        'isOutOfBeat': _isOutOfBeat,
+      });
     }
   }
 

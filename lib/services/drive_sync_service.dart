@@ -984,17 +984,10 @@ class DriveSyncService {
             mrpUpdated++;
           }
 
-          // unit_price change from RATE — queue for verification
+          // Auto-apply unit_price change from RATE (same as MRP)
           if (newRate != null && newRate > 0 && newRate != p.unitPrice) {
-            priceChanges.add({
-              'productId': p.id,
-              'productName': p.name,
-              'category': p.category,
-              'currentPrice': p.unitPrice,
-              'newPrice': newRate,
-              'mrp': newMrp ?? p.mrp,
-              'stockQty': newQty,
-            });
+            data['unit_price'] = newRate;
+            changed = true;
           }
 
           if (changed) {

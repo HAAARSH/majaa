@@ -4,6 +4,7 @@ import 'package:fl_chart/fl_chart.dart';
 
 import '../../../services/supabase_service.dart';
 import '../../../theme/app_theme.dart';
+import './admin_shared_widgets.dart';
 
 const _reasons = [
   'Closed',
@@ -65,6 +66,10 @@ class _AdminVisitsTabState extends State<AdminVisitsTab> {
   String? _selectedBeatId;
   String? _selectedReason;
 
+  // Team scope — 'All' drops the team filter so super_admin sees visits
+  // from both JA and MA reps at once.
+  String _teamFilter = 'All';
+
   // Pagination
   static const _pageSize = 50;
   bool _loadingMore = false;
@@ -95,6 +100,7 @@ class _AdminVisitsTabState extends State<AdminVisitsTab> {
         limit: _pageSize,
         offset: 0,
         forceRefresh: forceRefresh,
+        teamId: _teamFilter == 'All' ? null : _teamFilter,
       );
       if (mounted) setState(() {
         _visits = visits;
@@ -117,6 +123,7 @@ class _AdminVisitsTabState extends State<AdminVisitsTab> {
         reason: _selectedReason,
         limit: _pageSize,
         offset: _visits.length,
+        teamId: _teamFilter == 'All' ? null : _teamFilter,
       );
       if (mounted) setState(() {
         _visits.addAll(moreVisits);
@@ -218,6 +225,16 @@ class _AdminVisitsTabState extends State<AdminVisitsTab> {
         color: AppTheme.primary,
         child: CustomScrollView(
           slivers: [
+            // Team scope picker — 'All' = cross-team visits.
+            SliverToBoxAdapter(
+              child: TeamFilterChips(
+                value: _teamFilter,
+                onChanged: (v) {
+                  setState(() => _teamFilter = v);
+                  _loadVisits(forceRefresh: true);
+                },
+              ),
+            ),
             // ── Filter bar ─────────────────────────────────────
             SliverToBoxAdapter(child: _buildFilterBar()),
 

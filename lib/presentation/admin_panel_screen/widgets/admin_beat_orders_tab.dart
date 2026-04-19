@@ -37,7 +37,7 @@ class _AdminBeatOrdersTabState extends State<AdminBeatOrdersTab> {
 
   Future<void> _loadRole() async {
     final role = await _service.getUserRole();
-    if (mounted) setState(() => _isSuperAdmin = role == 'super_admin' || role == 'admin');
+    if (mounted) setState(() => _isSuperAdmin = role == 'super_admin');
   }
 
   Future<void> _loadOrders() async {
@@ -245,7 +245,11 @@ class _AdminBeatOrdersTabState extends State<AdminBeatOrdersTab> {
     );
   }
 
-  /// Multi-beat bulk status change popup
+  /// Multi-beat bulk status change — bottom sheet (92% height) instead of a
+  /// small centered AlertDialog. Gives super_admin full vertical real estate
+  /// to browse beats (can easily be 30+ on a normal day) without scrolling
+  /// inside a cramped 200-px list. User directive 2026-04-18: "bulk beat
+  /// status change button in orders tab it open such a small window".
   void _showMultiBeatStatusPicker() {
     final selectedBeats = <String>{};
     final allStatuses = ['Confirmed', 'Delivered', 'Invoiced', 'Paid', 'Cancelled', 'Returned', 'Partially Delivered'];
@@ -253,40 +257,64 @@ class _AdminBeatOrdersTabState extends State<AdminBeatOrdersTab> {
         ? allStatuses
         : allStatuses.where((s) => !_adminOnlyStatuses.contains(s)).toList();
 
-    showDialog(
+    showModalBottomSheet(
       context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
       builder: (ctx) {
         return StatefulBuilder(
-          builder: (ctx, setDialogState) {
-            // Count orders for selected beats
+          builder: (ctx, setSheet) {
             final matchingOrders = _allPendingOrders.where((o) => selectedBeats.contains(o.beat)).toList();
-            return AlertDialog(
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-              title: Text('Beat Bulk Change', style: GoogleFonts.manrope(fontWeight: FontWeight.w800)),
-              content: SizedBox(
-                width: double.maxFinite,
+            return Padding(
+              padding: EdgeInsets.only(bottom: MediaQuery.of(ctx).viewInsets.bottom),
+              child: Container(
+                constraints: BoxConstraints(maxHeight: MediaQuery.of(ctx).size.height * 0.92),
+                decoration: BoxDecoration(
+                  color: Theme.of(ctx).scaffoldBackgroundColor,
+                  borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+                ),
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text('Select beats to change all pending orders',
-                        style: GoogleFonts.manrope(fontSize: 13, color: AppTheme.onSurfaceVariant)),
-                    const SizedBox(height: 12),
-                    ConstrainedBox(
-                      constraints: const BoxConstraints(maxHeight: 200),
+                    // Drag handle
+                    Container(
+                      width: 40, height: 4,
+                      margin: const EdgeInsets.only(top: 10, bottom: 8),
+                      decoration: BoxDecoration(color: Colors.grey.shade300, borderRadius: BorderRadius.circular(8)),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(24, 8, 24, 4),
+                      child: Row(
+                        children: [
+                          Text('Beat Bulk Change', style: GoogleFonts.manrope(fontWeight: FontWeight.w800, fontSize: 18)),
+                          const Spacer(),
+                          IconButton(icon: const Icon(Icons.close_rounded), onPressed: () => Navigator.pop(ctx)),
+                        ],
+                      ),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(24, 0, 24, 12),
+                      child: Text(
+                        'Pick one or more beats, then tap the status to apply to every pending order on those beats.',
+                        style: GoogleFonts.manrope(fontSize: 13, color: AppTheme.onSurfaceVariant),
+                      ),
+                    ),
+                    const Divider(height: 1),
+                    // Beat list — scrolls as much as it needs within sheet height
+                    Expanded(
                       child: ListView.builder(
-                        shrinkWrap: true,
+                        padding: const EdgeInsets.symmetric(vertical: 4),
                         itemCount: _beats.length,
                         itemBuilder: (_, i) {
                           final beat = _beats[i];
                           final count = _allPendingOrders.where((o) => o.beat == beat).length;
                           return CheckboxListTile(
                             dense: true,
-                            title: Text(beat, style: GoogleFonts.manrope(fontSize: 13)),
-                            subtitle: Text('$count pending', style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
+                            title: Text(beat, style: GoogleFonts.manrope(fontSize: 14, fontWeight: FontWeight.w600)),
+                            subtitle: Text('$count pending', style: GoogleFonts.manrope(fontSize: 12, color: AppTheme.onSurfaceVariant)),
                             value: selectedBeats.contains(beat),
                             onChanged: (_) {
-                              setDialogState(() {
+                              setSheet(() {
                                 if (selectedBeats.contains(beat)) {
                                   selectedBeats.remove(beat);
                                 } else {
@@ -299,45 +327,49 @@ class _AdminBeatOrdersTabState extends State<AdminBeatOrdersTab> {
                       ),
                     ),
                     if (selectedBeats.isNotEmpty) ...[
-                      const Divider(),
-                      Text('${matchingOrders.length} order${matchingOrders.length == 1 ? '' : 's'} — Change to:',
-                          style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700)),
-                      const SizedBox(height: 8),
-                      Wrap(
-                        spacing: 8,
-                        runSpacing: 4,
-                        children: available.map((s) {
-                          final isDestructive = _adminOnlyStatuses.contains(s);
-                          return ActionChip(
-                            label: Text(s),
-                            backgroundColor: isDestructive ? Colors.red.shade50 : Colors.blue.shade50,
-                            labelStyle: TextStyle(
-                              color: isDestructive ? Colors.red : Colors.blue.shade800,
-                              fontWeight: FontWeight.w600,
+                      const Divider(height: 1),
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(24, 12, 24, 16),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              '${matchingOrders.length} order${matchingOrders.length == 1 ? '' : 's'} will be updated — choose new status:',
+                              style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.w700),
                             ),
-                            onPressed: () async {
-                              Navigator.pop(ctx);
-                              final beatNames = selectedBeats.join(', ');
-                              final confirm = await _showConfirmation(
-                                'Change ${matchingOrders.length} order${matchingOrders.length == 1 ? '' : 's'} to "$s"?',
-                                'Beats: $beatNames',
-                              );
-                              if (!confirm) return;
-                              await _executeBulkChange(matchingOrders.map((o) => o.id).toList(), s, isDestructive);
-                            },
-                          );
-                        }).toList(),
+                            const SizedBox(height: 10),
+                            Wrap(
+                              spacing: 8,
+                              runSpacing: 8,
+                              children: available.map((s) {
+                                final isDestructive = _adminOnlyStatuses.contains(s);
+                                return ActionChip(
+                                  label: Text(s, style: GoogleFonts.manrope(fontWeight: FontWeight.w600)),
+                                  backgroundColor: isDestructive ? Colors.red.shade50 : Colors.blue.shade50,
+                                  labelStyle: TextStyle(
+                                    color: isDestructive ? Colors.red : Colors.blue.shade800,
+                                  ),
+                                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                                  onPressed: () async {
+                                    Navigator.pop(ctx);
+                                    final beatNames = selectedBeats.join(', ');
+                                    final confirm = await _showConfirmation(
+                                      'Change ${matchingOrders.length} order${matchingOrders.length == 1 ? '' : 's'} to "$s"?',
+                                      'Beats: $beatNames',
+                                    );
+                                    if (!confirm) return;
+                                    await _executeBulkChange(matchingOrders.map((o) => o.id).toList(), s, isDestructive);
+                                  },
+                                );
+                              }).toList(),
+                            ),
+                          ],
+                        ),
                       ),
                     ],
                   ],
                 ),
               ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.pop(ctx),
-                  child: Text('Cancel', style: GoogleFonts.manrope(fontWeight: FontWeight.w600)),
-                ),
-              ],
             );
           },
         );

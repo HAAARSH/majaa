@@ -9,6 +9,7 @@ import 'package:printing/printing.dart';
 import '../../../services/supabase_service.dart';
 import '../../../theme/app_theme.dart';
 import '../../../widgets/empty_state_widget.dart';
+import '../admin_panel_screen.dart' show adminOrdersNavIntent;
 
 // Conditional import for web download
 import 'admin_orders_download_stub.dart'
@@ -37,6 +38,9 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
   String _selectedStatus = 'Pending';
   // Team filter
   String _selectedTeamFilter = 'JA';
+  // Beat filter — set by dashboard drill-through (tap a beat on Dashboard
+  // → Orders tab lands here filtered to that beat). null means no beat filter.
+  String? _beatFilter;
 
   // Pagination
   static const _pageSize = 50;
@@ -52,12 +56,50 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
   void initState() {
     super.initState();
     _loadRole();
+    // Apply any pending drill-through intent INLINE (not via setState — we're
+    // still in initState; Flutter forbids setState before first build).
+    // The one _loadOrders() call at the bottom then fetches with the applied
+    // filters, so we don't double-fetch.
+    final pending = adminOrdersNavIntent.value;
+    if (pending != null) {
+      if (pending.startDate != null) _startDate = pending.startDate;
+      if (pending.endDate != null) _endDate = pending.endDate;
+      if (pending.teamId != null) _selectedTeamFilter = pending.teamId!;
+      _beatFilter = pending.beatName;
+      _selectedStatus = 'All';
+      adminOrdersNavIntent.value = null; // consume
+    }
+    // For subsequent intents (user drills again after having visited Orders
+    // tab once), the listener path uses setState safely (first build done).
+    adminOrdersNavIntent.addListener(_consumeNavIntent);
+    _loadOrders();
+  }
+
+  @override
+  void dispose() {
+    adminOrdersNavIntent.removeListener(_consumeNavIntent);
+    super.dispose();
+  }
+
+  void _consumeNavIntent() {
+    // Only called AFTER initState completes — setState is safe here.
+    final intent = adminOrdersNavIntent.value;
+    if (intent == null) return;
+    if (!mounted) return;
+    setState(() {
+      if (intent.startDate != null) _startDate = intent.startDate;
+      if (intent.endDate != null) _endDate = intent.endDate;
+      if (intent.teamId != null) _selectedTeamFilter = intent.teamId!;
+      _beatFilter = intent.beatName;
+      _selectedStatus = 'All';
+    });
+    adminOrdersNavIntent.value = null; // consume
     _loadOrders();
   }
 
   Future<void> _loadRole() async {
     final role = await _service.getUserRole();
-    if (mounted) setState(() => _isSuperAdmin = role == 'super_admin' || role == 'admin');
+    if (mounted) setState(() => _isSuperAdmin = role == 'super_admin');
   }
 
   Future<void> _loadOrders({bool forceRefresh = false}) async {
@@ -147,13 +189,14 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
 
   void _applyStatusFilter() {
     setState(() {
-      if (_selectedStatus == 'All') {
-        _filteredOrders = _orders;
-      } else {
-        _filteredOrders = _orders
-            .where((o) => o.status.toLowerCase() == _selectedStatus.toLowerCase())
-            .toList();
+      Iterable<OrderModel> list = _orders;
+      if (_selectedStatus != 'All') {
+        list = list.where((o) => o.status.toLowerCase() == _selectedStatus.toLowerCase());
       }
+      if (_beatFilter != null && _beatFilter!.isNotEmpty) {
+        list = list.where((o) => o.beat == _beatFilter);
+      }
+      _filteredOrders = list.toList();
     });
   }
 
@@ -161,6 +204,7 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
     setState(() {
       _startDate = null;
       _endDate = null;
+      _beatFilter = null;
     });
     _loadOrders();
   }
@@ -184,8 +228,10 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
   String _buildCsv({
     required List<OrderModel> orders,
     required Map<String, double> productMrpMap,
+    required Map<String, double> productUnitPriceMap,
     required Map<String, String> productBillingNameMap,
     required Map<String, String> userNameMap,
+    required DateTime exportDate,
     String? invoicePrefix,
     int? invoiceStartNum,
   }) {
@@ -197,28 +243,29 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
     );
 
     const months = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
-    final yesterday = DateTime.now().subtract(const Duration(days: 1));
-    final exportDate = '="${yesterday.day.toString().padLeft(2, '0')}-${months[yesterday.month - 1]}-${yesterday.year}"';
+    final dateStr = '="${exportDate.day.toString().padLeft(2, '0')}-${months[exportDate.month - 1]}-${exportDate.year}"';
     int invoiceCounter = invoiceStartNum ?? 0;
     for (final o in orders) {
       final invoiceNo = (invoicePrefix != null && invoiceStartNum != null)
           ? '$invoicePrefix${invoiceCounter++}'
           : '';
-      final orderDate = exportDate;
       final repName = (o.userId != null ? userNameMap[o.userId] : null) ?? '';
-      final notes = o.notes ?? '';
+      // Sanitize notes: replace newlines and tabs to prevent breaking rows
+      final notes = (o.notes ?? '').replaceAll(RegExp(r'[\r\n\t]+'), ' ').trim();
 
       if (o.lineItems.isEmpty) {
         buffer.writeln(
-          '$invoiceNo$t${o.id}$t$orderDate$t${o.customerName}${t}0$t$repName$t${t}0.00${t}0.00${t}0.00${t}0.00${t}0.00$t$notes',
+          '$invoiceNo$t${o.id}$t$dateStr$t${o.customerName}${t}0$t$repName$t${t}0.00${t}0.00${t}0.00${t}0.00${t}0.00$t$notes',
         );
       } else {
         for (final item in o.lineItems) {
           final mrp = item.mrp > 0 ? item.mrp : (productMrpMap[item.productId] ?? productMrpMap[item.sku] ?? 0.0);
+          // Use current product unit_price if it changed after order was placed
+          final currentUnitPrice = productUnitPriceMap[item.productId] ?? productUnitPriceMap[item.sku] ?? item.unitPrice;
           final itemName = productBillingNameMap[item.productId] ?? productBillingNameMap[item.sku] ?? item.productName;
-          final grossAmount = item.quantity * item.unitPrice;
+          final grossAmount = item.quantity * currentUnitPrice;
           buffer.writeln(
-            '$invoiceNo$t${o.id}$t$orderDate$t${o.customerName}$t${item.quantity}$t$repName$t$itemName$t${mrp.toStringAsFixed(2)}$t${item.unitPrice.toStringAsFixed(2)}${t}0.00${t}0.00$t${grossAmount.toStringAsFixed(2)}$t$notes',
+            '$invoiceNo$t${o.id}$t$dateStr$t${o.customerName}$t${item.quantity}$t$repName$t$itemName$t${mrp.toStringAsFixed(2)}$t${currentUnitPrice.toStringAsFixed(2)}${t}0.00${t}0.00$t${grossAmount.toStringAsFixed(2)}$t$notes',
           );
         }
       }
@@ -323,9 +370,14 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
                       },
                     ),
                     const Divider(height: 1),
-                    // Individual beats
+                    // Individual beats — bumped 300 → 520 so 20-30 beat
+                    // lists don't force inside-dialog scrolling on mobile.
+                    // User directive 2026-04-18: "i need bigger spaces in
+                    // everything".
                     ConstrainedBox(
-                      constraints: const BoxConstraints(maxHeight: 300),
+                      constraints: BoxConstraints(
+                        maxHeight: MediaQuery.of(ctx).size.height * 0.6,
+                      ),
                       child: ListView.builder(
                         shrinkWrap: true,
                         itemCount: beats.length,
@@ -429,15 +481,30 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
       }
     }
 
-    // Build product lookup maps (by id and sku)
-    final products = await _service.getProducts();
+    // Step 4: Ask for export date (for DUA Clipper import — DD-MMM-YYYY text format)
+    DateTime exportDate = DateTime.now().subtract(const Duration(days: 1));
+    final pickedDate = await showDatePicker(
+      context: context,
+      initialDate: exportDate,
+      firstDate: DateTime(2020),
+      lastDate: DateTime.now().add(const Duration(days: 365)),
+      helpText: 'Select order date for export',
+    );
+    if (pickedDate == null) return;
+    exportDate = pickedDate;
+
+    // Build product lookup maps (by id and sku) — use selected team's products
+    final products = await _service.getProducts(teamId: _selectedTeamFilter);
     final mrpMap = <String, double>{};
+    final unitPriceMap = <String, double>{};
     final billingNameMap = <String, String>{};
     for (final p in products) {
       mrpMap[p.id] = p.mrp;
+      unitPriceMap[p.id] = p.unitPrice;
       billingNameMap[p.id] = p.billingName ?? p.name;
       if (p.sku.isNotEmpty) {
         mrpMap[p.sku] = p.mrp;
+        unitPriceMap[p.sku] = p.unitPrice;
         billingNameMap[p.sku] = p.billingName ?? p.name;
       }
     }
@@ -463,8 +530,10 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
     final csv = _buildCsv(
       orders: exportOrders,
       productMrpMap: mrpMap,
+      productUnitPriceMap: unitPriceMap,
       productBillingNameMap: billingNameMap,
       userNameMap: userNameMap,
+      exportDate: exportDate,
       invoicePrefix: invoicePrefix,
       invoiceStartNum: invoiceStartNum,
     );
@@ -971,6 +1040,39 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
             ],
           ),
         )),
+
+        // Beat filter banner — shown only when a dashboard drill-through set
+        // _beatFilter. Tap X to clear and see all orders in the period.
+        if (_beatFilter != null)
+          SliverToBoxAdapter(child: Container(
+            color: AppTheme.primary.withValues(alpha: 0.08),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            child: Row(
+              children: [
+                Icon(Icons.filter_alt_rounded, size: 16, color: AppTheme.primary),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Filtered to beat: ${_beatFilter!}',
+                    style: GoogleFonts.manrope(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                        color: AppTheme.primary),
+                  ),
+                ),
+                InkWell(
+                  onTap: () {
+                    setState(() => _beatFilter = null);
+                    _applyStatusFilter();
+                  },
+                  child: const Padding(
+                    padding: EdgeInsets.all(4),
+                    child: Icon(Icons.close_rounded, size: 18),
+                  ),
+                ),
+              ],
+            ),
+          )),
 
         // Team Filter Chips (JA / MA)
         if (_hasFiltered && !_loading && _error == null)

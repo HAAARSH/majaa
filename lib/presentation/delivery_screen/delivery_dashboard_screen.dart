@@ -4,6 +4,7 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:image_picker/image_picker.dart';
 
+import '../../core/search_utils.dart';
 import '../../services/auth_service.dart';
 import '../../services/supabase_service.dart';
 import '../../theme/app_theme.dart';
@@ -29,6 +30,8 @@ class _DeliveryDashboardScreenState extends State<DeliveryDashboardScreen> {
 
   // Track completed orders for success animation
   final Set<String> _completedOrderIds = {};
+  // Prevent duplicate background processing on rapid swipes
+  final Set<String> _processingOrderIds = {};
 
   // Search
   final TextEditingController _searchController = TextEditingController();
@@ -173,14 +176,15 @@ class _DeliveryDashboardScreenState extends State<DeliveryDashboardScreen> {
       }).toList();
     }
 
-    // Search filter
-    if (_searchQuery.isNotEmpty) {
-      final q = _searchQuery.toLowerCase();
+    // Tokenized search filter
+    if (_searchQuery.trim().isNotEmpty) {
       list = list.where((order) {
-        final name = (order['customer_name'] ?? '').toString().toLowerCase();
-        final id = (order['id'] ?? '').toString().toLowerCase();
-        final route = (order['delivery_route'] ?? order['customers']?['delivery_route'] ?? '').toString().toLowerCase();
-        return name.contains(q) || id.contains(q) || route.contains(q);
+        return tokenMatch(_searchQuery, [
+          order['customer_name']?.toString(),
+          order['id']?.toString(),
+          (order['delivery_route'] ?? order['customers']?['delivery_route'])
+              ?.toString(),
+        ]);
       }).toList();
     }
 
@@ -218,6 +222,9 @@ class _DeliveryDashboardScreenState extends State<DeliveryDashboardScreen> {
       ) async {
     final orderId = order['id'] as String;
 
+    // Prevent duplicate processing on rapid swipes
+    if (_processingOrderIds.contains(orderId)) return;
+
     // 1. Swipe immediately opens the camera with compression settings
     final picker = ImagePicker();
     final XFile? photo = await picker.pickImage(
@@ -241,7 +248,7 @@ class _DeliveryDashboardScreenState extends State<DeliveryDashboardScreen> {
 
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
-        content: Text('Delivery confirmed! Bill processing in background.'),
+        content: Text('Photo captured — uploading proof, will confirm shortly.'),
         backgroundColor: Colors.green,
         duration: Duration(seconds: 2),
       ),
@@ -258,6 +265,7 @@ class _DeliveryDashboardScreenState extends State<DeliveryDashboardScreen> {
     });
 
     // 4. FIRE-AND-FORGET: Run background pipeline without awaiting
+    _processingOrderIds.add(orderId);
     _processDeliveryInBackground(orderId, photo.path);
   }
 
@@ -275,8 +283,16 @@ class _DeliveryDashboardScreenState extends State<DeliveryDashboardScreen> {
         extractedAmount: null,
       );
     } catch (e, stackTrace) {
-      // Silently log to error table - NEVER show UI errors to delivery rep
+      // Log to error table for admin visibility.
       await _logBackgroundProcessingError(orderId, e.toString(), stackTrace.toString());
+      // Revert status so the delivery card reappears on next refresh — rep can
+      // re-swipe to retry rather than the order silently getting stuck in
+      // 'Pending Verification' after Drive/OCR failure.
+      try {
+        await _service.updateOrderStatus(orderId, 'Pending');
+      } catch (_) {}
+    } finally {
+      _processingOrderIds.remove(orderId);
     }
   }
 
@@ -391,7 +407,7 @@ class _DeliveryDashboardScreenState extends State<DeliveryDashboardScreen> {
             onPressed: () async {
               Navigator.pop(ctx);
               try {
-                await _service.updateOrderStatus(orderId, 'Returned', isSuperAdmin: true);
+                await _service.updateOrderStatus(orderId, 'Returned');
                 if (mounted) {
                   setState(() => _allDeliveries.removeWhere((d) => d['id'] == orderId));
                   ScaffoldMessenger.of(context).showSnackBar(

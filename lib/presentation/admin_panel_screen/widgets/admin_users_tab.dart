@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
+import '../../../core/search_utils.dart';
 import '../../../services/supabase_service.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:image_picker/image_picker.dart';
@@ -50,14 +51,29 @@ class _AdminUsersTabState extends State<AdminUsersTab> {
   }
 
   void _applySearch() {
-    final q = _searchCtrl.text.toLowerCase();
+    final q = _searchCtrl.text;
     setState(() {
-      _filtered = _users.where((u) =>
-        u.fullName.toLowerCase().contains(q) ||
-        u.email.toLowerCase().contains(q) ||
-        u.teamId.toLowerCase().contains(q),
-      ).toList();
+      _filtered = _users
+          .where((u) => tokenMatch(q, [u.fullName, u.email, u.teamId]))
+          .toList();
     });
+  }
+
+  /// Writes the admin's brand selection to user_brand_access. Existing rows
+  /// are reset first so deselecting a brand actually revokes it.
+  Future<void> _applyBrandAccess(String uid, Set<String> selected, String teamId) async {
+    try {
+      await SupabaseService.instance.resetUserBrandAccess(uid);
+      for (final brand in selected) {
+        await SupabaseService.instance.setUserBrandAccess(uid, brand, true, teamId: teamId);
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Brand access update failed: $e'), backgroundColor: AppTheme.error),
+        );
+      }
+    }
   }
 
   Color _roleColor(String role) {
@@ -162,6 +178,23 @@ class _AdminUsersTabState extends State<AdminUsersTab> {
 
     final isNew = user == null;
 
+    // Preload data for the brand-access multi-select shown when role=brand_rep.
+    // Loaded unconditionally so the selector reacts instantly when the admin
+    // switches role in the dropdown.
+    List<String> allCategories = [];
+    final Set<String> selectedBrands = {};
+    try {
+      final cats = await SupabaseService.instance.getProductCategories();
+      allCategories = cats.map((c) => c.name).toList()..sort();
+    } catch (_) {}
+    if (user != null) {
+      try {
+        final existing =
+            await SupabaseService.instance.getUserBrandAccess(user.id);
+        selectedBrands.addAll(existing);
+      } catch (_) {}
+    }
+
     await showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
@@ -216,6 +249,72 @@ class _AdminUsersTabState extends State<AdminUsersTab> {
                   onChanged: (v) => setD(() => selectedTeam = v!),
                 ),
                 const SizedBox(height: 10),
+                // Brand-access multi-select — only shown when role=brand_rep.
+                // Admin picks which product categories this rep can sell.
+                // Empty selection = no access (rep lands on "brand access denied").
+                if (selectedRole == 'brand_rep') ...[
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: Colors.amber.shade50,
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(color: Colors.amber.shade300),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Icon(Icons.star_rounded, size: 16, color: Colors.amber.shade800),
+                            const SizedBox(width: 6),
+                            Text(
+                              'Brand Access',
+                              style: GoogleFonts.manrope(fontWeight: FontWeight.w700, fontSize: 13),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          allCategories.isEmpty
+                              ? 'No categories available.'
+                              : 'Select brands this rep can sell (current team only). Empty = no access.',
+                          style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          'For cross-team brands, use the Field Ops → Brand Access tab.',
+                          style: GoogleFonts.manrope(
+                            fontSize: 10,
+                            fontStyle: FontStyle.italic,
+                            color: AppTheme.onSurfaceVariant,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        Wrap(
+                          spacing: 6,
+                          runSpacing: 6,
+                          children: allCategories.map((cat) {
+                            final selected = selectedBrands.contains(cat);
+                            return FilterChip(
+                              label: Text(cat, style: GoogleFonts.manrope(fontSize: 12)),
+                              selected: selected,
+                              onSelected: (v) => setD(() {
+                                if (v) {
+                                  selectedBrands.add(cat);
+                                } else {
+                                  selectedBrands.remove(cat);
+                                }
+                              }),
+                              selectedColor: Colors.amber.shade200,
+                              checkmarkColor: Colors.amber.shade900,
+                            );
+                          }).toList(),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                ],
                 SwitchListTile(
                   title: Text('Active', style: GoogleFonts.manrope(fontWeight: FontWeight.w600)),
                   value: isActive,
@@ -245,10 +344,14 @@ class _AdminUsersTabState extends State<AdminUsersTab> {
                 Navigator.pop(ctx);
                 try {
                   if (isNew) {
-                    await SupabaseService.instance.adminCreateUser(
+                    final newUid = await SupabaseService.instance.adminCreateUser(
                       email: email, password: pass, fullName: name,
                       role: selectedRole, teamId: selectedTeam, upiId: upiCtrl.text.trim(),
                     );
+                    // Persist brand-access for newly created brand_reps.
+                    if (selectedRole == 'brand_rep') {
+                      await _applyBrandAccess(newUid, selectedBrands, selectedTeam);
+                    }
                     if (mounted) _load(forceRefresh: true);
                   } else {
                     await SupabaseService.instance.updateAppUser(
@@ -269,6 +372,14 @@ class _AdminUsersTabState extends State<AdminUsersTab> {
                       } else {
                         await SupabaseService.instance.adminSetPassword(user.id, pass);
                       }
+                    }
+                    // Brand-access sync. Only when the user IS a brand_rep;
+                    // switching TO brand_rep writes the selection, switching
+                    // AWAY doesn't wipe existing rows (admin may be toggling
+                    // roles temporarily — explicit reset belongs in a
+                    // dedicated brand-access tab).
+                    if (selectedRole == 'brand_rep') {
+                      await _applyBrandAccess(user.id, selectedBrands, selectedTeam);
                     }
                     // Refresh only the edited user in-place
                     if (mounted) {

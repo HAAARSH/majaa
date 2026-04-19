@@ -25,6 +25,7 @@ class OrderModel {
   final double? preliminaryAmount;
   final String source; // 'app' = sales rep order, 'office' = auto-created from ITTR
   final String? userId;
+  final bool isOutOfBeat;
 
   const OrderModel({
     required this.id, this.customerId, required this.customerName, required this.beat,
@@ -34,7 +35,7 @@ class OrderModel {
     this.finalBillNo, this.actualBilledAmount,
     this.billPhotoUrl, this.verifiedByDelivery = false, this.verifiedByOffice = false,
     this.billVerified = false, this.preliminaryBillNo, this.preliminaryAmount,
-    this.source = 'app', this.userId,
+    this.source = 'app', this.userId, this.isOutOfBeat = false,
   });
 
   factory OrderModel.fromJson(Map<String, dynamic> json) => OrderModel(
@@ -63,6 +64,7 @@ class OrderModel {
     preliminaryAmount: (json['preliminary_amount'] as num?)?.toDouble(),
     source: json['source'] as String? ?? 'app',
     userId: json['user_id'] as String?,
+    isOutOfBeat: json['is_out_of_beat'] as bool? ?? false,
   );
 
   OrderModel copyWithStatus(String newStatus) => OrderModel(
@@ -74,7 +76,7 @@ class OrderModel {
     billPhotoUrl: billPhotoUrl, verifiedByDelivery: verifiedByDelivery,
     verifiedByOffice: verifiedByOffice, billVerified: billVerified,
     preliminaryBillNo: preliminaryBillNo, preliminaryAmount: preliminaryAmount,
-    source: source, userId: userId,
+    source: source, userId: userId, isOutOfBeat: isOutOfBeat,
   );
 
   bool get isOfficeBill => source == 'office';

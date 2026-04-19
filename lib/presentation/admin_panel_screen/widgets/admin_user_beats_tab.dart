@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
+import '../../../core/search_utils.dart';
 import '../../../services/supabase_service.dart';
 import '../../../theme/app_theme.dart';
 import './admin_shared_widgets.dart';
@@ -79,12 +80,11 @@ class _AdminUserBeatsTabState extends State<AdminUserBeatsTab> {
   void _applyFilter() {
     setState(() {
       var list = _beats.toList();
-      // Text search
-      if (_searchQuery.isNotEmpty) {
-        final q = _searchQuery.toLowerCase();
-        list = list.where((b) =>
-            b.beatName.toLowerCase().contains(q) ||
-            b.beatCode.toLowerCase().contains(q)).toList();
+      // Tokenized text search
+      if (_searchQuery.trim().isNotEmpty) {
+        list = list
+            .where((b) => tokenMatch(_searchQuery, [b.beatName, b.beatCode]))
+            .toList();
       }
       // Rep filter
       if (_repFilter == 'Unassigned') {

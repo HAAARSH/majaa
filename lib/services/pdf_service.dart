@@ -25,8 +25,62 @@ class PdfService {
       _boldFont ??= await PdfGoogleFonts.notoSansBold();
   static final PdfColor textColor = PdfColor.fromHex('#1F2937'); // Dark Gray
 
+  // Filter orders in-place to only line items whose product's category is in
+  // `allowedBrands`. Returns the filtered orders (each with a recomputed
+  // grand_total from the remaining items). Orders with zero matching items
+  // are dropped. Unknown-category items are excluded (conservative).
+  static Future<List<Map<String, dynamic>>> _scopeOrdersToBrands(
+    List<Map<String, dynamic>> orders,
+    List<String> allowedBrands,
+  ) async {
+    if (allowedBrands.isEmpty) return orders;
+    final productIds = orders
+        .expand((o) => (o['order_items'] as List?) ?? [])
+        .map((it) => (it as Map)['product_id'])
+        .whereType<String>()
+        .toSet()
+        .toList();
+    final Map<String, String> categoryMap = {};
+    if (productIds.isNotEmpty) {
+      final rows = await SupabaseService.instance.client
+          .from('products')
+          .select('id, category')
+          .inFilter('id', productIds);
+      for (final r in rows as List) {
+        final id = (r as Map)['id'] as String?;
+        final cat = r['category'] as String?;
+        if (id != null && cat != null) categoryMap[id] = cat;
+      }
+    }
+    final scoped = <Map<String, dynamic>>[];
+    for (final o in orders) {
+      final items = (o['order_items'] as List?) ?? [];
+      final keptItems = items.where((it) {
+        final pid = (it as Map)['product_id'] as String?;
+        if (pid == null) return false;
+        final cat = categoryMap[pid];
+        return cat != null && allowedBrands.contains(cat);
+      }).toList();
+      if (keptItems.isEmpty) continue;
+      double newTotal = 0;
+      for (final it in keptItems) {
+        newTotal += ((it as Map)['line_total'] ?? it['total_price'] ?? 0).toDouble();
+      }
+      scoped.add({
+        ...o,
+        'order_items': keptItems,
+        'grand_total': newTotal,
+      });
+    }
+    return scoped;
+  }
+
   // ─── DAILY REPORT GENERATOR ──────────────────────────────────────────────
-  static Future<void> generateAndShareOrderReport(DateTime date) async {
+  static Future<void> generateAndShareOrderReport(
+    DateTime date, {
+    List<String>? teamIds,
+    List<String>? allowedBrands,
+  }) async {
     final pdf = pw.Document();
     final String formattedDate = DateFormat('dd-MM-yyyy').format(date);
     final String dateString = DateFormat('yyyy-MM-dd').format(date);
@@ -34,8 +88,13 @@ class PdfService {
     // Force resync orders before exporting to get latest data
     await SupabaseService.instance.invalidateCache('recent_orders');
 
-    final List<Map<String, dynamic>> orders = await SupabaseService.instance
-        .getOrdersByDate(dateString);
+    List<Map<String, dynamic>> orders = await SupabaseService.instance
+        .getOrdersByDate(dateString, teamIds: teamIds);
+
+    final bool brandScoped = allowedBrands != null && allowedBrands.isNotEmpty;
+    if (brandScoped) {
+      orders = await _scopeOrdersToBrands(orders, allowedBrands);
+    }
 
     if (orders.isEmpty) throw 'No orders found for $formattedDate';
 
@@ -63,6 +122,14 @@ class PdfService {
                   ]
               ),
             ),
+            if (brandScoped)
+              pw.Padding(
+                padding: const pw.EdgeInsets.only(top: 6),
+                child: pw.Text(
+                  'Brand-scoped: ${allowedBrands.join(", ")}',
+                  style: pw.TextStyle(fontSize: 10, color: secondaryColor, fontStyle: pw.FontStyle.italic),
+                ),
+              ),
             pw.SizedBox(height: 20),
           ];
 
@@ -139,13 +206,21 @@ class PdfService {
   }
 
   /// Generate today's order report and return the temp file path for WhatsApp sharing.
-  static Future<String> generateOrderReportFile(DateTime date) async {
+  static Future<String> generateOrderReportFile(
+    DateTime date, {
+    List<String>? teamIds,
+    List<String>? allowedBrands,
+  }) async {
     // Force resync
     await SupabaseService.instance.invalidateCache('recent_orders');
 
     final String formattedDate = DateFormat('dd-MM-yyyy').format(date);
     final String dateString = DateFormat('yyyy-MM-dd').format(date);
-    final orders = await SupabaseService.instance.getOrdersByDate(dateString);
+    var orders = await SupabaseService.instance.getOrdersByDate(dateString, teamIds: teamIds);
+    final bool brandScoped = allowedBrands != null && allowedBrands.isNotEmpty;
+    if (brandScoped) {
+      orders = await _scopeOrdersToBrands(orders, allowedBrands);
+    }
     if (orders.isEmpty) throw 'No orders found for $formattedDate';
 
     double grandTotal = 0;
@@ -167,6 +242,14 @@ class PdfService {
                 pw.Text(formattedDate, style: const pw.TextStyle(fontSize: 16)),
               ]),
             ),
+            if (brandScoped)
+              pw.Padding(
+                padding: const pw.EdgeInsets.only(top: 6),
+                child: pw.Text(
+                  'Brand-scoped: ${allowedBrands.join(", ")}',
+                  style: pw.TextStyle(fontSize: 10, color: secondaryColor, fontStyle: pw.FontStyle.italic),
+                ),
+              ),
             pw.SizedBox(height: 20),
           ];
           for (var order in orders) {
@@ -750,6 +833,7 @@ class PdfService {
 
     // Build collection lookup: customer_id → {upi: amount, cash: amount, cheque: amount}
     final Map<String, Map<String, double>> collectionMap = {};
+    double upiGrand = 0, chequeGrand = 0, cashGrand = 0;
     debugPrint('🧾 Overlay: ${collections.length} collections to map');
     for (final c in collections) {
       debugPrint('🧾 Collection: ${c.customerName} (${c.customerId}) = ${c.amountCollected} ${c.paymentMode}');
@@ -757,10 +841,13 @@ class PdfService {
       final mode = c.paymentMode;
       if (mode == 'UPI') {
         collectionMap[c.customerId]!['UPI'] = (collectionMap[c.customerId]!['UPI'] ?? 0) + c.amountCollected;
+        upiGrand += c.amountCollected;
       } else if (mode == 'Cheque' || mode == 'CHEQUE') {
         collectionMap[c.customerId]!['Cheque'] = (collectionMap[c.customerId]!['Cheque'] ?? 0) + c.amountCollected;
+        chequeGrand += c.amountCollected;
       } else {
         collectionMap[c.customerId]!['CASH'] = (collectionMap[c.customerId]!['CASH'] ?? 0) + c.amountCollected;
+        cashGrand += c.amountCollected;
       }
     }
 
@@ -936,6 +1023,27 @@ class PdfService {
             ]));
             content.add(pw.Divider(color: PdfColors.white, thickness: 1));
           }
+
+          // Grand total overlay — aligns with the outstanding sheet's GRAND TOTAL bar.
+          // Invisible cells preserve the layout; only UPI / CHQ / CASH totals print
+          // visibly, and those columns are empty on the outstanding's Grand Total row.
+          final totalStyle = pw.TextStyle(fontSize: 9, fontWeight: pw.FontWeight.bold);
+          content.add(pw.SizedBox(height: 4));
+          content.add(pw.Container(
+            padding: const pw.EdgeInsets.all(6),
+            child: pw.Row(children: [
+              pw.SizedBox(width: 120, child: pw.Text('GRAND TOTAL', style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 10, color: PdfColors.white))),
+              pw.SizedBox(width: 52, child: pw.Text('', style: invisible)),
+              pw.SizedBox(width: 44, child: pw.Text('', style: invisible)),
+              pw.SizedBox(width: 22, child: pw.Text('', style: invisible)),
+              pw.SizedBox(width: 44, child: pw.Text('0', style: pw.TextStyle(fontSize: 9, color: PdfColors.white), textAlign: pw.TextAlign.right)),
+              pw.SizedBox(width: 38, child: pw.Text('0', style: pw.TextStyle(fontSize: 9, color: PdfColors.white), textAlign: pw.TextAlign.right)),
+              pw.SizedBox(width: 44, child: pw.Text('0', style: pw.TextStyle(fontSize: 9, color: PdfColors.white), textAlign: pw.TextAlign.right)),
+              pw.Expanded(child: pw.Text(upiGrand > 0 ? upiGrand.toStringAsFixed(0) : '', style: totalStyle, textAlign: pw.TextAlign.center)),
+              pw.Expanded(child: pw.Text(chequeGrand > 0 ? chequeGrand.toStringAsFixed(0) : '', style: totalStyle, textAlign: pw.TextAlign.center)),
+              pw.Expanded(child: pw.Text(cashGrand > 0 ? cashGrand.toStringAsFixed(0) : '', style: totalStyle, textAlign: pw.TextAlign.center)),
+            ]),
+          ));
 
           return content;
         },

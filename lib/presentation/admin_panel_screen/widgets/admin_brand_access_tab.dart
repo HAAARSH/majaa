@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
+import '../../../core/search_utils.dart';
 import '../../../services/supabase_service.dart';
 import '../../../services/auth_service.dart';
 import '../../../theme/app_theme.dart';
@@ -64,12 +65,11 @@ class _AdminBrandAccessTabState extends State<AdminBrandAccessTab> {
   }
 
   void _applySearch() {
-    final q = _searchCtrl.text.toLowerCase();
+    final q = _searchCtrl.text;
     setState(() {
-      _filtered = _salesReps.where((u) =>
-        u.fullName.toLowerCase().contains(q) ||
-        u.email.toLowerCase().contains(q),
-      ).toList();
+      _filtered = _salesReps
+          .where((u) => tokenMatch(q, [u.fullName, u.email]))
+          .toList();
     });
   }
 
@@ -322,7 +322,7 @@ class _AdminBrandAccessTabState extends State<AdminBrandAccessTab> {
                 const SizedBox(width: 8),
                 Expanded(
                   child: Text(
-                    'Tap a sales rep to control which brands/categories they can see. No restrictions = sees all brands.',
+                    'Tap a sales rep to control which brands they can see. No restrictions = sees all brands.',
                     style: GoogleFonts.manrope(fontSize: 11, color: Colors.blue.shade700),
                   ),
                 ),

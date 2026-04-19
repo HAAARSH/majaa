@@ -330,8 +330,64 @@ class _AdminSettingsTabState extends State<AdminSettingsTab> {
         ListTile(
           leading: const Icon(Icons.delete_forever_rounded, color: AppTheme.error),
           title: Text('Clear Local Cache', style: GoogleFonts.manrope(color: AppTheme.error, fontWeight: FontWeight.w600)),
-          subtitle: Text('Removes cached products, customers and categories.', style: GoogleFonts.manrope(fontSize: 11)),
+          subtitle: Text('Removes cached products, customers and brands.', style: GoogleFonts.manrope(fontSize: 11)),
           onTap: () async {
+            // #SA10 (2026-04-18 overnight): added confirmation because this
+            // action wipes 8 Hive boxes including `offline_orders`,
+            // `offline_operations`, and `cart` — which hold queued-but-
+            // unsynced orders and partial cart state. A single accidental
+            // tap previously destroyed work irreversibly.
+            final confirmed = await showDialog<bool>(
+              context: context,
+              builder: (ctx) => AlertDialog(
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                title: Text('Clear Local Cache?', style: GoogleFonts.manrope(fontWeight: FontWeight.w800)),
+                content: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'This will permanently delete:',
+                      style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.w600),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      '• Cached products, customers, brands\n'
+                      '• Queued offline orders (not yet synced)\n'
+                      '• Pending offline operations\n'
+                      '• Unsubmitted cart contents\n'
+                      '• Hero-image cache\n'
+                      '• Drive-sync failure log',
+                      style: GoogleFonts.manrope(fontSize: 12),
+                    ),
+                    const SizedBox(height: 10),
+                    Container(
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(color: Colors.red.shade50, borderRadius: BorderRadius.circular(8)),
+                      child: Row(
+                        children: [
+                          Icon(Icons.warning_rounded, color: Colors.red.shade700, size: 16),
+                          const SizedBox(width: 8),
+                          Expanded(child: Text(
+                            'Any offline order that hasn\'t reached Supabase will be lost. Make sure you are ONLINE and all syncs are green before clearing.',
+                            style: GoogleFonts.manrope(fontSize: 11, color: Colors.red.shade900, fontWeight: FontWeight.w600),
+                          )),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+                actions: [
+                  TextButton(onPressed: () => Navigator.pop(ctx, false), child: Text('Cancel', style: GoogleFonts.manrope(fontWeight: FontWeight.w600))),
+                  FilledButton(
+                    style: FilledButton.styleFrom(backgroundColor: Colors.red),
+                    onPressed: () => Navigator.pop(ctx, true),
+                    child: Text('Clear Cache', style: GoogleFonts.manrope(fontWeight: FontWeight.w800)),
+                  ),
+                ],
+              ),
+            );
+            if (confirmed != true || !mounted) return;
             try {
               // Clear ALL Hive boxes
               final boxNames = ['cache_JA', 'cache_MA', 'orders', 'offline_orders', 'offline_operations', 'cart', 'hero_cache', 'drive_sync_failures'];

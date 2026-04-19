@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 
+import './auth_service.dart';
 import './supabase_service.dart';
 
 enum ProductStatus { available, lowStock, outOfStock, discontinued }
@@ -88,14 +89,21 @@ class CartService {
   static final CartService instance = CartService._internal();
   CartService._internal();
 
-  static const _boxName = 'cart_draft';
+  // Hive box is namespaced per team so a cart built in team JA never leaks
+  // into team MA when the rep switches team mid-session.
+  String get _boxName => 'cart_draft_${AuthService.currentTeam}';
   static const _cartKey = 'items';
   static const _customerKey = 'customer';
   static const _beatKey = 'beat';
+  // Persist OOB flag alongside cart — without this, a force-close mid-order
+  // silently downgrades an out-of-beat draft to a regular order on restart.
+  static const _oobKey = 'is_out_of_beat';
 
   // ─── PERSISTENCE ───
-  Future<Box> get _box async =>
-      Hive.isBoxOpen(_boxName) ? Hive.box(_boxName) : await Hive.openBox(_boxName);
+  Future<Box> get _box async {
+    final name = _boxName;
+    return Hive.isBoxOpen(name) ? Hive.box(name) : await Hive.openBox(name);
+  }
 
   Future<void> _persistCart() async {
     try {
@@ -121,6 +129,7 @@ class CartService {
       await box.put(_cartKey, jsonEncode(items));
       if (currentCustomer != null) await box.put(_customerKey, jsonEncode(currentCustomer!.toJson()));
       if (currentBeat != null) await box.put(_beatKey, jsonEncode(currentBeat!.toJson()));
+      await box.put(_oobKey, isOutOfBeat);
     } catch (e) {
       debugPrint('⚠️ CartService._persistCart failed: $e');
     }
@@ -151,6 +160,7 @@ class CartService {
 
       if (customerStr != null) currentCustomer = CustomerModel.fromJson(Map<String, dynamic>.from(jsonDecode(customerStr)));
       if (beatStr != null) currentBeat = BeatModel.fromJson(Map<String, dynamic>.from(jsonDecode(beatStr)));
+      isOutOfBeat = box.get(_oobKey) as bool? ?? false;
       cartNotifier.value = items;
     } catch (e) {
       debugPrint('⚠️ CartService.restoreCart failed: $e');
@@ -160,7 +170,7 @@ class CartService {
   Future<void> clearPersistedCart() async {
     try {
       final box = await _box;
-      await box.deleteAll([_cartKey, _customerKey, _beatKey]);
+      await box.deleteAll([_cartKey, _customerKey, _beatKey, _oobKey]);
     } catch (_) {}
   }
 
@@ -179,23 +189,35 @@ class CartService {
   // Current Session Data
   CustomerModel? currentCustomer;
   BeatModel? currentBeat;
+  /// True when the current order was initiated from the Out-of-Beat flow.
+  /// Surfaced on the order creation header + tagged on the order row so
+  /// managers can distinguish route compliance from walk-in orders.
+  bool isOutOfBeat = false;
 
   /// When editing an existing order, this holds the original order ID.
   /// On submit, the old order is deleted and the new one uses this ID.
   /// Null means creating a new order.
   String? editingOrderId;
+  /// Beat name captured from the original order when editing — used as a
+  /// final fallback on submit so edited orders never write empty beat_name.
+  String? editingOriginalBeatName;
   /// Products that were in the original order but no longer exist in the catalog.
   List<String> editingSkippedItems = [];
 
   // ─── SESSION LOGIC ───
-  void setCustomerSession(CustomerModel customer, BeatModel? beat) {
+  void setCustomerSession(CustomerModel customer, BeatModel? beat, {bool isOutOfBeat = false}) {
     // If a NEW customer is selected, clear the cart.
     // If the SAME customer is selected again, keep the cart intact!
     if (currentCustomer?.id != customer.id) {
       cartNotifier.value = [];
       currentCustomer = customer;
       currentBeat = beat;
+      this.isOutOfBeat = isOutOfBeat;
       _persistCart();
+    } else {
+      // Update OOB even for same customer — the rep may re-enter via OOB path
+      // after cancelling a previous attempt.
+      this.isOutOfBeat = isOutOfBeat;
     }
   }
 
@@ -203,7 +225,11 @@ class CartService {
     currentCustomer = customer;
     currentBeat = beat;
     editingOrderId = order.id;
+    editingOriginalBeatName = order.beat;
     editingSkippedItems = [];
+    // Preserve OOB flag across edit — if the original was an out-of-beat order,
+    // the edited version stays tagged so manager reports stay consistent.
+    isOutOfBeat = order.isOutOfBeat;
 
     // Fetch all products to match with order items
     final allProducts = await SupabaseService.instance.getProducts();
@@ -228,12 +254,19 @@ class CartService {
   void clearCart() {
     cartNotifier.value = [];
     editingOrderId = null;
+    editingOriginalBeatName = null;
     editingSkippedItems = [];
+    isOutOfBeat = false;
     clearPersistedCart();
   }
 
   // ─── CART OPERATIONS ───
-  void addOrUpdateItem(Product product, int amount) {
+  //
+  // Each mutator awaits _persistCart so a fast kill (battery, OS) after tapping
+  // "+10" doesn't lose the last items. Callers that don't await still work —
+  // the UI is updated synchronously via cartNotifier; only durability is
+  // shifted from "eventually" to "before the Future completes".
+  Future<void> addOrUpdateItem(Product product, int amount) async {
     if (amount <= 0) return;
 
     final items = List<CartItem>.from(cartNotifier.value);
@@ -250,10 +283,10 @@ class CartService {
       items.add(CartItem(product: product, quantity: amount));
     }
     cartNotifier.value = items; // Triggers UI rebuild automatically
-    _persistCart();
+    await _persistCart();
   }
 
-  void removeItem(Product product) {
+  Future<void> removeItem(Product product) async {
     final items = List<CartItem>.from(cartNotifier.value);
     final index = items.indexWhere((item) => item.product.id == product.id);
 
@@ -264,11 +297,11 @@ class CartService {
         items.removeAt(index);
       }
       cartNotifier.value = items;
-      _persistCart();
+      await _persistCart();
     }
   }
 
-  void setItemQuantity(Product product, int quantity) {
+  Future<void> setItemQuantity(Product product, int quantity) async {
     final items = List<CartItem>.from(cartNotifier.value);
     final index = items.indexWhere((item) => item.product.id == product.id);
 
@@ -279,15 +312,15 @@ class CartService {
         items[index].quantity = quantity;
       }
       cartNotifier.value = items;
-      _persistCart();
+      await _persistCart();
     }
   }
 
-  void deleteItemEntirely(Product product) {
+  Future<void> deleteItemEntirely(Product product) async {
     final items = List<CartItem>.from(cartNotifier.value);
     items.removeWhere((item) => item.product.id == product.id);
     cartNotifier.value = items;
-    _persistCart();
+    await _persistCart();
   }
 
   int getQuantity(String productId) {

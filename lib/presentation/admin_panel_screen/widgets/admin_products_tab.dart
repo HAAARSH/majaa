@@ -7,8 +7,10 @@ import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
+import '../../../core/search_utils.dart';
 import '../../../services/supabase_service.dart';
 import '../../../theme/app_theme.dart';
+import './admin_shared_widgets.dart';
 import 'category_management_dialog.dart';
 
 class AdminProductsTab extends StatefulWidget {
@@ -32,12 +34,14 @@ class _AdminProductsTabState extends State<AdminProductsTab>
   // Subcategory state
   List<ProductSubcategoryModel> _allSubcategories = [];
 
-  // Pagination
-  int _displayLimit = 200;
-
   // Multi-select state
   bool _isSelectMode = false;
   final Set<String> _selectedIds = {};
+
+  // Team scope picker. 'All' merges JA+MA products (two calls, concat);
+  // 'JA' / 'MA' fetches a single team. Default 'All' so super_admin sees
+  // the full catalog on open instead of being silently scoped.
+  String _teamFilter = 'All';
 
   @override
   void initState() {
@@ -66,7 +70,7 @@ class _AdminProductsTabState extends State<AdminProductsTab>
       debugPrint('_loadCategories error: $e');
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed to load categories: $e'), backgroundColor: AppTheme.error),
+          SnackBar(content: Text('Failed to load brands: $e'), backgroundColor: AppTheme.error),
         );
       }
     }
@@ -90,7 +94,19 @@ class _AdminProductsTabState extends State<AdminProductsTab>
   Future<void> _loadProducts({bool forceRefresh = false}) async {
     setState(() => _isLoading = true);
     try {
-      final products = await SupabaseService.instance.getProducts(forceRefresh: forceRefresh);
+      List<ProductModel> products;
+      if (_teamFilter == 'All') {
+        // Two calls + client merge — getProducts' existing signature treats
+        // teamId=null as currentTeam fallback, so we explicitly fetch each.
+        final ja = await SupabaseService.instance.getProducts(
+          forceRefresh: forceRefresh, teamId: 'JA');
+        final ma = await SupabaseService.instance.getProducts(
+          forceRefresh: forceRefresh, teamId: 'MA');
+        products = [...ja, ...ma];
+      } else {
+        products = await SupabaseService.instance.getProducts(
+          forceRefresh: forceRefresh, teamId: _teamFilter);
+      }
       products.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
       if (mounted) {
         setState(() {
@@ -113,11 +129,10 @@ class _AdminProductsTabState extends State<AdminProductsTab>
   void _onSearch() => _applyFilters();
 
   void _applyFilters() {
-    final query = _searchController.text.toLowerCase();
+    final query = _searchController.text;
     setState(() {
-      _displayLimit = 500;
       _filtered = _products.where((p) {
-        final matchesSearch = p.name.toLowerCase().contains(query);
+        final matchesSearch = tokenMatchSingle(query, p.name);
         final matchesCat = _selectedCategory == 'All' ||
             (p.categoryName) == _selectedCategory;
         return matchesSearch && matchesCat;
@@ -307,14 +322,18 @@ class _AdminProductsTabState extends State<AdminProductsTab>
             ),
             child: Container(
               constraints: BoxConstraints(
-                maxHeight: MediaQuery.of(ctx).size.height * 0.85,
+                // Bumped 0.85 → 0.95 so the Delete Product button (added
+                // 2026-04-18) fits on-screen without the user having to
+                // scroll the sheet. 0.92 still left it half-clipped on
+                // CPH2487 (Android 16, 6.43" screen).
+                maxHeight: MediaQuery.of(ctx).size.height * 0.95,
               ),
               decoration: BoxDecoration(
                 color: Theme.of(ctx).scaffoldBackgroundColor,
                 borderRadius:
                     const BorderRadius.vertical(top: Radius.circular(24)),
               ),
-              padding: const EdgeInsets.fromLTRB(24, 12, 24, 32),
+              padding: const EdgeInsets.fromLTRB(24, 12, 24, 16),
               child: Form(
                 key: formKey,
                 child: SingleChildScrollView(
@@ -372,7 +391,7 @@ class _AdminProductsTabState extends State<AdminProductsTab>
                     DropdownButtonFormField<String>(
                       initialValue: selectedCategoryName,
                       decoration: InputDecoration(
-                        labelText: 'Category',
+                        labelText: 'Brand',
                         labelStyle: GoogleFonts.manrope(
                             fontSize: 13, color: Colors.grey.shade600),
                         prefixIcon: Icon(Icons.category_outlined,
@@ -634,6 +653,35 @@ class _AdminProductsTabState extends State<AdminProductsTab>
                               ),
                       ),
                     ),
+                    // Delete is only offered in edit mode and is intentionally
+                    // placed below Save so it takes a second, deliberate tap.
+                    // Tap closes the sheet first then opens _confirmDeleteProduct
+                    // (which has its own AlertDialog with Cancel/Delete).
+                    if (isEdit) ...[
+                      const SizedBox(height: 8),
+                      SizedBox(
+                        width: double.infinity,
+                        height: 42,
+                        child: OutlinedButton.icon(
+                          onPressed: saving
+                              ? null
+                              : () {
+                                  Navigator.pop(ctx);
+                                  _confirmDeleteProduct(existing);
+                                },
+                          icon: const Icon(Icons.delete_outline_rounded, size: 18),
+                          label: Text(
+                            'Delete Product',
+                            style: GoogleFonts.manrope(fontWeight: FontWeight.w700, fontSize: 14),
+                          ),
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: Colors.red.shade600,
+                            side: BorderSide(color: Colors.red.shade200),
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                          ),
+                        ),
+                      ),
+                    ],
                   ],
                 ),
                 ),
@@ -1120,33 +1168,69 @@ class _AdminProductsTabState extends State<AdminProductsTab>
       return const Center(child: CircularProgressIndicator());
     }
 
-    // Group ALL filtered products by category (for accurate counts)
-    final Map<String, List<ProductModel>> fullGrouped = {};
-    for (final p in _filtered) {
-      fullGrouped.putIfAbsent(p.categoryName, () => []).add(p);
-    }
-    // Paginate for rendering
-    final displayList = _filtered.length <= _displayLimit
-        ? _filtered
-        : _filtered.sublist(0, _displayLimit);
+    // Render the full filtered list — ListView.builder lazily materializes
+    // rows, so 1000+ items doesn't cost us up-front work and the user can
+    // keep scrolling without a "Showing 500 of X" cap.
     final Map<String, List<ProductModel>> grouped = {};
-    for (final p in displayList) {
+    for (final p in _filtered) {
       grouped.putIfAbsent(p.categoryName, () => []).add(p);
     }
-
-    // Build scrollable header widgets (count/actions row only)
+    // Everything except the search stays in the scrollable area (user request
+    // on 2026-04-18: "ONLY SEARCH SHOULD REMAIN ALL SHOULD SLID WITH SWIPE"):
+    // category chips → stats/actions row → category groups with cards.
     final headerWidgets = <Widget>[];
 
-    // Count + action buttons row
+    // [0] Horizontal category-filter chips (moved here from the pinned top)
+    headerWidgets.add(
+      Padding(
+        padding: const EdgeInsets.only(top: 4, bottom: 10),
+        child: SizedBox(
+          height: 34,
+          child: ListView.separated(
+            scrollDirection: Axis.horizontal,
+            itemCount: _categories.length,
+            separatorBuilder: (_, __) => const SizedBox(width: 8),
+            itemBuilder: (_, i) {
+              final cat = _categories[i];
+              final selected = _selectedCategory == cat;
+              return GestureDetector(
+                onTap: () {
+                  setState(() => _selectedCategory = cat);
+                  _applyFilters();
+                },
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 200),
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: selected
+                        ? AppTheme.primary
+                        : AppTheme.primary.withOpacity(0.08),
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Text(
+                    cat,
+                    style: GoogleFonts.manrope(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: selected ? Colors.white : AppTheme.primary,
+                    ),
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
+      ),
+    );
+
+    // [1] Count + action buttons row
     headerWidgets.add(
       Padding(
         padding: const EdgeInsets.only(bottom: 8),
         child: Row(
           children: [
             Text(
-              _displayLimit < _filtered.length
-                  ? 'Showing ${_displayLimit} of ${_filtered.length}'
-                  : '${_filtered.length} product${_filtered.length == 1 ? '' : 's'}',
+              '${_filtered.length} product${_filtered.length == 1 ? '' : 's'}',
               style: GoogleFonts.manrope(fontSize: 11, color: Colors.grey.shade500, fontWeight: FontWeight.w500),
               overflow: TextOverflow.ellipsis,
             ),
@@ -1175,7 +1259,7 @@ class _AdminProductsTabState extends State<AdminProductsTab>
                           child: Row(mainAxisSize: MainAxisSize.min, children: [
                             Icon(Icons.category_rounded, size: 13, color: AppTheme.primary),
                             const SizedBox(width: 4),
-                            Text('Categories', style: GoogleFonts.manrope(fontSize: 11, fontWeight: FontWeight.w600, color: AppTheme.primary)),
+                            Text('Brands', style: GoogleFonts.manrope(fontSize: 11, fontWeight: FontWeight.w600, color: AppTheme.primary)),
                           ]),
                         ),
                       ),
@@ -1207,85 +1291,53 @@ class _AdminProductsTabState extends State<AdminProductsTab>
       bottomNavigationBar: _isSelectMode ? _buildBulkBar() : null,
       body: Column(
         children: [
-          // ── Pinned: Search + Category filter ───────────────
+          // Team scope picker — 'All' merges JA+MA catalogs (two calls on
+          // load). Kept in the pinned area alongside search for quick access.
+          TeamFilterChips(
+            value: _teamFilter,
+            onChanged: (v) {
+              setState(() => _teamFilter = v);
+              _loadProducts(forceRefresh: true);
+            },
+          ),
+          // ── Pinned: Search only ───────────────────────────────
+          // Per user directive 2026-04-18: only the search field stays fixed
+          // at the top on scroll; category chips and everything else slide
+          // away as part of the scrollable list.
           Padding(
-            padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
-            child: Column(
-              children: [
-                TextField(
-                  controller: _searchController,
-                  style: GoogleFonts.manrope(fontSize: 14),
-                  decoration: InputDecoration(
-                    hintText: 'Search products...',
-                    hintStyle: GoogleFonts.manrope(
-                        fontSize: 13, color: Colors.grey.shade500),
-                    prefixIcon: Icon(Icons.search_rounded,
-                        color: AppTheme.primary, size: 20),
-                    suffixIcon: _searchController.text.isNotEmpty
-                        ? IconButton(
-                            icon: const Icon(Icons.close_rounded,
-                                size: 18, color: Colors.grey),
-                            onPressed: () {
-                              _searchController.clear();
-                              _applyFilters();
-                            },
-                          )
-                        : null,
-                    filled: true,
-                    fillColor: AppTheme.primary.withOpacity(0.05),
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(14),
-                      borderSide: BorderSide.none,
-                    ),
-                    contentPadding: const EdgeInsets.symmetric(
-                        horizontal: 16, vertical: 12),
-                  ),
-                ),
-                const SizedBox(height: 12),
-                SizedBox(
-                  height: 34,
-                  child: ListView.separated(
-                    scrollDirection: Axis.horizontal,
-                    itemCount: _categories.length,
-                    separatorBuilder: (_, __) => const SizedBox(width: 8),
-                    itemBuilder: (_, i) {
-                      final cat = _categories[i];
-                      final selected = _selectedCategory == cat;
-                      return GestureDetector(
-                        onTap: () {
-                          setState(() => _selectedCategory = cat);
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+            child: TextField(
+              controller: _searchController,
+              style: GoogleFonts.manrope(fontSize: 14),
+              decoration: InputDecoration(
+                hintText: 'Search products...',
+                hintStyle: GoogleFonts.manrope(
+                    fontSize: 13, color: Colors.grey.shade500),
+                prefixIcon: Icon(Icons.search_rounded,
+                    color: AppTheme.primary, size: 20),
+                suffixIcon: _searchController.text.isNotEmpty
+                    ? IconButton(
+                        icon: const Icon(Icons.close_rounded,
+                            size: 18, color: Colors.grey),
+                        onPressed: () {
+                          _searchController.clear();
                           _applyFilters();
                         },
-                        child: AnimatedContainer(
-                          duration: const Duration(milliseconds: 200),
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 14, vertical: 6),
-                          decoration: BoxDecoration(
-                            color: selected
-                                ? AppTheme.primary
-                                : AppTheme.primary.withOpacity(0.08),
-                            borderRadius: BorderRadius.circular(20),
-                          ),
-                          child: Text(
-                            cat,
-                            style: GoogleFonts.manrope(
-                              fontSize: 12,
-                              fontWeight: FontWeight.w600,
-                              color:
-                                  selected ? Colors.white : AppTheme.primary,
-                            ),
-                          ),
-                        ),
-                      );
-                    },
-                  ),
+                      )
+                    : null,
+                filled: true,
+                fillColor: AppTheme.primary.withOpacity(0.05),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(14),
+                  borderSide: BorderSide.none,
                 ),
-                const SizedBox(height: 8),
-              ],
+                contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 16, vertical: 12),
+              ),
             ),
           ),
 
-          // ── Scrollable: Everything else ─────────────────────
+          // ── Scrollable: category chips + stats + product list ─────
           Expanded(
             child: _filtered.isEmpty
                 ? Center(
@@ -1303,15 +1355,7 @@ class _AdminProductsTabState extends State<AdminProductsTab>
                       ],
                     ),
                   )
-                : NotificationListener<ScrollNotification>(
-                    onNotification: (scroll) {
-                      if (scroll.metrics.pixels > scroll.metrics.maxScrollExtent - 200 &&
-                          _displayLimit < _filtered.length) {
-                        setState(() => _displayLimit += 200);
-                      }
-                      return false;
-                    },
-                    child: RefreshIndicator(
+                : RefreshIndicator(
                     onRefresh: () => _loadProducts(forceRefresh: true),
                     color: AppTheme.primary,
                     child: ListView.builder(
@@ -1364,7 +1408,7 @@ class _AdminProductsTabState extends State<AdminProductsTab>
                                           BorderRadius.circular(20),
                                     ),
                                     child: Text(
-                                      '${fullGrouped[category]?.length ?? items.length}',
+                                      '${items.length}',
                                       style: GoogleFonts.manrope(
                                         fontSize: 11,
                                         fontWeight: FontWeight.w700,
@@ -1388,8 +1432,6 @@ class _AdminProductsTabState extends State<AdminProductsTab>
                                   isSelectMode: _isSelectMode,
                                   onEdit: () =>
                                       _openProductSheet(existing: product),
-                                  onDelete: () =>
-                                      _confirmDeleteProduct(product),
                                   onLongPress: () =>
                                       _enterSelectMode(product.id),
                                   onSelect: () =>
@@ -1400,7 +1442,6 @@ class _AdminProductsTabState extends State<AdminProductsTab>
                         );
                       },
                     ),
-                  ),
                   ),
           ),
         ],
@@ -1446,7 +1487,6 @@ class _ProductCard extends StatelessWidget {
   final bool isSelected;
   final bool isSelectMode;
   final VoidCallback onEdit;
-  final VoidCallback onDelete;
   final VoidCallback onLongPress;
   final VoidCallback onSelect;
 
@@ -1458,7 +1498,6 @@ class _ProductCard extends StatelessWidget {
     required this.isSelected,
     required this.isSelectMode,
     required this.onEdit,
-    required this.onDelete,
     required this.onLongPress,
     required this.onSelect,
   });
@@ -1525,10 +1564,11 @@ class _ProductCard extends StatelessWidget {
                     Text(
                       product.name,
                       style: GoogleFonts.manrope(
-                        fontSize: 14,
+                        fontSize: 13,
                         fontWeight: FontWeight.w700,
+                        height: 1.25,
                       ),
-                      maxLines: 1,
+                      maxLines: 2,
                       overflow: TextOverflow.ellipsis,
                     ),
                     const SizedBox(height: 4),
@@ -1574,7 +1614,11 @@ class _ProductCard extends StatelessWidget {
                   ],
                 ),
               ),
-              if (!isSelectMode) ...[
+              if (!isSelectMode)
+                // Single edit affordance — delete now lives inside the edit
+                // sheet behind a confirm dialog, per user's request on
+                // 2026-04-18: "ADD DELETE BUTTION INSIDE EDIT BUTTON WITH
+                // CINFIRMATION". Prevents mis-tap deletes on mobile.
                 IconButton(
                   onPressed: onEdit,
                   icon: const Icon(Icons.edit_rounded, size: 18),
@@ -1586,19 +1630,6 @@ class _ProductCard extends StatelessWidget {
                     ),
                   ),
                 ),
-                const SizedBox(width: 4),
-                IconButton(
-                  onPressed: onDelete,
-                  icon: const Icon(Icons.delete_outline_rounded, size: 18),
-                  color: Colors.red.shade400,
-                  style: IconButton.styleFrom(
-                    backgroundColor: Colors.red.shade50,
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                  ),
-                ),
-              ],
             ],
           ),
         ),
@@ -2038,7 +2069,7 @@ class _ManageSubcategoriesSheetState extends State<_ManageSubcategoriesSheet> {
                         child: DropdownButtonFormField<String>(
                           value: _selectedCategoryId,
                           decoration: InputDecoration(
-                            hintText: 'Category',
+                            hintText: 'Brand',
                             hintStyle: GoogleFonts.manrope(
                                 fontSize: 13, color: Colors.grey.shade400),
                             filled: true,

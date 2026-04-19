@@ -46,6 +46,7 @@ class _PinDialogWidgetState extends State<_PinDialogWidget> {
   final _ctrl2 = TextEditingController();
   String? _error;
   bool _firstVerified = false;
+  String? _firstPin; // stores first PIN for double-verify comparison
 
   @override
   void dispose() {
@@ -71,6 +72,7 @@ class _PinDialogWidgetState extends State<_PinDialogWidget> {
     if (widget.requireDouble && !_firstVerified) {
       setState(() {
         _firstVerified = true;
+        _firstPin = pin;
         _error = null;
       });
       _ctrl1.clear();
@@ -78,10 +80,8 @@ class _PinDialogWidgetState extends State<_PinDialogWidget> {
     }
 
     if (widget.requireDouble && _firstVerified) {
-      final pin2 = _ctrl1.text.trim();
-      final firstOk = await PinService.instance.verify(pin2);
-      if (!firstOk) {
-        setState(() => _error = 'PIN does not match');
+      if (pin != _firstPin) {
+        setState(() => _error = 'PINs do not match');
         _ctrl1.clear();
         return;
       }

@@ -42,9 +42,51 @@ class AppRoutes {
     adminPanelScreen: (context) => const _AdminGuard(),
     dashboardScreen: (context) => const DashboardScreen(),
     customerDetailScreen: (context) => const CustomerDetailScreen(),
-    deliveryDashboardScreen: (context) => const DeliveryDashboardScreen(),
+    deliveryDashboardScreen: (context) => const _DeliveryGuard(),
     customerDetails: (context) => const CustomerDetailScreen(),
   };
+}
+
+// Route-level guard — blocks direct navigation to /delivery_dashboard by non-delivery reps.
+class _DeliveryGuard extends StatefulWidget {
+  const _DeliveryGuard();
+  @override
+  State<_DeliveryGuard> createState() => _DeliveryGuardState();
+}
+
+class _DeliveryGuardState extends State<_DeliveryGuard> {
+  late final Future<String?> _roleFuture;
+
+  @override
+  void initState() {
+    super.initState();
+    _roleFuture = SupabaseService.instance.getUserRole();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<String?>(
+      future: _roleFuture,
+      builder: (context, snapshot) {
+        if (snapshot.connectionState != ConnectionState.done) {
+          return const Scaffold(body: Center(child: CircularProgressIndicator()));
+        }
+        const allowedRoles = ['delivery_rep', 'admin', 'super_admin'];
+        final role = snapshot.data ?? 'sales_rep';
+        if (!allowedRoles.contains(role)) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (!context.mounted) return;
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('Access denied. Delivery privileges required.'), backgroundColor: Colors.red),
+            );
+            Navigator.pushReplacementNamed(context, AppRoutes.beatSelectionScreen);
+          });
+          return const Scaffold(body: Center(child: CircularProgressIndicator()));
+        }
+        return const DeliveryDashboardScreen();
+      },
+    );
+  }
 }
 
 // Route-level guard — blocks direct navigation to /admin_panel by non-admins.

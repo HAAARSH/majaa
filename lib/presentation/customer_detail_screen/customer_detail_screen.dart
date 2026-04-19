@@ -46,6 +46,7 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
   // Dual-team support — only when navigated from merged multi-team beat view
   // AND customer actually belongs to both teams
   bool _isMergedView = false;
+  bool _isOutOfBeat = false;
   bool get _isDualTeam => _isMergedView &&
       _customer != null &&
       _customer!.belongsToTeam('JA') && _customer!.belongsToTeam('MA');
@@ -64,18 +65,26 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
     if (args is Map) {
       if (args['customer'] is CustomerModel) {
         _customer = args['customer'] as CustomerModel;
-        _loadOrders();
-        _loadCollections();
+        // Orders + Collections tabs are hidden for brand_rep — skip the
+        // fetches so we don't waste egress (and don't pull competitor line
+        // items into memory). Billing still loads for the Outstanding tab.
+        if (!_isBrandRep) {
+          _loadOrders();
+          _loadCollections();
+        }
         _loadBillingData();
       }
       if (args['beat'] is BeatModel) {
         _beat = args['beat'] as BeatModel;
       }
       _isMergedView = args['isMergedView'] as bool? ?? false;
+      _isOutOfBeat = args['isOutOfBeat'] as bool? ?? false;
     } else if (args is CustomerModel) {
       _customer = args;
-      _loadOrders();
-      _loadCollections();
+      if (!_isBrandRep) {
+        _loadOrders();
+        _loadCollections();
+      }
       _loadBillingData();
     }
   }
@@ -129,21 +138,19 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
         SupabaseService.instance.currentUserRole == 'brand_rep';
     try {
       if (_isDualTeam) {
-        // Load both teams' data for dual-team customers
-        final savedTeam = AuthService.currentTeam;
-        AuthService.currentTeam = 'JA';
+        // Load both teams' data without mutating the global AuthService.currentTeam —
+        // any concurrent read (push notification, timer, visit-log) must always
+        // see the rep's actual team, not a transient dual-team-load value.
         final jaResults = await Future.wait([
-          SupabaseService.instance.getCustomerBills(_customer!.id, repOnly: isRep),
-          SupabaseService.instance.getCustomerReceipts(_customer!.id, repOnly: isRep),
-          SupabaseService.instance.getCustomerBilledItems(_customer!.id, repOnly: isRep),
+          SupabaseService.instance.getCustomerBills(_customer!.id, repOnly: isRep, teamId: 'JA'),
+          SupabaseService.instance.getCustomerReceipts(_customer!.id, repOnly: isRep, teamId: 'JA'),
+          SupabaseService.instance.getCustomerBilledItems(_customer!.id, repOnly: isRep, teamId: 'JA'),
         ]);
-        AuthService.currentTeam = 'MA';
         final maResults = await Future.wait([
-          SupabaseService.instance.getCustomerBills(_customer!.id, repOnly: isRep),
-          SupabaseService.instance.getCustomerReceipts(_customer!.id, repOnly: isRep),
-          SupabaseService.instance.getCustomerBilledItems(_customer!.id, repOnly: isRep),
+          SupabaseService.instance.getCustomerBills(_customer!.id, repOnly: isRep, teamId: 'MA'),
+          SupabaseService.instance.getCustomerReceipts(_customer!.id, repOnly: isRep, teamId: 'MA'),
+          SupabaseService.instance.getCustomerBilledItems(_customer!.id, repOnly: isRep, teamId: 'MA'),
         ]);
-        AuthService.currentTeam = savedTeam;
         if (!mounted) return;
         setState(() {
           _outstandingBills = [...jaResults[0] as List<Map<String, dynamic>>, ...maResults[0] as List<Map<String, dynamic>>];
@@ -207,358 +214,172 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
     }
   }
 
-  void _goToNewOrder() {
-    CartService.instance.setCustomerSession(_customer!, _beat);
+  Future<void> _goToNewOrder() async {
+    // Guard against silent cart-clear when rep taps a different customer after
+    // building up a cart for someone else. Without this dialog, setCustomerSession
+    // wipes the cart with no warning — a rep who tapped the wrong row loses work.
+    final cart = CartService.instance;
+    final existing = cart.cartNotifier.value;
+    final prevCustomer = cart.currentCustomer;
+    if (existing.isNotEmpty && prevCustomer != null && prevCustomer.id != _customer!.id) {
+      final proceed = await showDialog<bool>(
+        context: context,
+        barrierDismissible: false,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Cart has items from another customer'),
+          content: Text(
+            'You have ${existing.length} item(s) in cart for ${prevCustomer.name}.\n\n'
+            'Start a new order for ${_customer!.name}? The existing cart will be cleared.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Clear & Continue'),
+            ),
+          ],
+        ),
+      );
+      if (proceed != true) return;
+    }
+    if (!mounted) return;
+    cart.setCustomerSession(_customer!, _beat, isOutOfBeat: _isOutOfBeat);
     Navigator.pushNamed(context, AppRoutes.productsScreen);
   }
 
   // ─── Payment methods ───
 
-  void _showPaymentBottomSheet({double? presetAmount, List<OrderModel>? presetOrders, String? presetBillNo}) {
-    final amountController = TextEditingController(text: presetAmount?.toStringAsFixed(2) ?? '');
-    final billNoController = TextEditingController(
-      text: presetBillNo ?? (presetOrders?.map((o) =>
-        o.finalBillNo != null && o.finalBillNo!.isNotEmpty
-            ? o.finalBillNo!
-            : o.id.split('-').last.toUpperCase()
-      ).join(', ') ?? ''),
-    );
-    String selectedMethod = 'UPI';
-
+  void _showPaymentBottomSheet({
+    double? presetAmount,
+    List<OrderModel>? presetOrders,
+    String? presetBillNo,
+  }) {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
-      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
-      builder: (ctx) => StatefulBuilder(
-        builder: (context, setModalState) {
-          return Padding(
-            padding: EdgeInsets.only(
-              bottom: MediaQuery.of(ctx).viewInsets.bottom + 20,
-              left: 20, right: 20, top: 20,
-            ),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text('Settle Payment', style: GoogleFonts.manrope(fontSize: 18, fontWeight: FontWeight.w800)),
-                const SizedBox(height: 8),
-                if (_customer != null && _customer!.outstandingForTeam(AuthService.currentTeam) > 0)
-                  Container(
-                    width: double.infinity,
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                    decoration: BoxDecoration(
-                      color: Colors.orange.shade50,
-                      borderRadius: BorderRadius.circular(10),
-                      border: Border.all(color: Colors.orange.shade200),
-                    ),
-                    child: Row(
-                      children: [
-                        Icon(Icons.account_balance_wallet_rounded, size: 16, color: Colors.orange.shade700),
-                        const SizedBox(width: 8),
-                        Text(
-                          'Outstanding: ₹${_customer!.outstandingForTeam(AuthService.currentTeam).toStringAsFixed(0)}',
-                          style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.w700, color: Colors.orange.shade800),
-                        ),
-                      ],
-                    ),
-                  ),
-                const SizedBox(height: 12),
-                Row(
-                  children: [
-                    Expanded(
-                      child: RadioListTile<String>(
-                        title: Text('UPI', style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.bold)),
-                        value: 'UPI',
-                        groupValue: selectedMethod,
-                        onChanged: (val) => setModalState(() => selectedMethod = val!),
-                        contentPadding: EdgeInsets.zero,
-                        activeColor: AppTheme.primary,
-                      ),
-                    ),
-                    Expanded(
-                      child: RadioListTile<String>(
-                        title: Text('Cash', style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.bold)),
-                        value: 'CASH',
-                        groupValue: selectedMethod,
-                        onChanged: (val) => setModalState(() => selectedMethod = val!),
-                        contentPadding: EdgeInsets.zero,
-                        activeColor: Colors.orange,
-                      ),
-                    ),
-                    Expanded(
-                      child: RadioListTile<String>(
-                        title: Text('Cheque', style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.bold)),
-                        value: 'Cheque',
-                        groupValue: selectedMethod,
-                        onChanged: (val) => setModalState(() => selectedMethod = val!),
-                        contentPadding: EdgeInsets.zero,
-                        activeColor: Colors.purple,
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: amountController,
-                  keyboardType: TextInputType.number,
-                  decoration: InputDecoration(
-                    labelText: 'Total Amount (\u20B9)',
-                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-                    prefixIcon: const Icon(Icons.currency_rupee),
-                  ),
-                ),
-                const SizedBox(height: 12),
-                // Bill number dropdown from verified orders + manual entry
-                Autocomplete<String>(
-                  optionsBuilder: (textEditingValue) {
-                    final verifiedBills = _orders
-                        .where((o) => o.status == 'Verified' || o.status == 'Invoiced' || o.status == 'Delivered')
-                        .where((o) => o.finalBillNo != null && o.finalBillNo!.isNotEmpty)
-                        .map((o) => o.finalBillNo!)
-                        .toSet()
-                        .toList();
-                    if (textEditingValue.text.isEmpty) return verifiedBills;
-                    return verifiedBills.where((b) => b.toLowerCase().contains(textEditingValue.text.toLowerCase()));
-                  },
-                  initialValue: billNoController.value,
-                  onSelected: (val) => billNoController.text = val,
-                  fieldViewBuilder: (ctx, ctrl, focusNode, onSubmit) {
-                    // Sync with our controller
-                    ctrl.text = billNoController.text;
-                    ctrl.addListener(() => billNoController.text = ctrl.text);
-                    return TextField(
-                      controller: ctrl,
-                      focusNode: focusNode,
-                      decoration: InputDecoration(
-                        labelText: 'Bill Number(s)',
-                        hintText: 'Select verified bill or type manually',
-                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
-                        prefixIcon: const Icon(Icons.receipt_outlined),
-                        suffixIcon: const Icon(Icons.arrow_drop_down),
-                      ),
-                    );
-                  },
-                ),
-                const SizedBox(height: 24),
-                SizedBox(
-                  width: double.infinity,
-                  height: 54,
-                  child: ElevatedButton(
-                    onPressed: () async {
-                      final amount = amountController.text.trim();
-                      final billNo = billNoController.text.trim();
-                      if (amount.isEmpty || billNo.isEmpty) {
-                        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Enter amount and bill number')));
-                        return;
-                      }
-                      Navigator.pop(ctx);
-                      final activeOrders = (presetOrders?.isNotEmpty == true) ? presetOrders : null;
-                      if (selectedMethod == 'UPI') {
-                        _showQrDialog(amount, billNo,
-                          onCaptured: activeOrders != null
-                              ? (driveFileId) => _processMultiPayment(orders: activeOrders, amount: double.parse(amount), method: 'UPI', driveFileId: driveFileId)
-                              : null,
-                        );
-                      } else {
-                        // Cash or Cheque — direct record, no QR
-                        if (activeOrders != null) {
-                          await _processMultiPayment(orders: activeOrders, amount: double.parse(amount), method: selectedMethod);
-                        } else {
-                          await _processPayment(billNo: billNo, amount: double.parse(amount), method: selectedMethod);
-                        }
-                      }
-                    },
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: selectedMethod == 'UPI' ? AppTheme.primary : selectedMethod == 'Cheque' ? Colors.purple : Colors.orange,
-                      foregroundColor: Colors.white,
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-                    ),
-                    child: Text(selectedMethod == 'UPI' ? 'Generate QR & Capture Proof' : 'Record ${selectedMethod} Payment'),
-                  ),
-                ),
-              ],
-            ),
-          );
+      shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      builder: (_) => _SettleSheet(
+        customer: _customer!,
+        outstanding:
+            _customer!.outstandingForTeam(AuthService.currentTeam),
+        presetOrders: presetOrders ?? const [],
+        presetBillNo: presetBillNo,
+        presetAmount: presetAmount,
+        onSubmitted: () {
+          _loadCollections();
+          _loadOrders();
+          _refreshCustomer();
         },
       ),
     );
   }
 
-  void _showQrDialog(String amount, String billNo, {Future<void> Function(String driveFileId)? onCaptured}) {
-    final teamUpi = AuthService.teamUpi.isNotEmpty ? AuthService.teamUpi : 'default@upi';
-    final teamName = AuthService.currentTeam == 'JA' ? 'JAGANNATH' : 'MADHAV';
-    final upiString = 'upi://pay?pa=$teamUpi&pn=MAJAA_$teamName&am=$amount&tn=${Uri.encodeComponent("Bill $billNo")}&cu=INR';
+  // Re-fetches the customer (+team profile) from Supabase and rebuilds the
+  // hero header. Called after a settle succeeds so the "₹X due" chip and the
+  // Settle JA/MA/Due buttons reflect the new outstanding without a pop-push.
+  Future<void> _refreshCustomer() async {
+    final id = _customer?.id;
+    if (id == null) return;
+    try {
+      final fresh = await SupabaseService.instance.getCustomerById(id);
+      if (!mounted || fresh == null) return;
+      setState(() => _customer = fresh);
+    } catch (_) {
+      // Stale outstanding isn't worth pestering the rep about.
+    }
+  }
 
-    showDialog(
+  // Lets the rep correct a wrong phone or add a missing one without leaving
+  // the customer detail screen. Writes straight to `customers.phone` via a
+  // lightweight update (full `updateCustomer` needs name/address/beat which
+  // we don't want to touch here).
+  Future<void> _showEditPhoneDialog(CustomerModel customer) async {
+    final seed = (customer.phone.isEmpty || customer.phone == 'No Phone')
+        ? ''
+        : customer.phone;
+    final controller = TextEditingController(text: seed);
+    final newPhone = await showDialog<String>(
       context: context,
-      barrierDismissible: false, // cannot dismiss by tapping outside
-      builder: (ctx) => PopScope(
-        canPop: false, // back button also blocked
-        child: AlertDialog(
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-          title: Text('Scan to Pay ₹$amount\n($teamName)', textAlign: TextAlign.center, style: GoogleFonts.manrope(fontWeight: FontWeight.w800)),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(border: Border.all(color: Colors.grey.shade200), borderRadius: BorderRadius.circular(12)),
-                child: QrImageView(data: upiString, version: QrVersions.auto, size: 200.0),
-              ),
-              const SizedBox(height: 16),
-              Text('Bills: $billNo', style: GoogleFonts.manrope(fontWeight: FontWeight.w600, fontSize: 12), textAlign: TextAlign.center),
-              const SizedBox(height: 8),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                decoration: BoxDecoration(color: Colors.red.shade50, borderRadius: BorderRadius.circular(8)),
-                child: const Text(
-                  '⚠️ You MUST capture the customer\'s payment success screen.\n'
-                  'Screenshot will be sent to WhatsApp automatically.',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(fontSize: 11, color: Colors.red, fontWeight: FontWeight.bold),
-                ),
-              ),
-            ],
-          ),
-          actions: [
-            Row(
-              children: [
-                Expanded(
-                  flex: 1,
-                  child: OutlinedButton(
-                    onPressed: () => Navigator.pop(ctx),
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: Colors.red,
-                      side: const BorderSide(color: Colors.red),
-                      padding: const EdgeInsets.symmetric(vertical: 14),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                    ),
-                    child: const Text('Cancel', style: TextStyle(fontWeight: FontWeight.w700)),
-                  ),
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  flex: 2,
-                  child: ElevatedButton.icon(
-                    onPressed: () async {
-                      Navigator.pop(ctx);
-                      await _captureProofAndProcess(billNo, double.parse(amount), onCaptured: onCaptured);
-                    },
-                    icon: const Icon(Icons.camera_alt_rounded),
-                    label: const Text('Capture Proof'),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.green,
-                      foregroundColor: Colors.white,
-                      padding: const EdgeInsets.symmetric(vertical: 14),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ],
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Text(
+          seed.isEmpty ? 'Add phone' : 'Update phone',
+          style: GoogleFonts.manrope(
+              fontSize: 15, fontWeight: FontWeight.w700),
         ),
+        content: TextField(
+          controller: controller,
+          keyboardType: TextInputType.phone,
+          maxLength: 10,
+          autofocus: true,
+          decoration: InputDecoration(
+            labelText: 'Phone',
+            prefixText: '+91 ',
+            prefixIcon: const Icon(Icons.phone_outlined),
+            border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(12)),
+            counterText: '',
+          ),
+          onSubmitted: (v) => Navigator.pop(ctx, v.trim()),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, null),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
+            child: const Text('Save'),
+          ),
+        ],
       ),
     );
-  }
-
-  Future<void> _captureProofAndProcess(String billNo, double amount, {Future<void> Function(String driveFileId)? onCaptured}) async {
-    // ── Step 1: Capture — mandatory, keep looping until user takes a photo ──
-    XFile? photo;
-    while (photo == null) {
-      final picker = ImagePicker();
-      photo = await picker.pickImage(source: ImageSource.camera, imageQuality: 80);
-      if (photo == null && mounted) {
-        // Photo is required — show warning and loop back
-        await showDialog(
-          context: context,
-          barrierDismissible: false,
-          builder: (_) => AlertDialog(
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-            title: const Text('Screenshot Required', style: TextStyle(fontWeight: FontWeight.w800)),
-            content: const Text(
-              'You must capture the customer\'s UPI payment success screen before recording this payment.',
-            ),
-            actions: [
-              FilledButton(
-                onPressed: () => Navigator.pop(context),
-                style: FilledButton.styleFrom(backgroundColor: Colors.red),
-                child: const Text('Take Photo'),
-              ),
-            ],
-          ),
-        );
-      }
+    controller.dispose();
+    if (newPhone == null) return; // cancelled
+    if (!mounted) return;
+    if (newPhone.length < 10 || !RegExp(r'^\d{10}$').hasMatch(newPhone)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Enter a valid 10-digit number.')),
+      );
+      return;
     }
+    if (newPhone == seed) return; // nothing changed
 
     try {
-      // ── Step 2: Share proof to group via share sheet ──
-      final customerName = _customer?.name ?? 'Customer';
-      final date = DateFormat('dd-MM-yyyy').format(DateTime.now());
-
-      await SharePlus.instance.share(
-        ShareParams(
-          files: [XFile(photo.path)],
-          text: 'UPI Payment Proof\n$customerName\nBill: $billNo\nAmount: ₹$amount\nDate: $date',
-        ),
+      await SupabaseService.instance.client
+          .from('customers')
+          .update({'phone': newPhone}).eq('id', customer.id);
+      if (!mounted) return;
+      setState(() {
+        _customer = customer.copyWith(phone: newPhone);
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+            content: Text('Phone updated for ${customer.name}.'),
+            backgroundColor: Colors.green),
       );
-
-      // ── Step 3: Record payment ──
-      if (onCaptured != null) {
-        await onCaptured('shared');
-      } else {
-        await _processPayment(billNo: billNo, amount: amount, method: 'UPI');
-      }
     } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e')));
-    }
-  }
-
-  Future<void> _processMultiPayment({required List<OrderModel> orders, required double amount, required String method, String? driveFileId}) async {
-    try {
-      final orderIds = orders.map((o) => o.id).toList();
-      await SupabaseService.instance.settleMultipleOrders(
-        orderIds: orderIds,
-        customerId: _customer!.id,
-        customerName: _customer!.name,
-        paymentMethod: method,
-        totalAmount: amount,
-        driveFileId: driveFileId,
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not save: $e'), backgroundColor: Colors.red),
       );
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('$method Payment of ₹$amount recorded for ${orders.length} orders!'), backgroundColor: Colors.green),
-        );
-        _loadCollections();
-        _loadOrders();
-      }
-    } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Database Error: $e'), backgroundColor: Colors.red));
-    }
-  }
-
-  Future<void> _processPayment({required String billNo, required double amount, required String method, String? driveFileId}) async {
-    try {
-      await SupabaseService.instance.recordCollection(
-        billNo: billNo,
-        customerId: _customer!.id,
-        customerName: _customer!.name,
-        amountPaid: amount,
-        remainingBalance: 0,
-        paymentMethod: method,
-        driveFileId: driveFileId,
-      );
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$method Payment of ₹$amount Recorded!'), backgroundColor: Colors.green));
-        _loadCollections();
-        _loadOrders();
-      }
-    } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Database Error: $e'), backgroundColor: Colors.red));
     }
   }
 
   void _viewPaymentPhoto(BuildContext context, String fileId) {
+    // Old records wrote the literal sentinel 'shared' when the Drive upload
+    // pipeline was removed. The Drive URL built from 'shared' resolves to
+    // an error page — bail early and tell the rep directly.
+    if (fileId.isEmpty || fileId == 'shared') {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('Proof was shared via WhatsApp — not stored in Drive.'),
+      ));
+      return;
+    }
     final imageUrl = 'https://drive.google.com/uc?export=view&id=$fileId';
     showDialog(
       context: context,
@@ -642,6 +463,8 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
             Container(
               color: AppTheme.surface,
               child: TabBar(
+                isScrollable: true,
+                tabAlignment: TabAlignment.start,
                 indicatorColor: AppTheme.primary,
                 labelColor: AppTheme.primary,
                 unselectedLabelColor: AppTheme.onSurfaceVariant,
@@ -691,17 +514,49 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
               ),
               const SizedBox(width: 14),
               Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(c.name, style: GoogleFonts.manrope(fontSize: 18, fontWeight: FontWeight.w700, color: AppTheme.onSurface), maxLines: 1, overflow: TextOverflow.ellipsis),
-                    const SizedBox(height: 2),
-                    Text(
-                      phonePresent ? c.phone : 'No Phone',
-                      style: GoogleFonts.manrope(fontSize: 13, color: phonePresent ? AppTheme.onSurfaceVariant : Colors.red),
-                    ),
-                  ],
-                ),
+                // Brand_rep is view-only on customer detail — they can still
+                // fill in a missing phone when the customer list prompts them
+                // (once-per-session dialog on tap), but they cannot proactively
+                // edit a phone that's already on file.
+                child: _isBrandRep
+                    ? Text(
+                        phonePresent ? c.phone : 'No Phone',
+                        style: GoogleFonts.manrope(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w600,
+                          color: phonePresent
+                              ? AppTheme.onSurface
+                              : Colors.red,
+                        ),
+                      )
+                    : InkWell(
+                        onTap: () => _showEditPhoneDialog(c),
+                        borderRadius: BorderRadius.circular(6),
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                phonePresent ? c.phone : 'No Phone',
+                                style: GoogleFonts.manrope(
+                                  fontSize: 15,
+                                  fontWeight: FontWeight.w600,
+                                  color: phonePresent
+                                      ? AppTheme.onSurface
+                                      : Colors.red,
+                                ),
+                              ),
+                            ),
+                            Padding(
+                              padding: const EdgeInsets.only(left: 4),
+                              child: Icon(
+                                Icons.edit_outlined,
+                                size: 14,
+                                color: AppTheme.onSurfaceVariant,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
               ),
               const SizedBox(width: 8),
               Column(
@@ -760,38 +615,41 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
               ],
               if (!_isBrandRep) ...[
                 if (_isDualTeam) ...[
-                  Expanded(
-                    child: OutlinedButton.icon(
-                      onPressed: () {
-                        AuthService.currentTeam = 'JA';
-                        _showPaymentBottomSheet();
-                      },
-                      icon: const Icon(Icons.payments_outlined, size: 15),
-                      label: Text('Settle JA', style: GoogleFonts.manrope(fontWeight: FontWeight.w600, fontSize: 12)),
-                      style: OutlinedButton.styleFrom(
-                        foregroundColor: Colors.blue,
-                        side: BorderSide(color: Colors.blue.withValues(alpha: 0.5)),
-                        padding: const EdgeInsets.symmetric(vertical: 8),
+                  if (c.outstandingForTeam('JA') > 0) ...[
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: () {
+                          AuthService.currentTeam = 'JA';
+                          _showPaymentBottomSheet();
+                        },
+                        icon: const Icon(Icons.payments_outlined, size: 15),
+                        label: Text('Settle JA', style: GoogleFonts.manrope(fontWeight: FontWeight.w600, fontSize: 12)),
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: Colors.blue,
+                          side: BorderSide(color: Colors.blue.withValues(alpha: 0.5)),
+                          padding: const EdgeInsets.symmetric(vertical: 8),
+                        ),
                       ),
                     ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: OutlinedButton.icon(
-                      onPressed: () {
-                        AuthService.currentTeam = 'MA';
-                        _showPaymentBottomSheet();
-                      },
-                      icon: const Icon(Icons.payments_outlined, size: 15),
-                      label: Text('Settle MA', style: GoogleFonts.manrope(fontWeight: FontWeight.w600, fontSize: 12)),
-                      style: OutlinedButton.styleFrom(
-                        foregroundColor: Colors.orange,
-                        side: BorderSide(color: Colors.orange.withValues(alpha: 0.5)),
-                        padding: const EdgeInsets.symmetric(vertical: 8),
+                    const SizedBox(width: 8),
+                  ],
+                  if (c.outstandingForTeam('MA') > 0)
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: () {
+                          AuthService.currentTeam = 'MA';
+                          _showPaymentBottomSheet();
+                        },
+                        icon: const Icon(Icons.payments_outlined, size: 15),
+                        label: Text('Settle MA', style: GoogleFonts.manrope(fontWeight: FontWeight.w600, fontSize: 12)),
+                        style: OutlinedButton.styleFrom(
+                          foregroundColor: Colors.orange,
+                          side: BorderSide(color: Colors.orange.withValues(alpha: 0.5)),
+                          padding: const EdgeInsets.symmetric(vertical: 8),
+                        ),
                       ),
                     ),
-                  ),
-                ] else
+                ] else if (balance > 0)
                   Expanded(
                     flex: phonePresent ? 1 : 3,
                     child: OutlinedButton.icon(
@@ -1368,7 +1226,10 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
                             color: isApp ? Colors.blue : Colors.teal),
                       ),
                     ),
-                    if (isApp && c['drive_id'] != null)
+                    if (isApp &&
+                        c['drive_id'] != null &&
+                        c['drive_id'] != 'shared' &&
+                        (c['drive_id'] as String).isNotEmpty)
                       IconButton(
                         icon: Icon(Icons.camera_alt_outlined, color: AppTheme.primary, size: 18),
                         onPressed: () => _viewPaymentPhoto(context, c['drive_id']),
@@ -2026,6 +1887,795 @@ class _BilledItemsDiffState extends State<_BilledItemsDiff> {
         Expanded(child: Text(name, style: GoogleFonts.manrope(fontSize: 11, fontWeight: FontWeight.w600), maxLines: 1, overflow: TextOverflow.ellipsis)),
         Text(message, style: GoogleFonts.manrope(fontSize: 10, fontWeight: FontWeight.w600, color: color)),
       ]),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SETTLE SHEET — the rep's one-stop flow to take money against a customer's
+// outstanding. Supports UPI / Cash / Cheque, a single bill or a split across
+// many bills, and for cheques an optional photo that Gemini OCR turns into
+// prefilled cheque-number / bank / date fields. Every rupee written to the
+// DB flows through [SupabaseService.settleOrderBills] so the customer's
+// team outstanding is decremented (never blindly zeroed) and only orders
+// fully covered by their allocation flip to 'Paid'.
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum _SettleMethod { upi, cash, cheque }
+
+extension on _SettleMethod {
+  String get label {
+    switch (this) {
+      case _SettleMethod.upi:
+        return 'UPI';
+      case _SettleMethod.cash:
+        return 'Cash';
+      case _SettleMethod.cheque:
+        return 'Cheque';
+    }
+  }
+
+  Color get color {
+    switch (this) {
+      case _SettleMethod.upi:
+        return AppTheme.primary;
+      case _SettleMethod.cash:
+        return Colors.orange;
+      case _SettleMethod.cheque:
+        return Colors.purple;
+    }
+  }
+}
+
+/// Parse an amount string the rep actually types — strips currency symbols,
+/// commas, whitespace. Returns null if the result isn't a positive number.
+double? _parseRupees(String raw) {
+  final cleaned = raw.replaceAll(RegExp(r'[₹,\s]'), '');
+  if (cleaned.isEmpty) return null;
+  final v = double.tryParse(cleaned);
+  if (v == null || v <= 0) return null;
+  return v;
+}
+
+class _SettleSheet extends StatefulWidget {
+  final CustomerModel customer;
+  final double outstanding;
+  final List<OrderModel> presetOrders;
+  final String? presetBillNo;
+  final double? presetAmount;
+  final VoidCallback onSubmitted;
+
+  const _SettleSheet({
+    required this.customer,
+    required this.outstanding,
+    required this.presetOrders,
+    this.presetBillNo,
+    this.presetAmount,
+    required this.onSubmitted,
+  });
+
+  @override
+  State<_SettleSheet> createState() => _SettleSheetState();
+}
+
+class _SettleSheetState extends State<_SettleSheet> {
+  _SettleMethod _method = _SettleMethod.upi;
+
+  final _totalCtrl = TextEditingController();
+  final _billNoCtrl = TextEditingController();
+
+  // Per-bill amount controllers when splitting multi-select.
+  late final Map<String, TextEditingController> _perBillCtrls;
+  bool _split = false;
+
+  // Cheque fields — all optional.
+  final _chequeNoCtrl = TextEditingController();
+  final _chequeBankCtrl = TextEditingController();
+  DateTime? _chequeDate;
+  String? _chequePhotoPath;
+  bool _chequeOcrRunning = false;
+
+  bool _submitting = false;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.presetAmount != null) {
+      _totalCtrl.text = widget.presetAmount!.toStringAsFixed(0);
+    }
+    if (widget.presetBillNo != null) {
+      _billNoCtrl.text = widget.presetBillNo!;
+    } else if (widget.presetOrders.isNotEmpty) {
+      _billNoCtrl.text = widget.presetOrders.map(_billLabelForOrder).join(', ');
+    }
+    _perBillCtrls = {
+      for (final o in widget.presetOrders) o.id: TextEditingController()
+    };
+    if (widget.presetOrders.length > 1) {
+      _split = false; // default: single pot, auto-distributed
+    }
+  }
+
+  @override
+  void dispose() {
+    _totalCtrl.dispose();
+    _billNoCtrl.dispose();
+    _chequeNoCtrl.dispose();
+    _chequeBankCtrl.dispose();
+    for (final c in _perBillCtrls.values) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  String _billLabelForOrder(OrderModel o) =>
+      (o.finalBillNo != null && o.finalBillNo!.isNotEmpty)
+          ? o.finalBillNo!
+          : o.id.split('-').last.toUpperCase();
+
+  double _orderOutstanding(OrderModel o) {
+    // Rep-visible outstanding for a single order is its grand_total unless we
+    // have a better per-order figure; the customer's aggregate is trusted
+    // elsewhere. Grand total is a safe upper bound for "how much this bill
+    // owes" from the rep's POV.
+    return o.grandTotal;
+  }
+
+  void _snack(String msg, {Color? color}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(msg), backgroundColor: color),
+    );
+  }
+
+  Future<void> _pickChequePhoto() async {
+    final picker = ImagePicker();
+    final photo = await picker.pickImage(
+        source: ImageSource.camera, imageQuality: 80);
+    if (photo == null) return;
+    setState(() {
+      _chequePhotoPath = photo.path;
+      _chequeOcrRunning = true;
+    });
+    try {
+      final ocr = await GeminiOcrService.extractChequeData(photo.path);
+      if (!mounted) return;
+      setState(() {
+        _chequeOcrRunning = false;
+        if (ocr.chequeNo != null && _chequeNoCtrl.text.isEmpty) {
+          _chequeNoCtrl.text = ocr.chequeNo!;
+        }
+        if (ocr.bank != null && _chequeBankCtrl.text.isEmpty) {
+          _chequeBankCtrl.text = ocr.bank!;
+        }
+        if (ocr.date != null && _chequeDate == null) {
+          final parsed = _tryParseDate(ocr.date!);
+          if (parsed != null) _chequeDate = parsed;
+        }
+        if (ocr.amount != null && _totalCtrl.text.isEmpty) {
+          final amt = _parseRupees(ocr.amount!);
+          if (amt != null) _totalCtrl.text = amt.toStringAsFixed(0);
+        }
+      });
+    } catch (_) {
+      if (mounted) setState(() => _chequeOcrRunning = false);
+    }
+  }
+
+  DateTime? _tryParseDate(String raw) {
+    final cleaned = raw.trim();
+    for (final fmt in ['dd/MM/yyyy', 'dd-MM-yyyy', 'yyyy-MM-dd', 'dd MMM yyyy']) {
+      try {
+        return DateFormat(fmt).parseStrict(cleaned);
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  Future<void> _pickChequeDate() async {
+    final now = DateTime.now();
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: _chequeDate ?? now,
+      firstDate: DateTime(now.year - 1),
+      lastDate: DateTime(now.year + 1),
+    );
+    if (picked != null) setState(() => _chequeDate = picked);
+  }
+
+  List<BillAllocation>? _buildAllocations() {
+    // Split across multiple bills — per-bill inputs.
+    if (widget.presetOrders.length > 1 && _split) {
+      final allocs = <BillAllocation>[];
+      for (final o in widget.presetOrders) {
+        final raw = _perBillCtrls[o.id]!.text.trim();
+        if (raw.isEmpty) continue;
+        final amt = _parseRupees(raw);
+        if (amt == null) {
+          _snack('Bill ${_billLabelForOrder(o)}: enter a valid amount.',
+              color: Colors.red);
+          return null;
+        }
+        if (amt > _orderOutstanding(o) + 0.01) {
+          _snack(
+              'Bill ${_billLabelForOrder(o)}: ₹${amt.toStringAsFixed(0)} exceeds its outstanding ₹${_orderOutstanding(o).toStringAsFixed(0)}.',
+              color: Colors.red);
+          return null;
+        }
+        allocs.add(BillAllocation(
+          billNo: _billLabelForOrder(o),
+          orderId: o.id,
+          amount: amt,
+          orderOutstanding: _orderOutstanding(o),
+        ));
+      }
+      if (allocs.isEmpty) {
+        _snack('Enter an amount against at least one bill.',
+            color: Colors.red);
+        return null;
+      }
+      return allocs;
+    }
+
+    // Single pot — one total spread across bills (or a single bill).
+    final total = _parseRupees(_totalCtrl.text);
+    if (total == null) {
+      _snack('Enter a valid amount.', color: Colors.red);
+      return null;
+    }
+    if (total > widget.outstanding + 0.01) {
+      _snack(
+          'Amount ₹${total.toStringAsFixed(0)} exceeds outstanding ₹${widget.outstanding.toStringAsFixed(0)}.',
+          color: Colors.red);
+      return null;
+    }
+    if (widget.presetOrders.isEmpty) {
+      // Single free-form bill — rep typed the bill number.
+      final bill = _billNoCtrl.text.trim();
+      if (bill.isEmpty) {
+        _snack('Enter the bill number.', color: Colors.red);
+        return null;
+      }
+      return [
+        BillAllocation(
+          billNo: bill,
+          amount: total,
+          orderOutstanding: widget.outstanding,
+        ),
+      ];
+    }
+    // Multi-select, not split — distribute FIFO oldest first until the pot
+    // is empty.
+    final orders = List<OrderModel>.from(widget.presetOrders)
+      ..sort((a, b) => a.orderDate.compareTo(b.orderDate));
+    double remaining = total;
+    final allocs = <BillAllocation>[];
+    for (final o in orders) {
+      if (remaining <= 0) break;
+      final due = _orderOutstanding(o);
+      final take = remaining >= due ? due : remaining;
+      allocs.add(BillAllocation(
+        billNo: _billLabelForOrder(o),
+        orderId: o.id,
+        amount: take,
+        orderOutstanding: due,
+      ));
+      remaining -= take;
+    }
+    if (remaining > 0.01 && allocs.isNotEmpty) {
+      // Leftover after covering every bill — attach to the last allocation
+      // as overpayment rather than drop it.
+      final last = allocs.removeLast();
+      allocs.add(BillAllocation(
+        billNo: last.billNo,
+        orderId: last.orderId,
+        amount: last.amount + remaining,
+        orderOutstanding: last.orderOutstanding,
+      ));
+    }
+    return allocs;
+  }
+
+  Future<void> _submit() async {
+    if (_submitting) return;
+    final allocations = _buildAllocations();
+    if (allocations == null) return;
+
+    if (_method == _SettleMethod.upi) {
+      await _handleUpiFlow(allocations);
+    } else {
+      await _recordAndClose(allocations);
+    }
+  }
+
+  Future<void> _handleUpiFlow(List<BillAllocation> allocations) async {
+    final total = allocations.fold<double>(0, (s, a) => s + a.amount);
+    final billsLabel = allocations.map((a) => a.billNo).join(', ');
+    // Show QR, require mandatory proof capture, then record.
+    final proceed = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => _UpiQrDialog(
+        totalAmount: total,
+        billsLabel: billsLabel,
+      ),
+    );
+    if (proceed != true) return; // cancelled
+
+    // Mandatory proof capture loop.
+    XFile? photo;
+    final picker = ImagePicker();
+    while (photo == null) {
+      photo = await picker.pickImage(
+          source: ImageSource.camera, imageQuality: 80);
+      if (photo == null && mounted) {
+        await showDialog(
+          context: context,
+          barrierDismissible: false,
+          builder: (_) => AlertDialog(
+            shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(16)),
+            title: const Text('Screenshot Required',
+                style: TextStyle(fontWeight: FontWeight.w800)),
+            content: const Text(
+              'Capture the customer\'s UPI payment success screen before recording this payment.',
+            ),
+            actions: [
+              FilledButton(
+                onPressed: () => Navigator.pop(context),
+                style: FilledButton.styleFrom(backgroundColor: Colors.red),
+                child: const Text('Take Photo'),
+              ),
+            ],
+          ),
+        );
+      }
+    }
+
+    try {
+      await SharePlus.instance.share(
+        ShareParams(
+          files: [XFile(photo.path)],
+          text:
+              'UPI Payment Proof\n${widget.customer.name}\nBills: $billsLabel\n'
+              'Amount: ₹${total.toStringAsFixed(0)}\n'
+              'Date: ${DateFormat('dd-MM-yyyy').format(DateTime.now())}',
+        ),
+      );
+    } catch (_) {
+      // Share failure shouldn't block the settle record — proof is in the gallery.
+    }
+
+    await _recordAndClose(allocations, proofPath: photo.path);
+  }
+
+  Future<void> _recordAndClose(
+    List<BillAllocation> allocations, {
+    String? proofPath,
+  }) async {
+    setState(() => _submitting = true);
+    try {
+      await SupabaseService.instance.settleOrderBills(
+        allocations: allocations,
+        customerId: widget.customer.id,
+        customerName: widget.customer.name,
+        paymentMethod: _method.label,
+        chequeNo: _method == _SettleMethod.cheque ? _chequeNoCtrl.text.trim() : null,
+        chequeBank:
+            _method == _SettleMethod.cheque ? _chequeBankCtrl.text.trim() : null,
+        chequeDate: _method == _SettleMethod.cheque ? _chequeDate : null,
+        // Cheque photo / UPI proof are on the device for now — upload
+        // pipelines already handle screenshots via SharePlus share. Leave
+        // the Drive column blank to stop the old `"shared"` sentinel from
+        // being written.
+      );
+      final total = allocations.fold<double>(0, (s, a) => s + a.amount);
+      if (mounted) {
+        Navigator.pop(context); // close the sheet
+        _snackParent(
+            '${_method.label} payment of ₹${total.toStringAsFixed(0)} recorded.',
+            color: Colors.green);
+        widget.onSubmitted();
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _submitting = false);
+        _snack('Could not save: $e', color: Colors.red);
+      }
+    }
+  }
+
+  void _snackParent(String msg, {Color? color}) {
+    final parent = ScaffoldMessenger.maybeOf(context);
+    parent?.showSnackBar(
+      SnackBar(content: Text(msg), backgroundColor: color),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: EdgeInsets.only(
+        bottom: MediaQuery.of(context).viewInsets.bottom + 20,
+        left: 20,
+        right: 20,
+        top: 20,
+      ),
+      child: SingleChildScrollView(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text('Settle Payment',
+                style: GoogleFonts.manrope(
+                    fontSize: 18, fontWeight: FontWeight.w800)),
+            const SizedBox(height: 8),
+            Container(
+              width: double.infinity,
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: Colors.orange.shade50,
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: Colors.orange.shade200),
+              ),
+              child: Row(children: [
+                Icon(Icons.account_balance_wallet_rounded,
+                    size: 16, color: Colors.orange.shade700),
+                const SizedBox(width: 8),
+                Text(
+                  'Outstanding: ₹${widget.outstanding.toStringAsFixed(0)}',
+                  style: GoogleFonts.manrope(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w700,
+                      color: Colors.orange.shade800),
+                ),
+              ]),
+            ),
+            const SizedBox(height: 12),
+            // Method radio row
+            Row(
+              children: _SettleMethod.values.map((m) {
+                return Expanded(
+                  child: RadioListTile<_SettleMethod>(
+                    title: Text(m.label,
+                        style: GoogleFonts.manrope(
+                            fontSize: 13, fontWeight: FontWeight.bold)),
+                    value: m,
+                    groupValue: _method,
+                    onChanged: (v) => setState(() => _method = v!),
+                    contentPadding: EdgeInsets.zero,
+                    activeColor: m.color,
+                  ),
+                );
+              }).toList(),
+            ),
+            const SizedBox(height: 6),
+            if (widget.presetOrders.length > 1) ...[
+              SwitchListTile(
+                value: _split,
+                onChanged: (v) => setState(() => _split = v),
+                title: Text('Split across bills',
+                    style: GoogleFonts.manrope(
+                        fontSize: 13, fontWeight: FontWeight.w700)),
+                subtitle: Text(
+                  _split
+                      ? 'Type an amount next to each bill.'
+                      : 'Enter one total — the app will cover bills oldest-first.',
+                  style: GoogleFonts.manrope(
+                      fontSize: 11, color: AppTheme.onSurfaceVariant),
+                ),
+                contentPadding: EdgeInsets.zero,
+              ),
+              const SizedBox(height: 6),
+              if (_split)
+                ...widget.presetOrders.map((o) {
+                  return Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 4),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(_billLabelForOrder(o),
+                                  style: GoogleFonts.manrope(
+                                      fontSize: 13,
+                                      fontWeight: FontWeight.w700)),
+                              Text(
+                                'Bill ₹${_orderOutstanding(o).toStringAsFixed(0)}',
+                                style: GoogleFonts.manrope(
+                                    fontSize: 11,
+                                    color: AppTheme.onSurfaceVariant),
+                              ),
+                            ],
+                          ),
+                        ),
+                        SizedBox(
+                          width: 120,
+                          child: TextField(
+                            controller: _perBillCtrls[o.id],
+                            keyboardType: TextInputType.number,
+                            decoration: InputDecoration(
+                              isDense: true,
+                              prefixText: '₹ ',
+                              hintText: '0',
+                              border: OutlineInputBorder(
+                                  borderRadius: BorderRadius.circular(10)),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                }),
+            ],
+            if (widget.presetOrders.length <= 1 || !_split) ...[
+              TextField(
+                controller: _totalCtrl,
+                keyboardType: TextInputType.number,
+                decoration: InputDecoration(
+                  labelText: 'Amount (₹)',
+                  hintText:
+                      'Up to ${widget.outstanding.toStringAsFixed(0)}',
+                  prefixIcon: const Icon(Icons.currency_rupee),
+                  border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(12)),
+                ),
+              ),
+              const SizedBox(height: 12),
+              if (widget.presetOrders.isEmpty)
+                TextField(
+                  controller: _billNoCtrl,
+                  decoration: InputDecoration(
+                    labelText: 'Bill Number',
+                    hintText: 'Bill being paid against',
+                    prefixIcon: const Icon(Icons.receipt_outlined),
+                    border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12)),
+                  ),
+                )
+              else
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 12, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: AppTheme.surfaceVariant,
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: Text(
+                    'Bills: ${widget.presetOrders.map(_billLabelForOrder).join(', ')}',
+                    style: GoogleFonts.manrope(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                        color: AppTheme.onSurfaceVariant),
+                  ),
+                ),
+            ],
+            if (_method == _SettleMethod.cheque) ...[
+              const SizedBox(height: 16),
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: Colors.purple.shade50,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.purple.shade200),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Icon(Icons.description_outlined,
+                            size: 16, color: Colors.purple.shade700),
+                        const SizedBox(width: 6),
+                        Text('Cheque details (optional)',
+                            style: GoogleFonts.manrope(
+                                fontSize: 12,
+                                fontWeight: FontWeight.w700,
+                                color: Colors.purple.shade800)),
+                        const Spacer(),
+                        TextButton.icon(
+                          onPressed: _chequeOcrRunning ? null : _pickChequePhoto,
+                          icon: _chequeOcrRunning
+                              ? const SizedBox(
+                                  width: 14,
+                                  height: 14,
+                                  child: CircularProgressIndicator(strokeWidth: 2))
+                              : const Icon(Icons.camera_alt_rounded, size: 16),
+                          label: Text(
+                              _chequePhotoPath == null
+                                  ? 'Capture & auto-fill'
+                                  : 'Recapture',
+                              style: GoogleFonts.manrope(fontSize: 11)),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: _chequeNoCtrl,
+                      keyboardType: TextInputType.number,
+                      decoration: InputDecoration(
+                        isDense: true,
+                        labelText: 'Cheque number',
+                        border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(10)),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: _chequeBankCtrl,
+                      decoration: InputDecoration(
+                        isDense: true,
+                        labelText: 'Bank',
+                        border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(10)),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    InkWell(
+                      onTap: _pickChequeDate,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 12, vertical: 12),
+                        decoration: BoxDecoration(
+                          border: Border.all(color: AppTheme.outlineVariant),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Row(children: [
+                          const Icon(Icons.calendar_today_rounded, size: 16),
+                          const SizedBox(width: 8),
+                          Text(
+                            _chequeDate == null
+                                ? 'Cheque date'
+                                : DateFormat('dd MMM yyyy').format(_chequeDate!),
+                            style: GoogleFonts.manrope(fontSize: 13),
+                          ),
+                        ]),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+            const SizedBox(height: 20),
+            SizedBox(
+              width: double.infinity,
+              height: 54,
+              child: ElevatedButton(
+                onPressed: _submitting ? null : _submit,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: _method.color,
+                  foregroundColor: Colors.white,
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14)),
+                ),
+                child: _submitting
+                    ? const SizedBox(
+                        width: 22,
+                        height: 22,
+                        child: CircularProgressIndicator(
+                            color: Colors.white, strokeWidth: 2.5),
+                      )
+                    : Text(
+                        _method == _SettleMethod.upi
+                            ? 'Generate QR & Capture Proof'
+                            : 'Record ${_method.label} Payment',
+                        style: GoogleFonts.manrope(
+                            fontSize: 14, fontWeight: FontWeight.w700),
+                      ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _UpiQrDialog extends StatelessWidget {
+  final double totalAmount;
+  final String billsLabel;
+
+  const _UpiQrDialog({
+    required this.totalAmount,
+    required this.billsLabel,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final teamUpi = AuthService.teamUpi.isNotEmpty
+        ? AuthService.teamUpi
+        : 'default@upi';
+    final teamName =
+        AuthService.currentTeam == 'JA' ? 'JAGANNATH' : 'MADHAV';
+    final upiString =
+        'upi://pay?pa=$teamUpi&pn=MAJAA_$teamName&am=${totalAmount.toStringAsFixed(2)}&tn=${Uri.encodeComponent("Bills $billsLabel")}&cu=INR';
+
+    return PopScope(
+      canPop: false,
+      child: AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: Text(
+          'Scan to Pay ₹${totalAmount.toStringAsFixed(0)}\n($teamName)',
+          textAlign: TextAlign.center,
+          style: GoogleFonts.manrope(fontWeight: FontWeight.w800),
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                  border: Border.all(color: Colors.grey.shade200),
+                  borderRadius: BorderRadius.circular(12)),
+              child: QrImageView(
+                  data: upiString,
+                  version: QrVersions.auto,
+                  size: 200.0),
+            ),
+            const SizedBox(height: 16),
+            Text('Bills: $billsLabel',
+                style: GoogleFonts.manrope(
+                    fontWeight: FontWeight.w600, fontSize: 12),
+                textAlign: TextAlign.center),
+            const SizedBox(height: 8),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              decoration: BoxDecoration(
+                  color: Colors.red.shade50,
+                  borderRadius: BorderRadius.circular(8)),
+              child: const Text(
+                '⚠️ You MUST capture the customer\'s payment success screen.\n'
+                'Screenshot will be sent to WhatsApp automatically.',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                    fontSize: 11,
+                    color: Colors.red,
+                    fontWeight: FontWeight.bold),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          Row(
+            children: [
+              Expanded(
+                flex: 1,
+                child: OutlinedButton(
+                  onPressed: () => Navigator.pop(context, false),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.red,
+                    side: const BorderSide(color: Colors.red),
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12)),
+                  ),
+                  child: const Text('Cancel',
+                      style: TextStyle(fontWeight: FontWeight.w700)),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                flex: 2,
+                child: ElevatedButton.icon(
+                  onPressed: () => Navigator.pop(context, true),
+                  icon: const Icon(Icons.camera_alt_rounded),
+                  label: const Text('Capture Proof'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.green,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12)),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
     );
   }
 }

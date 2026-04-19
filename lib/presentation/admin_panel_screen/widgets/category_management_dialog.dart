@@ -55,7 +55,7 @@ class _CategoryManagementDialogState extends State<CategoryManagementDialog> {
       builder: (ctx) => AlertDialog(
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
         title: Text(
-          'Add Category',
+          'Add Brand',
           style: GoogleFonts.manrope(fontWeight: FontWeight.w700),
         ),
         content: TextField(
@@ -63,7 +63,7 @@ class _CategoryManagementDialogState extends State<CategoryManagementDialog> {
           autofocus: true,
           style: GoogleFonts.manrope(fontSize: 13),
           decoration: InputDecoration(
-            labelText: 'Category Name',
+            labelText: 'Brand Name',
             border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
             contentPadding: const EdgeInsets.symmetric(
               horizontal: 12,
@@ -130,7 +130,7 @@ class _CategoryManagementDialogState extends State<CategoryManagementDialog> {
             borderRadius: BorderRadius.circular(14),
           ),
           title: Text(
-            'Edit Category',
+            'Edit Brand',
             style: GoogleFonts.manrope(fontWeight: FontWeight.w700),
           ),
           content: Column(
@@ -140,7 +140,7 @@ class _CategoryManagementDialogState extends State<CategoryManagementDialog> {
                 controller: nameCtrl,
                 style: GoogleFonts.manrope(fontSize: 13),
                 decoration: InputDecoration(
-                  labelText: 'Category Name',
+                  labelText: 'Brand Name',
                   border: OutlineInputBorder(
                     borderRadius: BorderRadius.circular(10),
                   ),
@@ -218,8 +218,8 @@ class _CategoryManagementDialogState extends State<CategoryManagementDialog> {
   Future<void> _deleteCategory(ProductCategoryModel cat) async {
     final pinOk = await showPinDialog(
       context,
-      title: 'Delete Category',
-      warningMessage: 'This will delete category "${cat.name}" and all its subcategories. Products will become uncategorized.',
+      title: 'Delete Brand',
+      warningMessage: 'This will delete brand "${cat.name}" and all its subcategories. Products will become unlinked.',
     );
     if (!pinOk || !mounted) return;
 
@@ -241,13 +241,13 @@ class _CategoryManagementDialogState extends State<CategoryManagementDialog> {
 
   Future<void> _bulkDeleteCategories() async {
     final count = _selectedIds.length;
-    final warning = 'WARNING: This will permanently delete $count category(ies) and ALL associated data:\n\n'
-        '• All subcategories under these categories\n'
-        '• ALL products in these categories\n'
+    final warning = 'WARNING: This will permanently delete $count brand(s) and ALL associated data:\n\n'
+        '• All subcategories under these brands\n'
+        '• ALL products in these brands\n'
         '• All billed items linked to these products\n\n'
         'This action CANNOT be undone.';
 
-    final pinOk = await showPinDialog(context, title: 'Delete $count Category(ies)', warningMessage: warning, requireDouble: true);
+    final pinOk = await showPinDialog(context, title: 'Delete $count Brand(s)', warningMessage: warning, requireDouble: true);
     if (!pinOk || !mounted) return;
 
     setState(() => _isSaving = true);
@@ -271,7 +271,7 @@ class _CategoryManagementDialogState extends State<CategoryManagementDialog> {
       final updated = await SupabaseService.instance.getAllProductCategories();
       setState(() { _cats = updated; _isSaving = false; });
       widget.onChanged();
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Deleted $count categories'), backgroundColor: Colors.red));
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Deleted $count brands'), backgroundColor: Colors.red));
     } catch (e) {
       setState(() => _isSaving = false);
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e'), backgroundColor: AppTheme.error));
@@ -286,7 +286,7 @@ class _CategoryManagementDialogState extends State<CategoryManagementDialog> {
         children: [
           Expanded(
             child: Text(
-              'Manage Categories',
+              'Manage Brands',
               style: GoogleFonts.manrope(fontWeight: FontWeight.w700),
             ),
           ),
@@ -298,7 +298,7 @@ class _CategoryManagementDialogState extends State<CategoryManagementDialog> {
             ),
           IconButton(
             icon: const Icon(Icons.add_circle_rounded, color: AppTheme.primary),
-            tooltip: 'Add Category',
+            tooltip: 'Add Brand',
             onPressed: _addCategory,
           ),
         ],
@@ -310,7 +310,7 @@ class _CategoryManagementDialogState extends State<CategoryManagementDialog> {
             : _cats.isEmpty
                 ? Center(
                     child: Text(
-                      'No categories yet',
+                      'No brands yet',
                       style:
                           GoogleFonts.manrope(color: AppTheme.onSurfaceVariant),
                     ),

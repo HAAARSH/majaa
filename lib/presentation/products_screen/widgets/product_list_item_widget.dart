@@ -23,6 +23,74 @@ class ProductListItemWidget extends StatelessWidget {
       product.status != ProductStatus.outOfStock &&
       product.status != ProductStatus.discontinued;
 
+  Future<void> _promptQuantity(BuildContext context, int current) async {
+    final controller = TextEditingController(text: current.toString());
+    final result = await showDialog<int>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setLocal) {
+          String? errorText;
+          // Reject empty / zero / negative so an accidentally cleared field
+          // doesn't silently delete the line item. Reps who want to remove
+          // use the decrement or trash affordance.
+          void attemptSet() {
+            final parsed = int.tryParse(controller.text.trim());
+            if (parsed == null || parsed < 1) {
+              setLocal(() => errorText = 'Enter a quantity of 1 or more');
+              return;
+            }
+            if (product.stepSize > 1 && parsed % product.stepSize != 0) {
+              setLocal(() => errorText = 'Must be a multiple of ${product.stepSize} (pack size)');
+              return;
+            }
+            Navigator.of(ctx).pop(parsed);
+          }
+          return AlertDialog(
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+            title: Text(
+              product.name,
+              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+            content: TextField(
+              controller: controller,
+              keyboardType: TextInputType.number,
+              autofocus: true,
+              inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+              decoration: InputDecoration(
+                labelText: 'Quantity',
+                helperText: product.stepSize > 1
+                    ? 'Pack size: ${product.stepSize} ${product.unit}'
+                    : null,
+                errorText: errorText,
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+              ),
+              onChanged: (_) {
+                if (errorText != null) setLocal(() => errorText = null);
+              },
+              onSubmitted: (_) => attemptSet(),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(ctx).pop(null),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: attemptSet,
+                child: const Text('Set'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+    controller.dispose();
+    if (result == null) return;
+    HapticFeedback.lightImpact();
+    CartService.instance.setItemQuantity(product, result);
+  }
+
   @override
   Widget build(BuildContext context) {
     return ValueListenableBuilder<List<CartItem>>(
@@ -36,16 +104,12 @@ class ProductListItemWidget extends StatelessWidget {
 
   Widget _buildCard(BuildContext context, int cartQuantity) {
     final isInCart = cartQuantity > 0;
-    final stockColor = product.stockQty > 50
-        ? AppTheme.statusAvailable
-        : product.stockQty > 0
-            ? AppTheme.warning
-            : AppTheme.error;
-    final stockBgColor = product.stockQty > 50
-        ? AppTheme.statusAvailableContainer
-        : product.stockQty > 0
-            ? AppTheme.warningContainer
-            : AppTheme.errorContainer;
+    // Show the raw stock number and only flag zero-stock in red. Arbitrary
+    // 50-unit thresholds made reps shy away from items that were actually
+    // well-stocked for the SKU's typical velocity.
+    final isOut = product.stockQty <= 0;
+    final stockColor = isOut ? AppTheme.error : AppTheme.onSurfaceVariant;
+    final stockBgColor = isOut ? AppTheme.errorContainer : AppTheme.surfaceVariant;
 
     return AnimatedContainer(
       duration: const Duration(milliseconds: 200),
@@ -120,6 +184,7 @@ class ProductListItemWidget extends StatelessWidget {
                       HapticFeedback.lightImpact();
                       onRemoveFromCart();
                     },
+                    onTapQuantity: () => _promptQuantity(context, cartQuantity),
                   )
                 else
                   _canAddToCart
@@ -184,7 +249,7 @@ class ProductListItemWidget extends StatelessWidget {
                     color: AppTheme.onSurfaceVariant,
                     bgColor: AppTheme.surfaceVariant,
                   ),
-                // Stock badge — color-coded: green > 50, orange > 0, red = 0
+                // Stock badge — shows exact count. Red only when zero.
                 if (showStock)
                   _MetaChip(
                     icon: Icons.inventory_2_outlined,
@@ -274,11 +339,13 @@ class _CartStepper extends StatelessWidget {
   final int quantity;
   final VoidCallback onAdd;
   final VoidCallback onRemove;
+  final VoidCallback onTapQuantity;
 
   const _CartStepper({
     required this.quantity,
     required this.onAdd,
     required this.onRemove,
+    required this.onTapQuantity,
   });
 
   @override
@@ -293,14 +360,19 @@ class _CartStepper extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         children: [
           _StepButton(icon: Icons.remove_rounded, onTap: onRemove),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 4),
-            child: Text(
-              '$quantity',
-              style: const TextStyle(
-                color: Colors.white,
-                fontWeight: FontWeight.bold,
-                fontSize: 14,
+          // Tap quantity to type a specific value — essential for big orders.
+          InkWell(
+            onTap: onTapQuantity,
+            borderRadius: BorderRadius.circular(4),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              child: Text(
+                '$quantity',
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
+                  fontSize: 14,
+                ),
               ),
             ),
           ),

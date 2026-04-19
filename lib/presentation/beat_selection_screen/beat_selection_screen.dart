@@ -8,12 +8,15 @@ import 'package:hive_flutter/hive_flutter.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:http/http.dart' as http;
 
+import '../../core/search_utils.dart';
+import '../../main.dart' show routeObserver;
 import '../../routes/app_routes.dart';
 import '../../services/auth_service.dart';
 import 'package:supabase_flutter/supabase_flutter.dart' show FileOptions;
 import '../../services/supabase_service.dart';
 import '../../services/cart_service.dart';
 import '../../services/pdf_service.dart';
+import '../../services/offline_service.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/hero_selfie_modal.dart';
 import '../../widgets/hero_avatar_widget.dart';
@@ -25,7 +28,8 @@ class BeatSelectionScreen extends StatefulWidget {
   State<BeatSelectionScreen> createState() => _BeatSelectionScreenState();
 }
 
-class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerProviderStateMixin {
+class _BeatSelectionScreenState extends State<BeatSelectionScreen>
+    with TickerProviderStateMixin, RouteAware {
   List<BeatModel> _beats = [];
   Map<String, int> _totalOutlets = {};
   Map<String, int> _ordersToday = {};
@@ -36,6 +40,10 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
   bool _userIdError = false; // FIX 2: show error when userId cannot be resolved
   bool _isCheckingHeroSelfie = false;
   bool _shouldShowHeroSelfie = false;
+  // True when the last load attempt failed (likely offline). Surfaced as a
+  // banner so the rep sees "Offline — showing cached data" instead of an
+  // empty beat list that looks like "no beats assigned."
+  bool _loadFailed = false;
   
   // Cache user data to avoid redundant network calls
   AppUserModel? _cachedUser;
@@ -49,9 +57,20 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
   // Cross-team tracking for next day outstanding
   Map<String, String> _nextDayCustomerTeam = {}; // customer ID -> team that found them
   String? _nextDayCrossTeamId; // the other team if cross-team beats detected
+  List<String>? _todayTeamIds; // all team IDs for today's beats (for cross-team print)
+  List<String>? _cachedAllowedBrands; // lazily fetched; only used when brand_rep
 
   bool get _isBrandRep => SupabaseService.instance.currentUserRole == 'brand_rep';
   bool get _isSalesRep => SupabaseService.instance.currentUserRole == 'sales_rep';
+
+  Future<List<String>?> _brandScopeForReport() async {
+    if (!_isBrandRep) return null;
+    if (_cachedAllowedBrands != null) return _cachedAllowedBrands;
+    final uid = SupabaseService.instance.client.auth.currentUser?.id;
+    if (uid == null) return const <String>[];
+    _cachedAllowedBrands = await SupabaseService.instance.getUserBrandAccess(uid);
+    return _cachedAllowedBrands;
+  }
 
   int get _tabCount => _isBrandRep ? 1 : 3; // brand_rep: Orders only; sales_rep: Orders + Collections + Next Day
 
@@ -63,13 +82,29 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final route = ModalRoute.of(context);
+    if (route is PageRoute) routeObserver.subscribe(this, route);
+  }
+
+  // Reps return to this screen after placing an order / settling a collection /
+  // visiting a customer. Auto-refresh so the Today Orders / Collections /
+  // Next Day Due tabs reflect the work they just did.
+  @override
+  void didPopNext() {
+    _loadData();
+  }
+
+  @override
   void dispose() {
+    routeObserver.unsubscribe(this);
     _tabController.dispose();
     super.dispose();
   }
 
   Future<void> _loadData({bool forceRefresh = false}) async {
-    setState(() { _isLoading = true; _userIdError = false; });
+    setState(() { _isLoading = true; _userIdError = false; _loadFailed = false; });
     try {
       // Phase 2: Hard reset - clear cache if forceRefresh is true
       if (forceRefresh) {
@@ -102,9 +137,14 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
       final allCustomers = await SupabaseService.instance.getCustomers(forceRefresh: forceRefresh);
       final todayStr = DateTime.now().toIso8601String().substring(0, 10);
 
-      // Fetch all today's data in parallel
+      // Detect cross-team beats for today (e.g., Sourab covering Kaulagarh for both JA & MA)
+      final todayBeatsList = beats.where((b) => _isBeatToday(b)).toList();
+      final todayTeams = todayBeatsList.map((b) => b.teamId).toSet().toList();
+      _todayTeamIds = todayTeams.length > 1 ? todayTeams : null;
+
+      // Fetch all today's data in parallel — use multi-team if shared beats detected
       final results = await Future.wait([
-        SupabaseService.instance.getOrdersByDate(todayStr),
+        SupabaseService.instance.getOrdersByDate(todayStr, teamIds: _todayTeamIds),
         SupabaseService.instance.getVisitedCountsTodayByBeat(),
         SupabaseService.instance.getCollectionCountsTodayByBeat(allCustomers),
       ]);
@@ -157,7 +197,7 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
         _loadTabData(allCustomers, beats);
       }
     } catch (e) {
-      if (mounted) setState(() => _isLoading = false);
+      if (mounted) setState(() { _isLoading = false; _loadFailed = true; });
     }
   }
 
@@ -180,9 +220,14 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
         if (mounted) setState(() => _todayCollections = myCollections);
       }
 
-      // Load next day beat outstanding (sales_rep only)
+      // Load next day beat outstanding (sales_rep only).
+      // Skip Sunday — on Saturday, "next day" jumps to Monday so the rep sees
+      // the actual next working day's outstanding, not an empty Sunday tab.
       if (!_isBrandRep) {
-        final tomorrow = today.add(const Duration(days: 1));
+        var tomorrow = today.add(const Duration(days: 1));
+        if (tomorrow.weekday == DateTime.sunday) {
+          tomorrow = tomorrow.add(const Duration(days: 1));
+        }
         final tomorrowName = _weekdayNames[tomorrow.weekday - 1];
         _nextDayLabel = DateFormat('EEEE').format(tomorrow);
 
@@ -241,14 +286,30 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
     }
   }
 
-  /// Check if user needs to take hero selfie
+  /// Check if user needs to take hero selfie.
+  /// Cache-first: if we already have a user record with a hero image, trust it
+  /// and skip the network round-trip. Offline reps used to wait for a timeout
+  /// on every launch — now they pass through immediately.
   Future<void> _checkHeroSelfieRequirement(String userId) async {
     try {
       setState(() => _isCheckingHeroSelfie = true);
 
-      // Always fetch fresh from DB to check hero_image_url (cache may be stale)
-      final user = await SupabaseService.instance.getCurrentUser();
-      _cachedUser = user;
+      // Fast path: cached user already has a hero image → no check needed.
+      final cached = _cachedUser;
+      if (cached != null && cached.heroImageUrl != null && cached.heroImageUrl!.isNotEmpty) {
+        setState(() => _shouldShowHeroSelfie = false);
+        return;
+      }
+
+      // Slow path: no cached hero. Try fresh fetch; if it fails (offline), fall
+      // back to whatever cached record we have without forcing the modal.
+      AppUserModel? user = cached;
+      try {
+        user = await SupabaseService.instance.getCurrentUser();
+        if (user != null) _cachedUser = user;
+      } catch (_) {
+        // offline / network error — keep cached user
+      }
 
       if (user == null) {
         setState(() => _shouldShowHeroSelfie = false);
@@ -257,16 +318,13 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
 
       debugPrint('[BeatSelection] Hero check: role=${user.role}, heroUrl=${user.heroImageUrl}');
 
-      // Check if user has no hero image — mandatory for all roles
       final needsHeroSelfie = user.heroImageUrl == null || user.heroImageUrl!.isEmpty;
-
       setState(() => _shouldShowHeroSelfie = needsHeroSelfie);
-      
+
       if (needsHeroSelfie && mounted) {
-        // Show hero selfie modal after a short delay to allow UI to render
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (mounted) {
-            _showHeroSelfieModal(userId, user.fullName);
+            _showHeroSelfieModal(userId, user!.fullName);
           }
         });
       }
@@ -342,7 +400,12 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
 
     if (picked != null) {
       try {
-        await PdfService.generateAndShareOrderReport(picked);
+        final brands = await _brandScopeForReport();
+        await PdfService.generateAndShareOrderReport(
+          picked,
+          teamIds: _todayTeamIds,
+          allowedBrands: brands,
+        );
       } catch (e) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
@@ -386,6 +449,18 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
 
   // FEATURE 2: Out-of-Beat bottom sheet
   void _showOutOfBeatSheet() {
+    // Guard: if user id couldn't be resolved we can't load beats. Fail loud
+    // instead of opening a sheet that spins forever.
+    final userId = SupabaseService.instance.currentUserId
+        ?? SupabaseService.instance.client.auth.currentUser?.id;
+    if (userId == null || userId.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('Cannot identify your account. Please log out and back in.'),
+        backgroundColor: Colors.red,
+      ));
+      return;
+    }
+
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -394,140 +469,19 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
       ),
       builder: (ctx) => DraggableScrollableSheet(
         expand: false,
-        initialChildSize: 0.65,
-        maxChildSize: 0.9,
-        minChildSize: 0.4,
-        builder: (_, scrollCtrl) => FutureBuilder<List<BeatModel>>(
-          future: SupabaseService.instance.getUserBeats(
-            SupabaseService.instance.currentUserId
-                ?? SupabaseService.instance.client.auth.currentUser?.id
-                ?? '',
-          ),
-          builder: (_, snap) {
-            if (!snap.hasData) {
-              return const Center(
-                child: Padding(
-                  padding: EdgeInsets.all(40),
-                  child: CircularProgressIndicator(),
-                ),
-              );
-            }
-            final allBeats = snap.data!;
-            return Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                // Drag handle
-                Center(
-                  child: Container(
-                    margin: const EdgeInsets.symmetric(vertical: 12),
-                    width: 40,
-                    height: 4,
-                    decoration: BoxDecoration(
-                      color: Colors.grey.shade300,
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                  ),
-                ),
-                // Title
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 20),
-                  child: Row(
-                    children: [
-                      Icon(Icons.add_location_alt_rounded,
-                          color: Colors.orange.shade700, size: 22),
-                      const SizedBox(width: 8),
-                      Text(
-                        'Out of Beat Order',
-                        style: GoogleFonts.manrope(
-                            fontSize: 17, fontWeight: FontWeight.w700),
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 10),
-                // Warning box
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 20),
-                  child: Container(
-                    padding: const EdgeInsets.all(12),
-                    decoration: BoxDecoration(
-                      color: Colors.orange.shade50,
-                      borderRadius: BorderRadius.circular(12),
-                      border: Border.all(color: Colors.orange.shade200),
-                    ),
-                    child: Text(
-                      'This will let you take an order from a customer outside your assigned beats. You will return to your beat list after.',
-                      style: GoogleFonts.manrope(
-                          fontSize: 12, color: Colors.orange.shade900),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 12),
-                const Divider(height: 1),
-                // Beat list
-                Expanded(
-                  child: ListView.builder(
-                    controller: scrollCtrl,
-                    padding: const EdgeInsets.only(bottom: 24),
-                    itemCount: allBeats.length,
-                    itemBuilder: (_, i) {
-                      final beat = allBeats[i];
-                      final isToday = _isBeatToday(beat);
-                      return ListTile(
-                        leading: Container(
-                          padding: const EdgeInsets.all(8),
-                          decoration: BoxDecoration(
-                            color: AppTheme.primaryContainer,
-                            shape: BoxShape.circle,
-                          ),
-                          child: Icon(Icons.route_outlined,
-                              color: AppTheme.primary, size: 18),
-                        ),
-                        title: Text(
-                          beat.beatName,
-                          style: GoogleFonts.manrope(
-                              fontSize: 14, fontWeight: FontWeight.w600),
-                        ),
-                        subtitle: beat.area.isNotEmpty
-                            ? Text(
-                          beat.area,
-                          style: GoogleFonts.manrope(
-                              fontSize: 12,
-                              color: AppTheme.onSurfaceVariant),
-                        )
-                            : null,
-                        trailing: isToday
-                            ? Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 8, vertical: 3),
-                          decoration: BoxDecoration(
-                            color: Colors.green.shade600,
-                            borderRadius: BorderRadius.circular(20),
-                          ),
-                          child: Text(
-                            'TODAY',
-                            style: GoogleFonts.manrope(
-                              fontSize: 10,
-                              fontWeight: FontWeight.w700,
-                              color: Colors.white,
-                            ),
-                          ),
-                        )
-                            : const Icon(Icons.arrow_forward_ios_rounded,
-                            size: 14, color: Colors.grey),
-                        onTap: () {
-                          Navigator.pop(ctx);
-                          Navigator.pushNamed(
-                            context,
-                            AppRoutes.customerListScreen,
-                            arguments: {'beat': beat, 'isOutOfBeat': true},
-                          );
-                        },
-                      );
-                    },
-                  ),
-                ),
-              ],
+        initialChildSize: 0.75,
+        maxChildSize: 0.95,
+        minChildSize: 0.5,
+        builder: (_, scrollCtrl) => _OutOfBeatSheetContent(
+          userId: userId,
+          scrollCtrl: scrollCtrl,
+          isBeatToday: _isBeatToday,
+          onBeatPicked: (beat) {
+            Navigator.pop(ctx);
+            Navigator.pushNamed(
+              context,
+              AppRoutes.customerListScreen,
+              arguments: {'beat': beat, 'isOutOfBeat': true},
             );
           },
         ),
@@ -638,7 +592,10 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
                           Text("No beats scheduled for today",
                               style: GoogleFonts.manrope(fontSize: 14, fontWeight: FontWeight.w600, color: AppTheme.onSurface)),
                           const SizedBox(height: 4),
-                          Text("Use 'Out of Beat Order' below",
+                          Text(
+                              _isBrandRep
+                                  ? 'Ask admin to assign customers for your brand.'
+                                  : "Use 'Out of Beat Order' below",
                               style: GoogleFonts.manrope(fontSize: 12, color: AppTheme.onSurfaceVariant)),
                         ],
                       ),
@@ -707,6 +664,10 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
           ),
         ],
       ),
+      // OOB FAB is available to all field roles. Brand_rep uses it to log
+      // orders on days with no scheduled beats (e.g. Sunday) or for walk-ins
+      // outside their route. Product-level brand-access filter still limits
+      // what SKUs they can add, so the brand scope is preserved.
       floatingActionButton: FloatingActionButton.extended(
         onPressed: _showOutOfBeatSheet,
         backgroundColor: Colors.orange.shade700,
@@ -716,7 +677,40 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
             style: GoogleFonts.manrope(
                 fontSize: 13, fontWeight: FontWeight.w600)),
       ),
-      body: body,
+      body: Column(
+        children: [
+          // Offline banner: shown when the last data load failed — usually
+          // network. Prevents the rep from mistaking an empty beat list for
+          // "no beats assigned."
+          if (_loadFailed)
+            Material(
+              color: Colors.orange.shade700,
+              child: InkWell(
+                onTap: () => _loadData(forceRefresh: true),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  child: Row(
+                    children: [
+                      const Icon(Icons.cloud_off_rounded, size: 16, color: Colors.white),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          'Offline — showing cached data. Tap to retry.',
+                          style: GoogleFonts.manrope(
+                              fontSize: 12,
+                              fontWeight: FontWeight.w700,
+                              color: Colors.white),
+                        ),
+                      ),
+                      const Icon(Icons.refresh_rounded, size: 16, color: Colors.white),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          Expanded(child: body),
+        ],
+      ),
     );
   }
 
@@ -918,13 +912,34 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
   // ─── TAB: Today Orders ─────────────────────────────────────────
   Widget _buildTodayOrdersTab() {
     if (_todayOrders.isEmpty) {
-      return Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
+      return RefreshIndicator(
+        onRefresh: () => _loadData(forceRefresh: true),
+        child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
           children: [
-            Icon(Icons.receipt_long_outlined, size: 48, color: AppTheme.onSurfaceVariant.withAlpha(80)),
-            const SizedBox(height: 12),
-            Text('No orders today', style: GoogleFonts.manrope(fontSize: 14, fontWeight: FontWeight.w600, color: AppTheme.onSurfaceVariant)),
+            SizedBox(
+              height: MediaQuery.of(context).size.height * 0.5,
+              child: Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.receipt_long_outlined,
+                        size: 48,
+                        color: AppTheme.onSurfaceVariant.withAlpha(80)),
+                    const SizedBox(height: 12),
+                    Text('No orders today',
+                        style: GoogleFonts.manrope(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w600,
+                            color: AppTheme.onSurfaceVariant)),
+                    const SizedBox(height: 4),
+                    Text('Pull down to refresh',
+                        style: GoogleFonts.manrope(
+                            fontSize: 11, color: AppTheme.onSurfaceVariant)),
+                  ],
+                ),
+              ),
+            ),
           ],
         ),
       );
@@ -937,13 +952,24 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
           child: Row(children: [
             Text('${_todayOrders.length} orders', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w600, color: AppTheme.onSurfaceVariant)),
+            if (OfflineService.instance.pendingCount > 0) ...[
+              const SizedBox(width: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(color: AppTheme.warning.withAlpha(30), borderRadius: BorderRadius.circular(8)),
+                child: Text('${OfflineService.instance.pendingCount} pending sync', style: GoogleFonts.manrope(fontSize: 10, fontWeight: FontWeight.w600, color: AppTheme.warning)),
+              ),
+            ],
             const Spacer(),
             Text('\u20B9${totalAmt.toStringAsFixed(0)}', style: GoogleFonts.manrope(fontSize: 15, fontWeight: FontWeight.w800, color: AppTheme.primary)),
           ]),
         ),
         const Divider(height: 1),
         Expanded(
-          child: ListView.builder(
+          child: RefreshIndicator(
+            onRefresh: () => _loadData(forceRefresh: true),
+            child: ListView.builder(
+            physics: const AlwaysScrollableScrollPhysics(),
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 80),
             itemCount: _todayOrders.length + 1, // +1 for export button
             itemBuilder: (_, i) {
@@ -1011,6 +1037,7 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
                 ),
               );
             },
+          ),
           ),
         ),
       ],
@@ -1081,9 +1108,21 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
       }
       if (!mounted) return;
 
-      // Build OrderModel and load to cart (stores editingOrderId — old order stays until submit)
+      // Build OrderModel and load to cart (stores editingOrderId — old order stays until submit).
+      // Resolve the original beat by name so edited orders preserve beat_name on resubmit.
+      // Look across ALL the user's beats, not just today's — a rep may edit a
+      // beat order from a prior day.
       final orderModel = OrderModel.fromJson(order);
-      await CartService.instance.loadOrderToCart(orderModel, customer, null);
+      BeatModel? beat;
+      if (orderModel.beat.isNotEmpty) {
+        final uid = SupabaseService.instance.currentUserId
+            ?? SupabaseService.instance.client.auth.currentUser?.id;
+        if (uid != null) {
+          final allUserBeats = await SupabaseService.instance.getUserBeats(uid, allTeams: true);
+          beat = allUserBeats.where((b) => b.beatName == orderModel.beat).firstOrNull;
+        }
+      }
+      await CartService.instance.loadOrderToCart(orderModel, customer, beat);
       if (!mounted) return;
 
       // Warn if some products were missing
@@ -1115,12 +1154,17 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
             onPressed: () async {
               Navigator.pop(ctx);
               try {
-                await SupabaseService.instance.deleteOrder(orderId, isSuperAdmin: true);
+                final role = SupabaseService.instance.currentUserRole;
+                final isSuperAdmin = role == 'super_admin' || role == 'admin';
+                await SupabaseService.instance.deleteOrder(orderId, isSuperAdmin: isSuperAdmin);
                 if (!mounted) return;
                 setState(() => _todayOrders.removeWhere((o) => o['id'] == orderId));
                 ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Order deleted'), backgroundColor: Colors.green));
               } catch (e) {
-                if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red));
+                final msg = e.toString().toLowerCase().contains('3 days')
+                    ? 'Order older than 3 days — contact admin.'
+                    : 'Error: $e';
+                if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg), backgroundColor: Colors.red));
               }
             },
             child: Text('Delete', style: GoogleFonts.manrope(color: Colors.red, fontWeight: FontWeight.w700)),
@@ -1282,7 +1326,12 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Generating report...'), duration: Duration(seconds: 1)),
       );
-      final filePath = await PdfService.generateOrderReportFile(DateTime.now());
+      final brands = await _brandScopeForReport();
+      final filePath = await PdfService.generateOrderReportFile(
+        DateTime.now(),
+        teamIds: _todayTeamIds,
+        allowedBrands: brands,
+      );
       // Share directly to WhatsApp
       await SharePlus.instance.share(
         ShareParams(
@@ -1302,13 +1351,84 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
   // ─── TAB: Today Collections ───────────────────────────────────
   Widget _buildTodayCollectionsTab() {
     if (_todayCollections.isEmpty) {
-      return Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
+      return RefreshIndicator(
+        onRefresh: () => _loadData(forceRefresh: true),
+        child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 24),
           children: [
-            Icon(Icons.payments_outlined, size: 48, color: AppTheme.onSurfaceVariant.withAlpha(80)),
-            const SizedBox(height: 12),
-            Text('No collections today', style: GoogleFonts.manrope(fontSize: 14, fontWeight: FontWeight.w600, color: AppTheme.onSurfaceVariant)),
+            SizedBox(
+              height: MediaQuery.of(context).size.height * 0.42,
+              child: Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.payments_outlined,
+                        size: 48,
+                        color: AppTheme.onSurfaceVariant.withAlpha(80)),
+                    const SizedBox(height: 12),
+                    Text('No collections today',
+                        style: GoogleFonts.manrope(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w600,
+                            color: AppTheme.onSurfaceVariant)),
+                    const SizedBox(height: 4),
+                    Text('Pull down to refresh',
+                        style: GoogleFonts.manrope(
+                            fontSize: 11, color: AppTheme.onSurfaceVariant)),
+                  ],
+                ),
+              ),
+            ),
+            if (_todayPrimaryBeatNames.isNotEmpty || _todayCrossBeatNames.isNotEmpty) ...[
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: Text(
+                  "Today's outstanding",
+                  textAlign: TextAlign.center,
+                  style: GoogleFonts.manrope(fontSize: 11, fontWeight: FontWeight.w700, color: AppTheme.onSurfaceVariant),
+                ),
+              ),
+              Row(children: [
+                Expanded(
+                  child: SizedBox(
+                    height: 46,
+                    child: FilledButton.icon(
+                      onPressed: () => _shareOutstandingReport(
+                        primaryBeatNames: _todayPrimaryBeatNames,
+                        crossTeamId: _todayCrossTeamId,
+                        crossBeatNames: _todayCrossBeatNames,
+                      ),
+                      icon: const Icon(Icons.share_rounded, size: 16),
+                      label: Text('Share', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700)),
+                      style: FilledButton.styleFrom(
+                        backgroundColor: Colors.green.shade700,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: SizedBox(
+                    height: 46,
+                    child: OutlinedButton.icon(
+                      onPressed: () => _printOutstandingReport(
+                        primaryBeatNames: _todayPrimaryBeatNames,
+                        crossTeamId: _todayCrossTeamId,
+                        crossBeatNames: _todayCrossBeatNames,
+                      ),
+                      icon: Icon(Icons.print_rounded, size: 16, color: AppTheme.primary),
+                      label: Text('Print', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700, color: AppTheme.primary)),
+                      style: OutlinedButton.styleFrom(
+                        side: BorderSide(color: AppTheme.primary),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                      ),
+                    ),
+                  ),
+                ),
+              ]),
+            ],
           ],
         ),
       );
@@ -1361,7 +1481,10 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
             }
             final customers = byCustomer.entries.toList();
 
-            return ListView.builder(
+            return RefreshIndicator(
+              onRefresh: () => _loadData(forceRefresh: true),
+              child: ListView.builder(
+              physics: const AlwaysScrollableScrollPhysics(),
               padding: const EdgeInsets.fromLTRB(16, 8, 16, 80),
               itemCount: customers.length + 1, // +1 for overlay buttons
               itemBuilder: (_, i) {
@@ -1457,6 +1580,7 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
                   ),
                 );
               },
+              ),
             );
           }),
         ),
@@ -1578,13 +1702,35 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
   // ─── TAB: Next Day Outstanding ────────────────────────────────
   Widget _buildNextDayOutstandingTab() {
     if (_nextDayOutstanding.isEmpty) {
-      return Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
+      return RefreshIndicator(
+        onRefresh: () => _loadData(forceRefresh: true),
+        child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
           children: [
-            Icon(Icons.check_circle_outline, size: 48, color: Colors.green.shade300),
-            const SizedBox(height: 12),
-            Text('No outstanding for $_nextDayLabel', style: GoogleFonts.manrope(fontSize: 14, fontWeight: FontWeight.w600, color: AppTheme.onSurfaceVariant)),
+            SizedBox(
+              height: MediaQuery.of(context).size.height * 0.5,
+              child: Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.check_circle_outline,
+                        size: 48, color: Colors.green.shade300),
+                    const SizedBox(height: 12),
+                    Text(
+                      'No outstanding for $_nextDayLabel',
+                      style: GoogleFonts.manrope(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                          color: AppTheme.onSurfaceVariant),
+                    ),
+                    const SizedBox(height: 4),
+                    Text('Pull down to refresh',
+                        style: GoogleFonts.manrope(
+                            fontSize: 11, color: AppTheme.onSurfaceVariant)),
+                  ],
+                ),
+              ),
+            ),
           ],
         ),
       );
@@ -1606,7 +1752,10 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
         ),
         const Divider(height: 1),
         Expanded(
-          child: ListView.builder(
+          child: RefreshIndicator(
+            onRefresh: () => _loadData(forceRefresh: true),
+            child: ListView.builder(
+            physics: const AlwaysScrollableScrollPhysics(),
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 80),
             itemCount: _nextDayOutstanding.length + 1, // +1 for buttons
             itemBuilder: (_, i) {
@@ -1619,7 +1768,11 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
                       child: SizedBox(
                         height: 46,
                         child: FilledButton.icon(
-                          onPressed: _shareOutstandingReport,
+                          onPressed: () => _shareOutstandingReport(
+                            primaryBeatNames: _nextDayBeatNames,
+                            crossTeamId: _nextDayCrossTeamId,
+                            crossBeatNames: _nextDayCrossBeatNames,
+                          ),
                           icon: const Icon(Icons.share_rounded, size: 16),
                           label: Text('Share', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700)),
                           style: FilledButton.styleFrom(
@@ -1634,7 +1787,11 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
                       child: SizedBox(
                         height: 46,
                         child: OutlinedButton.icon(
-                          onPressed: _printOutstandingReport,
+                          onPressed: () => _printOutstandingReport(
+                            primaryBeatNames: _nextDayBeatNames,
+                            crossTeamId: _nextDayCrossTeamId,
+                            crossBeatNames: _nextDayCrossBeatNames,
+                          ),
                           icon: Icon(Icons.print_rounded, size: 16, color: AppTheme.primary),
                           label: Text('Print', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700, color: AppTheme.primary)),
                           style: OutlinedButton.styleFrom(
@@ -1691,6 +1848,7 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
               );
             },
           ),
+          ),
         ),
       ],
     );
@@ -1715,7 +1873,32 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
   List<String> get _todayBeatNames =>
       _beats.map((b) => b.beatName).toSet().toList();
 
-  Future<void> _shareOutstandingReport() async {
+  /// Beat names for the primary (current) team in today's beats
+  List<String> get _todayPrimaryBeatNames =>
+      _beats.where((b) => b.teamId == AuthService.currentTeam)
+          .map((b) => b.beatName).toSet().toList();
+
+  /// Cross-team id for today if any of today's beats belong to the other team
+  String? get _todayCrossTeamId {
+    final currentTeam = AuthService.currentTeam;
+    final others = _beats.where((b) => b.teamId != currentTeam)
+        .map((b) => b.teamId).toSet();
+    return others.isEmpty ? null : others.first;
+  }
+
+  /// Beat names for the cross team in today's beats
+  List<String> get _todayCrossBeatNames {
+    final crossId = _todayCrossTeamId;
+    if (crossId == null) return [];
+    return _beats.where((b) => b.teamId == crossId)
+        .map((b) => b.beatName).toSet().toList();
+  }
+
+  Future<void> _shareOutstandingReport({
+    required List<String> primaryBeatNames,
+    String? crossTeamId,
+    required List<String> crossBeatNames,
+  }) async {
     try {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Generating report...'), duration: Duration(seconds: 1)),
@@ -1725,16 +1908,16 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
 
       // Fetch cross-team bills if cross-team beats detected
       List<Map<String, dynamic>>? crossBills;
-      if (_nextDayCrossTeamId != null && _nextDayCrossBeatNames.isNotEmpty) {
-        crossBills = await SupabaseService.instance.getCustomerBillsForTeam(teamId: _nextDayCrossTeamId);
+      if (crossTeamId != null && crossBeatNames.isNotEmpty) {
+        crossBills = await SupabaseService.instance.getCustomerBillsForTeam(teamId: crossTeamId);
       }
 
       final filePath = await PdfService.generateOutstandingReportFile(
         customers: allCustomers, allBills: allBills, teamId: AuthService.currentTeam,
-        beatNames: _nextDayBeatNames,
-        crossTeamId: _nextDayCrossTeamId,
+        beatNames: primaryBeatNames,
+        crossTeamId: crossTeamId,
         crossTeamBills: crossBills,
-        crossTeamBeatNames: _nextDayCrossBeatNames,
+        crossTeamBeatNames: crossBeatNames,
       );
       await SharePlus.instance.share(
         ShareParams(
@@ -1747,7 +1930,11 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
     }
   }
 
-  Future<void> _printOutstandingReport() async {
+  Future<void> _printOutstandingReport({
+    required List<String> primaryBeatNames,
+    String? crossTeamId,
+    required List<String> crossBeatNames,
+  }) async {
     final isWeb = kIsWeb;
     // Confirmation dialog
     final confirmed = await showDialog<bool>(
@@ -1799,16 +1986,16 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen> with TickerPr
 
       // Fetch cross-team bills if cross-team beats detected
       List<Map<String, dynamic>>? crossBills;
-      if (_nextDayCrossTeamId != null && _nextDayCrossBeatNames.isNotEmpty) {
-        crossBills = await SupabaseService.instance.getCustomerBillsForTeam(teamId: _nextDayCrossTeamId);
+      if (crossTeamId != null && crossBeatNames.isNotEmpty) {
+        crossBills = await SupabaseService.instance.getCustomerBillsForTeam(teamId: crossTeamId);
       }
 
       final pdfBytes = await PdfService.generateOutstandingReportBytes(
         customers: allCustomers, allBills: allBills, teamId: AuthService.currentTeam,
-        beatNames: _nextDayBeatNames,
-        crossTeamId: _nextDayCrossTeamId,
+        beatNames: primaryBeatNames,
+        crossTeamId: crossTeamId,
         crossTeamBills: crossBills,
-        crossTeamBeatNames: _nextDayCrossBeatNames,
+        crossTeamBeatNames: crossBeatNames,
       );
 
       if (isWeb) {
@@ -2118,4 +2305,281 @@ class _TabBarDelegate extends SliverPersistentHeaderDelegate {
 
   @override
   bool shouldRebuild(covariant _TabBarDelegate oldDelegate) => false;
+}
+
+// ─── Out-of-Beat sheet content ──────────────────────────────────────────────
+//
+// Extracted into its own widget so it can manage its own search state without
+// rebuilding the parent. Adds:
+//   • explicit error state if getUserBeats fails
+//   • close button + search field
+//   • today's beats hidden (already shown on the main screen)
+//   • cross-team beats included (allTeams: true) so reps who cover both teams
+//     don't have to switch team first.
+class _OutOfBeatSheetContent extends StatefulWidget {
+  final String userId;
+  final ScrollController scrollCtrl;
+  final bool Function(BeatModel) isBeatToday;
+  final void Function(BeatModel) onBeatPicked;
+
+  const _OutOfBeatSheetContent({
+    required this.userId,
+    required this.scrollCtrl,
+    required this.isBeatToday,
+    required this.onBeatPicked,
+  });
+
+  @override
+  State<_OutOfBeatSheetContent> createState() => _OutOfBeatSheetContentState();
+}
+
+class _OutOfBeatSheetContentState extends State<_OutOfBeatSheetContent> {
+  late Future<List<BeatModel>> _future;
+  final TextEditingController _searchCtrl = TextEditingController();
+  String _query = '';
+
+  @override
+  void initState() {
+    super.initState();
+    _future = SupabaseService.instance.getUserBeats(widget.userId, allTeams: true);
+  }
+
+  @override
+  void dispose() {
+    _searchCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        // Drag handle
+        Center(
+          child: Container(
+            margin: const EdgeInsets.symmetric(vertical: 12),
+            width: 40,
+            height: 4,
+            decoration: BoxDecoration(
+              color: Colors.grey.shade300,
+              borderRadius: BorderRadius.circular(8),
+            ),
+          ),
+        ),
+        // Title + close
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 20),
+          child: Row(
+            children: [
+              Icon(Icons.add_location_alt_rounded,
+                  color: Colors.orange.shade700, size: 22),
+              const SizedBox(width: 8),
+              Text('Out of Beat Order',
+                  style: GoogleFonts.manrope(
+                      fontSize: 17, fontWeight: FontWeight.w700)),
+              const Spacer(),
+              IconButton(
+                icon: const Icon(Icons.close_rounded),
+                onPressed: () => Navigator.pop(context),
+                tooltip: 'Close',
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 4),
+        // Warning box — explains the beat picker's role.
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 20),
+          child: Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: Colors.orange.shade50,
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(color: Colors.orange.shade200),
+            ),
+            child: Text(
+              'Pick the nearest route to tag this order — the customer list below will let you pick ANY customer on your team.',
+              style: GoogleFonts.manrope(
+                  fontSize: 12, color: Colors.orange.shade900),
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
+        // Search
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 20),
+          child: TextField(
+            controller: _searchCtrl,
+            onChanged: (v) => setState(() => _query = v.trim()),
+            decoration: InputDecoration(
+              hintText: 'Search route or area…',
+              prefixIcon: const Icon(Icons.search_rounded),
+              isDense: true,
+              contentPadding: const EdgeInsets.symmetric(vertical: 10),
+              border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(12),
+                borderSide: BorderSide(color: AppTheme.outlineVariant),
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: 8),
+        const Divider(height: 1),
+        // Beat list
+        Expanded(
+          child: FutureBuilder<List<BeatModel>>(
+            future: _future,
+            builder: (_, snap) {
+              if (snap.connectionState == ConnectionState.waiting) {
+                return const Center(
+                  child: Padding(
+                    padding: EdgeInsets.all(40),
+                    child: CircularProgressIndicator(),
+                  ),
+                );
+              }
+              if (snap.hasError) {
+                return _errorState(
+                  icon: Icons.cloud_off_rounded,
+                  title: 'Could not load your beats',
+                  detail: 'Check your connection and try again.',
+                  onRetry: () => setState(() {
+                    _future = SupabaseService.instance
+                        .getUserBeats(widget.userId, allTeams: true);
+                  }),
+                );
+              }
+              final all = snap.data ?? <BeatModel>[];
+              // Today's beats are already on the main screen — OOB sheet is
+              // most useful for non-today routes. Hide today's.
+              final nonToday = all.where((b) => !widget.isBeatToday(b)).toList();
+              final filtered = _query.isEmpty
+                  ? nonToday
+                  : nonToday
+                      .where((b) => tokenMatch(_query, [b.beatName, b.area]))
+                      .toList();
+
+              if (all.isEmpty) {
+                return _errorState(
+                  icon: Icons.inbox_outlined,
+                  title: 'No beats assigned to you',
+                  detail: 'Ask admin to assign a route so you can place orders.',
+                );
+              }
+              if (filtered.isEmpty) {
+                return _errorState(
+                  icon: Icons.search_off_rounded,
+                  title: _query.isEmpty
+                      ? 'No non-today beats to show'
+                      : 'No matches for "$_query"',
+                  detail: _query.isEmpty
+                      ? 'Your other beats are already shown above.'
+                      : 'Try a different route or area name.',
+                );
+              }
+              return ListView.builder(
+                controller: widget.scrollCtrl,
+                padding: const EdgeInsets.only(bottom: 24),
+                itemCount: filtered.length,
+                itemBuilder: (_, i) {
+                  final beat = filtered[i];
+                  return ListTile(
+                    leading: Container(
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: AppTheme.primaryContainer,
+                        shape: BoxShape.circle,
+                      ),
+                      child: Icon(Icons.route_outlined,
+                          color: AppTheme.primary, size: 18),
+                    ),
+                    title: Text(beat.beatName,
+                        style: GoogleFonts.manrope(
+                            fontSize: 14, fontWeight: FontWeight.w600)),
+                    subtitle: beat.area.isNotEmpty
+                        ? Text(beat.area,
+                            style: GoogleFonts.manrope(
+                                fontSize: 12,
+                                color: AppTheme.onSurfaceVariant))
+                        : null,
+                    trailing: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        // Team pill — useful when the rep covers both teams.
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 6, vertical: 2),
+                          decoration: BoxDecoration(
+                            color: beat.teamId == 'JA'
+                                ? Colors.blue.shade50
+                                : Colors.purple.shade50,
+                            borderRadius: BorderRadius.circular(6),
+                          ),
+                          child: Text(
+                            beat.teamId,
+                            style: GoogleFonts.manrope(
+                              fontSize: 9,
+                              fontWeight: FontWeight.w800,
+                              color: beat.teamId == 'JA'
+                                  ? Colors.blue.shade800
+                                  : Colors.purple.shade800,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        const Icon(Icons.arrow_forward_ios_rounded,
+                            size: 14, color: Colors.grey),
+                      ],
+                    ),
+                    onTap: () => widget.onBeatPicked(beat),
+                  );
+                },
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _errorState({
+    required IconData icon,
+    required String title,
+    required String detail,
+    VoidCallback? onRetry,
+  }) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 48, color: AppTheme.onSurfaceVariant),
+            const SizedBox(height: 12),
+            Text(title,
+                textAlign: TextAlign.center,
+                style: GoogleFonts.manrope(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w700,
+                    color: AppTheme.onSurface)),
+            const SizedBox(height: 4),
+            Text(detail,
+                textAlign: TextAlign.center,
+                style: GoogleFonts.manrope(
+                    fontSize: 12, color: AppTheme.onSurfaceVariant)),
+            if (onRetry != null) ...[
+              const SizedBox(height: 16),
+              FilledButton.icon(
+                onPressed: onRetry,
+                icon: const Icon(Icons.refresh_rounded),
+                label: const Text('Retry'),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
 }

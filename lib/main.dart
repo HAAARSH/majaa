@@ -21,6 +21,12 @@ import 'theme/app_theme.dart';
 /// (e.g. session-expiry handler in WidgetsBindingObserver).
 final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
 
+/// Global RouteObserver — screens can subscribe via RouteAware to learn when
+/// they are revealed again after a child route pops (didPopNext), useful for
+/// auto-refreshing a screen's data on return.
+final RouteObserver<ModalRoute<void>> routeObserver =
+    RouteObserver<ModalRoute<void>>();
+
 /// Track last update check to avoid excessive checks
 
 // WorkManager callback — only runs on mobile, never on web
@@ -122,6 +128,8 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
       // Check expiry BEFORE updating timestamp
       if (SessionService.instance.isSessionExpired()) {
         SessionService.instance.reset();
+        // Clear cached sensitive data on session timeout
+        SupabaseService.instance.fullRefreshForSalesRep();
         SupabaseService.instance.signOut().then((_) {
           navigatorKey.currentState?.pushNamedAndRemoveUntil(
             AppRoutes.loginScreen,
@@ -166,6 +174,7 @@ class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
         builder: (context, orientation, deviceType) {
           return MaterialApp(
             navigatorKey: navigatorKey,
+            navigatorObservers: [routeObserver],
             title: 'MAJAA Sales',
             theme: AppTheme.lightTheme,
             debugShowCheckedModeBanner: false,
@@ -238,8 +247,79 @@ class _OfflineWrapperState extends State<_OfflineWrapper> {
               ),
             ),
           ),
+        // Pending-sync banner: only renders when there is queued work OR
+        // the last sync attempt errored. Tap to manually retry.
+        const _PendingSyncBanner(),
         Expanded(child: widget.child),
       ],
+    );
+  }
+}
+
+/// Global sync-status banner rendered in the root shell. Watches
+/// OfflineService.syncStatus + pendingCountNotifier and surfaces queued
+/// work to the rep so orders never sit invisibly in Hive.
+class _PendingSyncBanner extends StatelessWidget {
+  const _PendingSyncBanner();
+
+  @override
+  Widget build(BuildContext context) {
+    final service = OfflineService.instance;
+    return ValueListenableBuilder<int>(
+      valueListenable: service.pendingCountNotifier,
+      builder: (_, pending, __) {
+        return ValueListenableBuilder<int>(
+          valueListenable: service.syncStatus,
+          builder: (_, status, ___) {
+            // 0:Idle, 1:Syncing, 2:Success, 3:Error
+            if (pending == 0 && status != 3) return const SizedBox.shrink();
+
+            Color bg;
+            IconData icon;
+            String label;
+            if (status == 1) {
+              bg = Colors.blue.shade700;
+              icon = Icons.sync_rounded;
+              label = 'Syncing $pending item${pending == 1 ? '' : 's'}...';
+            } else if (status == 3) {
+              bg = Colors.red.shade700;
+              icon = Icons.sync_problem_rounded;
+              label = 'Sync failed ($pending pending) — tap to retry';
+            } else {
+              bg = Colors.orange.shade800;
+              icon = Icons.cloud_upload_rounded;
+              label = '$pending pending sync — tap to retry';
+            }
+            return Material(
+              color: bg,
+              child: InkWell(
+                onTap: status == 1 ? null : service.forceSyncNow,
+                child: SafeArea(
+                  bottom: false,
+                  child: SizedBox(
+                    width: double.infinity,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(icon, color: Colors.white, size: 14),
+                          const SizedBox(width: 8),
+                          Text(
+                            label,
+                            style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.w600),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            );
+          },
+        );
+      },
     );
   }
 }

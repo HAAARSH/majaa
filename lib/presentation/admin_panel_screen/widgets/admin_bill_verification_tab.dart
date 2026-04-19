@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:intl/intl.dart';
 import 'package:file_picker/file_picker.dart';
+import '../../../core/search_utils.dart';
 import '../../../services/supabase_service.dart';
 import '../../../services/auth_service.dart';
 import '../../../services/bill_extraction_service.dart';
@@ -60,6 +61,10 @@ class _AdminBillVerificationTabState extends State<AdminBillVerificationTab> wit
   // Products + Customers for dropdowns
   List<Map<String, dynamic>> _allProducts = [];
   List<Map<String, dynamic>> _allCustomers = [];
+
+  // Team scope: 'All' omits team filter; 'JA' / 'MA' restricts. Default
+  // cross-team so super_admin sees both teams' unverified bills on open.
+  String _teamFilter = 'All';
 
   @override
   void initState() {
@@ -143,14 +148,21 @@ class _AdminBillVerificationTabState extends State<AdminBillVerificationTab> wit
     setState(() => _ordersLoading = true);
     try {
       final cols = 'id, customer_name, customer_id, billed_no, invoice_amount, final_bill_no, actual_billed_amount, bill_photo_url, verified_by_delivery, verified_by_office, status, team_id, order_date, grand_total';
-      final team = AuthService.currentTeam;
+      // When _teamFilter == 'All', skip the team_id restriction so super_admin
+      // sees unverified bills from both JA and MA at once.
+      final String? team = _teamFilter == 'All' ? null : _teamFilter;
+      var pendingQ = SupabaseService.instance.client.from('orders').select(cols);
+      var returnedQ = SupabaseService.instance.client.from('orders').select(cols);
+      var deliveredQ = SupabaseService.instance.client.from('orders').select(cols);
+      if (team != null) {
+        pendingQ = pendingQ.eq('team_id', team);
+        returnedQ = returnedQ.eq('team_id', team);
+        deliveredQ = deliveredQ.eq('team_id', team);
+      }
       final results = await Future.wait([
-        SupabaseService.instance.client.from('orders').select(cols)
-            .eq('team_id', team).eq('status', 'Pending Verification').order('order_date', ascending: false),
-        SupabaseService.instance.client.from('orders').select(cols)
-            .eq('team_id', team).eq('status', 'Returned').order('order_date', ascending: false),
-        SupabaseService.instance.client.from('orders').select(cols)
-            .eq('team_id', team).eq('status', 'Delivered').eq('verified_by_office', false).order('order_date', ascending: false),
+        pendingQ.eq('status', 'Pending Verification').order('order_date', ascending: false),
+        returnedQ.eq('status', 'Returned').order('order_date', ascending: false),
+        deliveredQ.eq('status', 'Delivered').eq('verified_by_office', false).order('order_date', ascending: false),
       ]);
       if (!mounted) return;
       setState(() {
@@ -435,6 +447,16 @@ class _AdminBillVerificationTabState extends State<AdminBillVerificationTab> wit
   Widget build(BuildContext context) {
     return Column(
       children: [
+        // Team scope picker — 'All' shows bills across JA + MA. Only the
+        // Pending/Returned/Data-Changes tabs filter by team; upload tabs
+        // are team-agnostic so the chip is harmless on them.
+        TeamFilterChips(
+          value: _teamFilter,
+          onChanged: (v) {
+            setState(() => _teamFilter = v);
+            _loadOrders();
+          },
+        ),
         // Tab bar
         Container(
           color: AppTheme.surface,
@@ -655,7 +677,8 @@ class _AdminBillVerificationTabState extends State<AdminBillVerificationTab> wit
               Autocomplete<Map<String, dynamic>>(
                 optionsBuilder: (textEditingValue) {
                   if (textEditingValue.text.isEmpty) return _allProducts;
-                  return _allProducts.where((p) => (p['name'] as String).toLowerCase().contains(textEditingValue.text.toLowerCase()));
+                  return _allProducts.where(
+                      (p) => tokenMatchSingle(textEditingValue.text, p['name'] as String?));
                 },
                 displayStringForOption: (p) => p['name'] as String,
                 onSelected: (product) async {
@@ -751,7 +774,8 @@ class _AdminBillVerificationTabState extends State<AdminBillVerificationTab> wit
               Autocomplete<Map<String, dynamic>>(
                 optionsBuilder: (textEditingValue) {
                   if (textEditingValue.text.isEmpty) return _allCustomers;
-                  return _allCustomers.where((c) => (c['name'] as String).toLowerCase().contains(textEditingValue.text.toLowerCase()));
+                  return _allCustomers.where(
+                      (c) => tokenMatchSingle(textEditingValue.text, c['name'] as String?));
                 },
                 displayStringForOption: (c) => c['name'] as String,
                 onSelected: (customer) async {
@@ -1039,7 +1063,7 @@ class _AdminBillVerificationTabState extends State<AdminBillVerificationTab> wit
         ]),
         const SizedBox(height: 6),
         Wrap(spacing: 12, runSpacing: 4, children: [
-          Text('Category: $company', style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
+          Text('Brand: $company', style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
           if (teamId.isNotEmpty) Container(
             padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
             decoration: BoxDecoration(

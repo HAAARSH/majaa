@@ -51,6 +51,39 @@ class GeminiOcrService {
     }
   }
 
+  // ─── 1c. FOR CHEQUE PHOTOS ───
+  /// Pulls cheque number, bank name and date off a photo of a cheque.
+  /// All fields are best-effort — the rep can always override / leave blank.
+  /// `date` is returned as `dd/MM/yyyy` or `yyyy-MM-dd` depending on what's
+  /// printed; the caller normalises before storing.
+  static Future<({String? chequeNo, String? bank, String? date, String? amount})>
+      extractChequeData(String imagePath) async {
+    try {
+      final bytes = await File(imagePath).readAsBytes();
+      final result = await _callGeminiBase64(
+        base64Image: base64Encode(bytes),
+        prompt: 'This is a photo of an Indian bank cheque. Extract the '
+            'cheque number (6-digit MICR number at the bottom or the '
+            'number on top-right), the bank name printed on the cheque, '
+            'the date written in the Date box, and the rupee amount in '
+            'the Amount box. Reply ONLY in JSON format: '
+            '{"cheque_no": "value", "bank": "value", "date": "value", '
+            '"amount": "numeric value"}. Use null for any field not '
+            'clearly visible.',
+        extraKeys: const ['cheque_no', 'bank', 'date'],
+      );
+      return (
+        chequeNo: result?['cheque_no'],
+        bank: result?['bank'],
+        date: result?['date'],
+        amount: result?['amount'],
+      );
+    } catch (e) {
+      debugPrint('🚨 GeminiOcrService.extractChequeData error: $e');
+      return (chequeNo: null, bank: null, date: null, amount: null);
+    }
+  }
+
   // ─── 2. FOR UPI SCREENSHOTS ───
   static Future<String?> extractAmount(String imagePath) async {
     try {
@@ -71,14 +104,20 @@ class GeminiOcrService {
   static Future<Map<String, String?>?> _callGeminiFromBytes({
     required Uint8List bytes,
     required String prompt,
+    List<String> extraKeys = const [],
   }) async {
-    return _callGeminiBase64(base64Image: base64Encode(bytes), prompt: prompt);
+    return _callGeminiBase64(
+      base64Image: base64Encode(bytes),
+      prompt: prompt,
+      extraKeys: extraKeys,
+    );
   }
 
   // ─── CORE: from base64 string ───
   static Future<Map<String, String?>?> _callGeminiBase64({
     required String base64Image,
     required String prompt,
+    List<String> extraKeys = const [],
   }) async {
     final apiKey = await _getApiKey();
     if (apiKey.isEmpty) {
@@ -144,10 +183,14 @@ class GeminiOcrService {
         return s;
       }
 
-      return {
+      final out = <String, String?>{
         'bill_no': clean(parsed['bill_no']),
         'amount': clean(parsed['amount']),
       };
+      for (final k in extraKeys) {
+        out[k] = clean(parsed[k]);
+      }
+      return out;
     } catch (e) {
       debugPrint('🚨 GeminiOcrService: Failed to parse JSON: $e');
       return null;

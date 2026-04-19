@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
+import '../../../core/search_utils.dart';
 import '../../../services/supabase_service.dart';
 import '../../../services/auth_service.dart';
 import '../../../services/pin_service.dart';
@@ -23,6 +24,9 @@ class _AdminBeatsTabState extends State<AdminBeatsTab> {
   String? _error;
   final Set<String> _selectedIds = {};
 
+  // Team scope: 'All' fetches beats across both teams; 'JA' / 'MA' restricts.
+  String _teamFilter = 'All';
+
   @override
   void initState() {
     super.initState();
@@ -32,7 +36,10 @@ class _AdminBeatsTabState extends State<AdminBeatsTab> {
   Future<void> _load({bool forceRefresh = false}) async {
     setState(() { _isLoading = true; _error = null; });
     try {
-      final beats = await SupabaseService.instance.getBeats(forceRefresh: forceRefresh);
+      final beats = await SupabaseService.instance.getBeats(
+        forceRefresh: forceRefresh,
+        teamId: _teamFilter == 'All' ? null : _teamFilter,
+      );
       final counts = await SupabaseService.instance.getCustomerCountsByBeat();
       beats.sort((a, b) => a.beatName.toLowerCase().compareTo(b.beatName.toLowerCase()));
       if (!mounted) return;
@@ -387,13 +394,23 @@ class _AdminBeatsTabState extends State<AdminBeatsTab> {
           ),
         ],
       ),
-      body: RefreshIndicator(
-        onRefresh: () => _load(forceRefresh: true),
-        color: AppTheme.primary,
-        child: ListView.builder(
-          padding: const EdgeInsets.fromLTRB(16, 12, 16, 100),
-          itemCount: _beats.length,
-          itemBuilder: (context, index) {
+      body: Column(
+        children: [
+          TeamFilterChips(
+            value: _teamFilter,
+            onChanged: (v) {
+              setState(() => _teamFilter = v);
+              _load(forceRefresh: true);
+            },
+          ),
+          Expanded(
+            child: RefreshIndicator(
+              onRefresh: () => _load(forceRefresh: true),
+              color: AppTheme.primary,
+              child: ListView.builder(
+                padding: const EdgeInsets.fromLTRB(16, 4, 16, 100),
+                itemCount: _beats.length,
+                itemBuilder: (context, index) {
             final b = _beats[index];
             final customerCount = _customerCounts[b.id] ?? 0;
             final isSelected = _selectedIds.contains(b.id);
@@ -426,7 +443,10 @@ class _AdminBeatsTabState extends State<AdminBeatsTab> {
               ),
             );
           },
-        ),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -594,16 +614,14 @@ class _BeatCustomersSheetState extends State<_BeatCustomersSheet> {
   }
 
   void _applySearch() {
-    final q = _searchCtrl.text.toLowerCase();
+    final q = _searchCtrl.text;
     setState(() {
-      if (q.isEmpty) {
+      if (q.trim().isEmpty) {
         _filtered = _customers;
       } else {
-        _filtered = _customers.where((c) =>
-          c.name.toLowerCase().contains(q) ||
-          c.phone.toLowerCase().contains(q) ||
-          c.address.toLowerCase().contains(q)
-        ).toList();
+        _filtered = _customers
+            .where((c) => tokenMatch(q, [c.name, c.phone, c.address]))
+            .toList();
       }
     });
   }

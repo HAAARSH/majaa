@@ -16,6 +16,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
   String? _error;
   Map<String, dynamic> _analytics = {};
   bool _myOnly = true; // true = My Sales, false = Team Sales
+  List<String>? _allowedBrands; // non-null & non-empty = brand_rep scope
+
+  bool get _isBrandRep => SupabaseService.instance.currentUserRole == 'brand_rep';
 
   @override
   void initState() {
@@ -29,7 +32,16 @@ class _DashboardScreenState extends State<DashboardScreen> {
       _error = null;
     });
     try {
-      final analytics = await SupabaseService.instance.getSalesAnalytics(myOnly: _myOnly);
+      if (_isBrandRep && _allowedBrands == null) {
+        final uid = SupabaseService.instance.client.auth.currentUser?.id;
+        _allowedBrands = uid != null
+            ? await SupabaseService.instance.getUserBrandAccess(uid)
+            : <String>[];
+      }
+      final analytics = await SupabaseService.instance.getSalesAnalytics(
+        myOnly: _myOnly,
+        allowedBrands: _isBrandRep ? _allowedBrands : null,
+      );
       if (!mounted) return;
       setState(() {
         _analytics = analytics;

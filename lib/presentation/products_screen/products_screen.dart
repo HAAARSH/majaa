@@ -38,11 +38,16 @@ class _ProductsScreenState extends State<ProductsScreen>
   List<Product> _displayedProducts = []; // active category products
   List<Product> _allProducts = []; // populated on full refresh (for banner count)
 
+  // Track whether the current display is smart-sorted (most-ordered first)
+  // or fell back to plain A→Z. Exposed so the UI can show a small hint.
+  bool _smartSortActive = false;
+
   // ─── Smart sorting: Past items first for "All" category ───
   Future<List<Product>> _applySmartSorting(List<Product> products) async {
     // Only apply smart sorting for "All" category
     if (_selectedCategory != 'All') {
       products.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+      _smartSortActive = false;
       return products;
     }
 
@@ -50,15 +55,17 @@ class _ProductsScreenState extends State<ProductsScreen>
     final customer = _preSelectedCustomer;
     if (customer == null) {
       products.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+      _smartSortActive = false;
       return products;
     }
 
     try {
       // Extract product IDs from customer's order history with frequency
       final productFrequencies = await _getCustomerPurchasedProductIds(customer.id);
-      
+
       if (productFrequencies.isEmpty) {
         products.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+        _smartSortActive = false;
         return products;
       }
 
@@ -90,10 +97,12 @@ class _ProductsScreenState extends State<ProductsScreen>
       unpurchasedProducts.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
 
       // Combine: purchased products first, then unpurchased
+      _smartSortActive = purchasedProducts.isNotEmpty;
       return [...purchasedProducts, ...unpurchasedProducts];
     } catch (e) {
       // Fallback to alphabetical sorting if smart sorting fails
       products.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+      _smartSortActive = false;
       return products;
     }
   }
@@ -153,6 +162,12 @@ class _ProductsScreenState extends State<ProductsScreen>
   bool _brandAccessDenied = false; // true when brand_rep has zero allowed brands
   // ADDED: Stock visibility control — default true (show stock)
   bool _showStock = true;
+
+  // Brand_rep role: strict brand filter (no empty-category fallback) to
+  // prevent uncategorized products from leaking across brand boundaries.
+  // Sales_rep keeps the permissive OR so they still see legitimately
+  // uncategorized products on their route.
+  bool get _isBrandRep => SupabaseService.instance.currentUserRole == 'brand_rep';
 
   // ADDED: Computed filtered lists — hide products with stock_qty <= 0
   List<Product> get _inStockDisplayed => _displayedProducts.where((p) => p.stockQty > 0).toList();
@@ -293,7 +308,15 @@ class _ProductsScreenState extends State<ProductsScreen>
       final models =
           await SupabaseService.instance.getProductsByCategory(categoryId, forceRefresh: forceRefresh, teamId: teamId);
       if (!mounted) return;
-      final products = models.map((m) => Product.fromModel(m)).toList();
+      var products = models.map((m) => Product.fromModel(m)).toList();
+      // Filter disallowed brands at list time so the rep never sees products
+      // they cannot order — previously this check ran at submit and forced a
+      // cart rework mid-shop, breaking trust.
+      if (_allowedBrands.isNotEmpty) {
+        products = products.where((p) => _isBrandRep
+            ? _allowedBrands.contains(p.category)
+            : (p.category.isEmpty || _allowedBrands.contains(p.category))).toList();
+      }
       products
           .sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
       setState(() {
@@ -388,10 +411,13 @@ class _ProductsScreenState extends State<ProductsScreen>
           debugPrint('WARNING: ${missingCategoryProducts.length} products have missing/empty category: '
               '${missingCategoryProducts.map((p) => p.name).take(5).join(", ")}');
         }
-        // Include products with empty category in "All" view
-        products = products.where((p) =>
-            p.category.isEmpty ||
-            _allowedBrands.contains(p.category)).toList();
+        // Sales_rep: include products with empty category (might be
+        // legitimately uncategorized). Brand_rep: strict — unknown category
+        // is treated as out-of-scope to avoid leaking competitor products
+        // whose category metadata is missing.
+        products = products.where((p) => _isBrandRep
+            ? _allowedBrands.contains(p.category)
+            : (p.category.isEmpty || _allowedBrands.contains(p.category))).toList();
       }
 
       // Apply smart sorting for "All" category
@@ -461,8 +487,16 @@ class _ProductsScreenState extends State<ProductsScreen>
     }
 
     try {
-      final models = await SupabaseService.instance
-          .searchProducts(query, page: _searchPage);
+      // Brand_rep: scope search to allowed brands across teams so cross-team
+      // brand products are findable by typing (matches category-chip browse).
+      // Sales_rep: leave team_id scoped — original behavior.
+      final models = await SupabaseService.instance.searchProducts(
+        query,
+        page: _searchPage,
+        allowedBrands: _isBrandRep && _allowedBrands.isNotEmpty
+            ? _allowedBrands
+            : null,
+      );
       if (!mounted) return;
       var products = models.map((m) => Product.fromModel(m)).toList();
 
@@ -477,11 +511,12 @@ class _ProductsScreenState extends State<ProductsScreen>
       }
 
       // Filter search results by allowed brands (same as category/all views)
-      // Include products with empty category so they are not silently dropped
+      // Sales_rep: include empty-category (legitimately uncategorized).
+      // Brand_rep: strict — empty category treated as out-of-scope.
       if (_allowedBrands.isNotEmpty) {
-        products = products.where((p) =>
-            p.category.isEmpty ||
-            _allowedBrands.contains(p.category)).toList();
+        products = products.where((p) => _isBrandRep
+            ? _allowedBrands.contains(p.category)
+            : (p.category.isEmpty || _allowedBrands.contains(p.category))).toList();
       }
       // Filter by selected category (unless 'All')
       if (_selectedCategory != 'All') {
@@ -758,11 +793,47 @@ class _ProductsScreenState extends State<ProductsScreen>
                         SliverFillRemaining(
                           hasScrollBody: false,
                           child: Center(
-                            child: Text('No products found',
-                                style: GoogleFonts.manrope(
-                                    color: AppTheme.onSurfaceVariant))),
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(Icons.inventory_2_outlined, size: 48, color: AppTheme.onSurfaceVariant.withAlpha(80)),
+                                const SizedBox(height: 12),
+                                Text('No products found', style: GoogleFonts.manrope(fontSize: 14, fontWeight: FontWeight.w600, color: AppTheme.onSurfaceVariant)),
+                                const SizedBox(height: 4),
+                                Text(_selectedCategory != null ? 'Try selecting "All" brand or search by name' : 'Products may still be loading. Pull down to refresh.',
+                                    style: GoogleFonts.manrope(fontSize: 12, color: AppTheme.onSurfaceVariant.withAlpha(180)),
+                                    textAlign: TextAlign.center),
+                              ],
+                            )),
                         ),
                       ] else ...[
+                        // Hint when customer's most-ordered products are
+                        // bubbling to the top — lets the rep know the order
+                        // they see isn't plain A→Z and the first items are
+                        // the ones this shop usually reorders.
+                        if (_smartSortActive &&
+                            _selectedCategory == 'All' &&
+                            _preSelectedCustomer != null)
+                          SliverToBoxAdapter(
+                            child: Padding(
+                              padding: EdgeInsets.fromLTRB(
+                                  showSidebar ? 86.0 : 16.0, 8, 16, 0),
+                              child: Row(
+                                children: [
+                                  Icon(Icons.auto_awesome_rounded,
+                                      size: 14, color: AppTheme.primary),
+                                  const SizedBox(width: 6),
+                                  Text(
+                                    'Past purchases first',
+                                    style: GoogleFonts.manrope(
+                                        fontSize: 11,
+                                        fontWeight: FontWeight.w600,
+                                        color: AppTheme.primary),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
                         SliverPadding(
                           padding: EdgeInsets.fromLTRB(
                             showSidebar ? 86.0 : 16.0, 10, 16, 100),

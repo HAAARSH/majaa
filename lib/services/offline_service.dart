@@ -13,14 +13,30 @@ class OfflineService {
   late Box _orderBox;
   late Box _operationBox; // Generic queue for ALL offline operations
   final ValueNotifier<int> syncStatus = ValueNotifier<int>(0); // 0:Idle, 1:Syncing, 2:Success, 3:Error
+  // Exposed for the global sync banner so UI can react without polling.
+  final ValueNotifier<int> pendingCountNotifier = ValueNotifier<int>(0);
 
   Timer? _cacheRefreshTimer;
   Timer? _syncDebounce;
+  Timer? _endOfDayTimer;
   StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
+  DateTime? _lastEndOfDayAlert;
 
   Future<void> init() async {
     _orderBox = await Hive.openBox('offline_orders');
     _operationBox = await Hive.openBox('offline_operations');
+    _refreshPendingCount();
+  }
+
+  void _refreshPendingCount() {
+    pendingCountNotifier.value = _orderBox.length + _operationBox.length;
+  }
+
+  /// Exposed for the banner's Retry button. Same as syncAll but refreshes
+  /// the pending-count notifier on completion so the banner updates.
+  Future<void> forceSyncNow() async {
+    await syncAll();
+    _refreshPendingCount();
   }
 
   /// Starts connectivity monitoring for offline sync AND
@@ -41,6 +57,13 @@ class OfflineService {
       final connectivity = await Connectivity().checkConnectivity();
       if (connectivity.contains(ConnectivityResult.none)) return;
 
+      // Hourly: also retry any pending sync work so queued orders don't rot
+      // silently between connectivity blips.
+      if (pendingCountNotifier.value > 0) {
+        debugPrint('[OfflineService] Hourly auto-resync firing for ${pendingCountNotifier.value} pending');
+        await syncAll();
+      }
+
       debugPrint('[OfflineService] Auto-refreshing cache');
       try {
         await SupabaseService.instance.getProducts(forceRefresh: true);
@@ -52,6 +75,42 @@ class OfflineService {
         debugPrint('[OfflineService] Cache refresh error: $e');
       }
     });
+
+    // Daily end-of-day check: every 10 min, if local hour >= 21 (9 PM) and
+    // work is still pending, fire one last syncAll and then log an admin
+    // alert if the queue is still non-empty. Use a _lastEndOfDayAlert guard
+    // so we only alert once per day even though the check runs every 10 min.
+    _endOfDayTimer?.cancel();
+    _endOfDayTimer = Timer.periodic(const Duration(minutes: 10), (_) async {
+      final now = DateTime.now();
+      if (now.hour < 21) return;
+      if (pendingCountNotifier.value == 0) return;
+      // Dedup: one alert per calendar day
+      if (_lastEndOfDayAlert != null &&
+          _lastEndOfDayAlert!.year == now.year &&
+          _lastEndOfDayAlert!.month == now.month &&
+          _lastEndOfDayAlert!.day == now.day) {
+        return;
+      }
+      debugPrint('[OfflineService] End-of-day sync check — ${pendingCountNotifier.value} still pending');
+      await syncAll();
+      if (pendingCountNotifier.value > 0) {
+        try {
+          await SupabaseService.instance.client.from('app_error_logs').insert({
+            'error_type': 'sync_unfinished_eod',
+            'error_message':
+                '${pendingCountNotifier.value} offline operation(s) still unsynced at end of day on ${now.toIso8601String()}',
+            'resolved': false,
+            'team_id': AuthService.currentTeam,
+          });
+          _lastEndOfDayAlert = now;
+        } catch (e) {
+          debugPrint('[OfflineService] Failed to push EoD admin alert: $e');
+        }
+      } else {
+        _lastEndOfDayAlert = now; // avoid re-checking today
+      }
+    });
   }
 
   void stopMonitoring() {
@@ -59,6 +118,8 @@ class OfflineService {
     _cacheRefreshTimer = null;
     _syncDebounce?.cancel();
     _syncDebounce = null;
+    _endOfDayTimer?.cancel();
+    _endOfDayTimer = null;
     _connectivitySub?.cancel();
     _connectivitySub = null;
   }
@@ -76,18 +137,24 @@ class OfflineService {
   /// [type]: 'order', 'collection', 'delivery_status', 'bill_upload', etc.
   /// [data]: operation-specific payload.
   Future<void> queueOperation(String type, Map<String, dynamic> data) async {
-    // Check for duplicate before adding
+    // Dedup on content, not just order_id — otherwise editing an order offline
+    // is silently dropped because it shares the order_id with the original.
+    // Two queued ops with the same type + same order_id are only duplicates
+    // when the payload JSON is byte-identical.
+    final newFingerprint = jsonEncode(data);
     final existingOps = _operationBox.values.toList();
     final isDuplicate = existingOps.any((op) {
       final existingType = (op as Map)['type'];
-      final existingData = op['data'] as Map?;
-      final newData = data;
-      return existingType == type &&
-          existingData?['order_id'] == newData['order_id'] &&
-          newData.containsKey('order_id');
+      final existingData = op['data'];
+      if (existingType != type) return false;
+      try {
+        return jsonEncode(existingData) == newFingerprint;
+      } catch (_) {
+        return false;
+      }
     });
     if (isDuplicate) {
-      debugPrint('\u26a0\ufe0f OfflineService: Skipping duplicate $type for order ${data['order_id']}');
+      debugPrint('\u26a0\ufe0f OfflineService: Skipping identical $type for order ${data['order_id']}');
       return;
     }
 
@@ -97,6 +164,7 @@ class OfflineService {
       'queued_at': DateTime.now().toIso8601String(),
       'team_id': AuthService.currentTeam,
     });
+    _refreshPendingCount();
     debugPrint('[OfflineService] Queued $type operation');
     // Try to sync immediately
     syncAll();
@@ -109,6 +177,7 @@ class OfflineService {
     List<Map<String, dynamic>> orderItems,
   ) async {
     await _orderBox.add({'order': orderData, 'items': orderItems});
+    _refreshPendingCount();
     syncAll();
   }
 
@@ -116,6 +185,7 @@ class OfflineService {
 
   Future<void> syncAll() async {
     if (syncStatus.value == 1) return;
+    _refreshPendingCount();
     if (!await isOnline()) return;
 
     syncStatus.value = 1;
@@ -127,6 +197,8 @@ class OfflineService {
 
     // 2. Sync generic operations
     await _syncOperations().then((r) { synced += r.$1; failed += r.$2; });
+
+    _refreshPendingCount();
 
     if (failed > 0 && synced == 0) {
       syncStatus.value = 3;
@@ -267,6 +339,7 @@ class OfflineService {
       totalUnits: data['total_units'] as int? ?? 0,
       notes: data['notes'] as String? ?? '',
       items: items,
+      isOutOfBeat: data['is_out_of_beat'] as bool? ?? false,
     );
   }
 
@@ -306,6 +379,7 @@ class OfflineService {
       beatId: data['beat_id'] as String,
       reason: data['visit_purpose'] as String? ?? data['reason'] as String? ?? 'sales_call',
       notes: data['notes'] as String? ?? '',
+      isOutOfBeat: data['is_out_of_beat'] as bool? ?? false,
     );
   }
 

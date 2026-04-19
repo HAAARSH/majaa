@@ -5,6 +5,7 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:csv/csv.dart';
 
+import '../../../core/search_utils.dart';
 import '../../../services/supabase_service.dart';
 import '../../../theme/app_theme.dart';
 import './admin_shared_widgets.dart';
@@ -75,7 +76,7 @@ class _AdminCustomersTabState extends State<AdminCustomersTab> {
   }
 
   void _applySearch() {
-    final q = _searchController.text.toLowerCase();
+    final q = _searchController.text;
     setState(() {
       _displayLimit = 200;
       _filtered = _customers.where((c) {
@@ -87,13 +88,8 @@ class _AdminCustomersTabState extends State<AdminCustomersTab> {
           final hasBeat = c.beatIdForTeam('JA') != null || c.beatIdForTeam('MA') != null;
           if (hasTeam || hasBeat) return false;
         }
-        // Search filter
-        if (q.isNotEmpty) {
-          return c.name.toLowerCase().contains(q) ||
-              c.phone.toLowerCase().contains(q) ||
-              c.address.toLowerCase().contains(q);
-        }
-        return true;
+        // Tokenized search filter
+        return tokenMatch(q, [c.name, c.phone, c.address]);
       }).toList()
         ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
     });
@@ -299,6 +295,19 @@ class _AdminCustomersTabState extends State<AdminCustomersTab> {
             ),
           ),
           actions: [
+            // Delete offered only when editing an existing customer.
+            // Closes the dialog first, then _confirmDeleteCustomer opens its
+            // own Cancel/Delete AlertDialog. Same safety pattern as products
+            // tab (#SA4).
+            if (customer != null)
+              TextButton.icon(
+                onPressed: () {
+                  Navigator.pop(ctx);
+                  _confirmDeleteCustomer(customer);
+                },
+                icon: Icon(Icons.delete_outline_rounded, color: Colors.red.shade600, size: 18),
+                label: Text('Delete', style: GoogleFonts.manrope(color: Colors.red.shade600, fontWeight: FontWeight.w700)),
+              ),
             TextButton(onPressed: () => Navigator.pop(ctx), child: Text('Cancel', style: GoogleFonts.manrope())),
             ElevatedButton(
               style: ElevatedButton.styleFrom(backgroundColor: AppTheme.primary, shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))),
@@ -553,7 +562,6 @@ class _AdminCustomersTabState extends State<AdminCustomersTab> {
                           return _CustomerCard(
                             customer: c,
                             onEdit: () => _showCustomerDialog(c),
-                            onDelete: () => _confirmDeleteCustomer(c),
                           );
                         },
                       ),
@@ -676,12 +684,10 @@ class _AdminCustomersTabState extends State<AdminCustomersTab> {
 class _CustomerCard extends StatelessWidget {
   final CustomerModel customer;
   final VoidCallback onEdit;
-  final VoidCallback onDelete;
 
   const _CustomerCard({
     required this.customer,
     required this.onEdit,
-    required this.onDelete,
   });
 
   @override
@@ -752,6 +758,8 @@ class _CustomerCard extends StatelessWidget {
             const SizedBox(width: 12),
             Column(
               children: [
+                // Single Edit affordance. Delete lives inside the edit dialog
+                // behind a confirm (same pattern as products tab — see #SA4).
                 GestureDetector(
                   onTap: onEdit,
                   child: Container(
@@ -767,26 +775,6 @@ class _CustomerCard extends StatelessWidget {
                         fontSize: 12,
                         fontWeight: FontWeight.w600,
                         color: AppTheme.primary,
-                      ),
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 8),
-                GestureDetector(
-                  onTap: onDelete,
-                  child: Container(
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-                    decoration: BoxDecoration(
-                      color: Colors.red.shade50,
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Text(
-                      'Delete',
-                      style: GoogleFonts.manrope(
-                        fontSize: 12,
-                        fontWeight: FontWeight.w600,
-                        color: Colors.red,
                       ),
                     ),
                   ),

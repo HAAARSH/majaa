@@ -1,4 +1,7 @@
+import 'dart:math';
+
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:fluttertoast/fluttertoast.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -12,7 +15,6 @@ import './widgets/order_header_widget.dart';
 import './widgets/order_line_item_widget.dart';
 import './widgets/order_totals_card_widget.dart';
 import './widgets/order_notes_widget.dart';
-import './widgets/customer_info_card_widget.dart';
 
 class OrderCreationScreen extends StatefulWidget {
   const OrderCreationScreen({super.key});
@@ -29,10 +31,10 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
   // 1. The Order Number variable
   late String _orderNumber;
 
-  // 2. The Locked Date Variables we just added
-  DateTime _selectedDate = DateTime.now();
-  final DateTime _minDate = DateTime.now().subtract(const Duration(days: 1));
-  final DateTime _maxDate = DateTime.now().add(const Duration(days: 1));
+  // Delivery date is fixed to tomorrow. Whether it actually ships on time
+  // is an admin/delivery concern, not the rep's.
+  final DateTime _selectedDate =
+      DateTime.now().add(const Duration(days: 1));
 
   CustomerModel? get _selectedCustomer => CartService.instance.currentCustomer;
   BeatModel? get _selectedBeat => CartService.instance.currentBeat;
@@ -43,9 +45,12 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
   void initState() {
     super.initState();
 
-    // Reuse original order ID when editing, generate new one for fresh orders
+    // Reuse original order ID when editing, generate new one for fresh orders.
+    // Full 13-digit millis + 4-hex-char random suffix so two reps submitting
+    // within the same second cannot collide (createOrder uses upsert).
+    final rand = Random().nextInt(0xFFFF).toRadixString(16).toUpperCase().padLeft(4, '0');
     _orderNumber = CartService.instance.editingOrderId ??
-        'ORD-${DateTime.now().millisecondsSinceEpoch.toString().substring(7)}';
+        'ORD-${DateTime.now().millisecondsSinceEpoch}-$rand';
   }
 
   @override
@@ -54,38 +59,19 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
     super.dispose();
   }
 
-  Future<void> _selectLockedDate(BuildContext context) async {
-    final DateTime? picked = await showDatePicker(
-      context: context,
-      initialDate: _selectedDate,
-      firstDate: _minDate, // 🚨 LOCKED: Cannot pick before yesterday
-      lastDate: _maxDate,  // 🚨 LOCKED: Cannot pick after tomorrow
-      builder: (context, child) {
-        return Theme(
-          data: Theme.of(context).copyWith(
-            colorScheme: ColorScheme.light(
-              primary: AppTheme.primary, // Selection color
-              onPrimary: Colors.white,
-              onSurface: Colors.black,
-            ),
-          ),
-          child: child!,
-        );
-      },
-    );
-
-    if (picked != null && picked != _selectedDate) {
-      setState(() {
-        _selectedDate = picked;
-      });
-    }
-  }
-
-
   Future<void> _shareToWhatsApp(String orderId, double total) async {
     if (_selectedCustomer == null) return;
 
     final String phone = _selectedCustomer!.phone;
+    // Guard: without a phone, whatsapp://send?phone= opens a blank chat and
+    // wa.me/ opens a browser error. Tell the rep directly instead.
+    if (phone.trim().isEmpty || phone.trim().toLowerCase() == 'no phone') {
+      Fluttertoast.showToast(
+        msg: 'No phone number on file — cannot share via WhatsApp.',
+        toastLength: Toast.LENGTH_LONG,
+      );
+      return;
+    }
     final String message =
         "✨ *Order Confirmation* ✨\n"
         "━━━━━━━━━━━━━━━\n"
@@ -115,6 +101,73 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
     if (_submitLock) return;
     _submitLock = true;
 
+    if (_selectedCustomer == null) {
+      Fluttertoast.showToast(msg: 'Please select a customer');
+      _submitLock = false;
+      return;
+    }
+
+    // Defense-in-depth: brand access is enforced at product list time
+    // (see products_screen), but a stale cart restored from a previous
+    // session could theoretically contain now-disallowed items. Instead of
+    // silently dropping them, we block submit with a confirmation listing
+    // the affected items so the rep knows exactly what's being removed and
+    // can renegotiate with the customer before placing the order.
+    final userId = SupabaseService.instance.client.auth.currentUser?.id;
+    if (userId != null) {
+      final allowedBrands = await SupabaseService.instance.getUserBrandAccess(userId);
+      if (allowedBrands.isNotEmpty) {
+        final violating = CartService.instance.cartNotifier.value
+            .where((ci) => !allowedBrands.contains(ci.product.category)).toList();
+        if (violating.isNotEmpty) {
+          final proceed = await showDialog<bool>(
+            context: context,
+            barrierDismissible: false,
+            builder: (ctx) => AlertDialog(
+              title: const Text('Some items are no longer allowed'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Your brand access has changed. These items must be removed before placing the order:',
+                  ),
+                  const SizedBox(height: 12),
+                  ...violating.map((ci) => Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 2),
+                        child: Text(
+                          '• ${ci.product.name}  ×${ci.quantity}',
+                          style: const TextStyle(fontWeight: FontWeight.w600),
+                        ),
+                      )),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(ctx, false),
+                  child: const Text('Cancel & Review'),
+                ),
+                FilledButton(
+                  onPressed: () => Navigator.pop(ctx, true),
+                  child: const Text('Remove & Continue'),
+                ),
+              ],
+            ),
+          );
+          if (proceed != true) {
+            _submitLock = false;
+            return;
+          }
+          for (final item in violating) {
+            CartService.instance.deleteItemEntirely(item.product);
+          }
+        }
+      }
+    }
+    if (!mounted) { _submitLock = false; return; }
+
+    // Re-read the cart AFTER any brand-access strip so we never submit a cart
+    // that was mutated behind our back.
     final cartItems = CartService.instance.cartNotifier.value;
 
     if (cartItems.isEmpty) {
@@ -123,30 +176,22 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
       return;
     }
 
-    if (_selectedCustomer == null) {
-      Fluttertoast.showToast(msg: 'Please select a customer');
+    // Resolve beat_name with explicit fallbacks. Reject submit if none found —
+    // an empty beat_name breaks route grouping, Next-Day-Due, and delivery manifests.
+    final customerBeatName = _selectedCustomer!.beatNameForTeam(AuthService.currentTeam);
+    final resolvedBeatName = customerBeatName.isNotEmpty
+        ? customerBeatName
+        : (_selectedBeat?.beatName.isNotEmpty == true
+            ? _selectedBeat!.beatName
+            : (CartService.instance.editingOriginalBeatName ?? ''));
+
+    if (resolvedBeatName.isEmpty) {
+      Fluttertoast.showToast(
+        msg: 'Beat not set — cannot place order. Assign this customer to a beat first.',
+        toastLength: Toast.LENGTH_LONG,
+      );
       _submitLock = false;
       return;
-    }
-
-    // Brand access guard — remove items not in allowed brands
-    final userId = SupabaseService.instance.client.auth.currentUser?.id;
-    if (userId != null) {
-      final allowedBrands = await SupabaseService.instance.getUserBrandAccess(userId);
-      if (allowedBrands.isNotEmpty) {
-        final violating = cartItems.where((ci) => !allowedBrands.contains(ci.product.category)).toList();
-        if (violating.isNotEmpty) {
-          for (final item in violating) {
-            CartService.instance.deleteItemEntirely(item.product);
-          }
-          Fluttertoast.showToast(
-            msg: '${violating.length} item(s) removed — not in your allowed brands',
-            toastLength: Toast.LENGTH_LONG,
-          );
-          _submitLock = false;
-          return; // let user review the updated cart before re-submitting
-        }
-      }
     }
 
     setState(() => _isSubmitting = true);
@@ -190,7 +235,7 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
         orderId: _orderNumber,
         customerId: _selectedCustomer!.id,
         customerName: _selectedCustomer!.name,
-        beat: _selectedCustomer!.beatNameForTeam(AuthService.currentTeam).isNotEmpty ? _selectedCustomer!.beatNameForTeam(AuthService.currentTeam) : _selectedBeat?.beatName ?? '',
+        beat: resolvedBeatName,
         deliveryDate: _selectedDate,
         subtotal: subtotal,
         vat: totalGst,
@@ -199,6 +244,7 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
         totalUnits: totalUnits,
         notes: _notesController.text,
         items: itemsJson,
+        isOutOfBeat: CartService.instance.isOutOfBeat,
       );
 
       await SupabaseService.instance.updateCustomerLastOrder(
@@ -206,10 +252,26 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
         grandTotal,
       );
 
+      // Auto-log a visit on successful order submission so "Not Visited" badge
+      // clears immediately and visit analytics count customers with orders as
+      // visited. Skipped on edit — the original order already produced a visit.
+      if (!_isEditing) {
+        try {
+          await SupabaseService.instance.logVisit(
+            customerId: _selectedCustomer!.id,
+            beatId: _selectedBeat?.id ?? '',
+            reason: 'order_placed',
+            isOutOfBeat: CartService.instance.isOutOfBeat,
+          );
+        } catch (_) {
+          // Don't block the order success on a visit-log hiccup.
+        }
+      }
+
       if (mounted) {
         setState(() => _isSubmitting = false);
         _submitLock = false;
-        _showSuccessDialog(total: grandTotal);
+        _showSuccessDialog(total: grandTotal, isOffline: false);
       }
     } catch (e) {
       // Offline fallback — queue order for later sync
@@ -218,7 +280,8 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
           'order_id': _orderNumber,
           'customer_id': _selectedCustomer!.id,
           'customer_name': _selectedCustomer!.name,
-          'beat': _selectedCustomer!.beatNameForTeam(AuthService.currentTeam).isNotEmpty ? _selectedCustomer!.beatNameForTeam(AuthService.currentTeam) : _selectedBeat?.beatName ?? '',
+          'beat': resolvedBeatName,
+          'is_out_of_beat': CartService.instance.isOutOfBeat,
           'delivery_date': _selectedDate.toIso8601String(),
           'subtotal': subtotal,
           'vat': totalGst,
@@ -228,11 +291,23 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
           'notes': _notesController.text,
           'items': itemsJson,
         });
+        // Also queue an auto-visit log so offline orders still count as visits
+        // once sync runs. Same edit-guard as the online path.
+        if (!_isEditing) {
+          try {
+            await OfflineService.instance.queueOperation('visit_log', {
+              'customer_id': _selectedCustomer!.id,
+              'beat_id': _selectedBeat?.id ?? '',
+              'reason': 'order_placed',
+              'is_out_of_beat': CartService.instance.isOutOfBeat,
+            });
+          } catch (_) {}
+        }
         if (mounted) {
           setState(() => _isSubmitting = false);
           _submitLock = false;
           Fluttertoast.showToast(msg: 'Order queued offline — will sync when connected');
-          _showSuccessDialog(total: grandTotal);
+          _showSuccessDialog(total: grandTotal, isOffline: true);
         }
         return;
       } catch (_) {}
@@ -244,7 +319,106 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
     }
   }
 
-  void _showSuccessDialog({required double total}) {
+  Widget _buildCustomerSummaryCard(CustomerModel customer) {
+    final hasPhone = customer.phone.trim().isNotEmpty &&
+        customer.phone.trim().toLowerCase() != 'no phone';
+    final hasAddress = customer.address.trim().isNotEmpty;
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: AppTheme.surface,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: AppTheme.outlineVariant),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 36,
+                height: 36,
+                decoration: BoxDecoration(
+                  color: AppTheme.primaryContainer,
+                  shape: BoxShape.circle,
+                ),
+                child: const Icon(Icons.storefront_rounded,
+                    size: 18, color: AppTheme.primary),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Billing To',
+                      style: GoogleFonts.manrope(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w500,
+                        color: AppTheme.onSurfaceVariant,
+                      ),
+                    ),
+                    Text(
+                      customer.name,
+                      style: GoogleFonts.manrope(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w700,
+                        color: AppTheme.onSurface,
+                      ),
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              const Icon(Icons.phone_outlined,
+                  size: 14, color: AppTheme.onSurfaceVariant),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  hasPhone ? customer.phone : 'No phone',
+                  style: GoogleFonts.manrope(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: hasPhone ? AppTheme.onSurface : Colors.red,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Padding(
+                padding: EdgeInsets.only(top: 2),
+                child: Icon(Icons.location_on_outlined,
+                    size: 14, color: AppTheme.onSurfaceVariant),
+              ),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  hasAddress ? customer.address : 'No address',
+                  style: GoogleFonts.manrope(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w500,
+                    color: AppTheme.onSurfaceVariant,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showSuccessDialog({required double total, required bool isOffline}) {
     final currentOrderId = _orderNumber;
 
     showDialog(
@@ -259,14 +433,63 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
             const Icon(Icons.check_circle_rounded, color: Colors.green, size: 64),
             const SizedBox(height: 16),
             Text(
-              'Order Placed!',
+              isOffline ? 'Order Saved!' : 'Order Placed!',
               style: GoogleFonts.manrope(fontSize: 20, fontWeight: FontWeight.w800),
             ),
             const SizedBox(height: 8),
-            Text(
-              'Order ID: $currentOrderId',
-              style: GoogleFonts.manrope(fontSize: 14, color: AppTheme.onSurfaceVariant),
+            // Bigger, primary-colored, tappable to copy. Reps read it
+            // quickly at the shop counter and often paste it into WhatsApp.
+            InkWell(
+              onTap: () async {
+                await Clipboard.setData(ClipboardData(text: currentOrderId));
+                Fluttertoast.showToast(msg: 'Order ID copied');
+              },
+              borderRadius: BorderRadius.circular(8),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      'Order ID: $currentOrderId',
+                      style: GoogleFonts.manrope(
+                        fontSize: 16,
+                        fontWeight: FontWeight.w700,
+                        color: AppTheme.primary,
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Icon(Icons.copy_rounded, size: 16, color: AppTheme.primary),
+                  ],
+                ),
+              ),
             ),
+            if (isOffline) ...[
+              const SizedBox(height: 10),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                decoration: BoxDecoration(
+                  color: Colors.orange.shade100,
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(color: Colors.orange.shade700, width: 1),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.cloud_off_rounded, size: 16, color: Colors.orange.shade900),
+                    const SizedBox(width: 6),
+                    Text(
+                      'Saved offline — will upload when connected',
+                      style: GoogleFonts.manrope(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                        color: Colors.orange.shade900,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
             const SizedBox(height: 24),
             SizedBox(
               width: double.infinity,
@@ -307,13 +530,45 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
+    return PopScope(
+      canPop: !_submitLock,
+      child: Scaffold(
       backgroundColor: AppTheme.background,
       appBar: AppBar(
         title: Text('Review Order', style: GoogleFonts.manrope(fontWeight: FontWeight.w700)),
         backgroundColor: AppTheme.surface,
         elevation: 0,
         centerTitle: true,
+        // OOB badge — makes it obvious to the rep (and anyone looking over
+        // their shoulder) that this order is tagged as out-of-beat. Prevents
+        // accidentally submitting an OOB order thinking it's a normal one.
+        bottom: CartService.instance.isOutOfBeat
+            ? PreferredSize(
+                preferredSize: const Size.fromHeight(28),
+                child: Container(
+                  width: double.infinity,
+                  color: Colors.orange.shade700,
+                  padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 16),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      const Icon(Icons.add_location_alt_rounded, color: Colors.white, size: 14),
+                      const SizedBox(width: 6),
+                      Text(
+                        'OUT OF BEAT ORDER',
+                        style: GoogleFonts.manrope(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w800,
+                          color: Colors.white,
+                          letterSpacing: 0.6,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              )
+            : null,
       ),
       body: ValueListenableBuilder<List<CartItem>>(
         valueListenable: CartService.instance.cartNotifier,
@@ -353,8 +608,10 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
                   padding: const EdgeInsets.all(16),
                   children: [
                     OrderHeaderWidget(orderNumber: _orderNumber, orderDate: _selectedDate),
-                    const SizedBox(height: 16),
-                    const SizedBox(height: 10),
+                    const SizedBox(height: 12),
+                    if (_selectedCustomer != null)
+                      _buildCustomerSummaryCard(_selectedCustomer!),
+                    const SizedBox(height: 14),
                     Container(
                       decoration: BoxDecoration(
                         color: AppTheme.surface,
@@ -416,6 +673,6 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
           );
         },
       ),
-    );
+    ));
   }
 }

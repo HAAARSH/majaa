@@ -211,3 +211,56 @@ Widget buildAdminTextField(
     ),
   );
 }
+
+/// Shared JA / MA / All chip row for super-admin tabs that need a team scope
+/// picker. [value] is one of 'All', 'JA', 'MA'. Tap calls [onChanged].
+class TeamFilterChips extends StatelessWidget {
+  final String value;
+  final ValueChanged<String> onChanged;
+  final bool includeAll;
+  const TeamFilterChips({
+    super.key,
+    required this.value,
+    required this.onChanged,
+    this.includeAll = true,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final options = <(String, String)>[
+      if (includeAll) ('All', 'All Teams'),
+      ('JA', 'Jagannath'),
+      ('MA', 'Madhav'),
+    ];
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      child: Row(
+        children: options.map((o) {
+          final selected = value == o.$1;
+          return Padding(
+            padding: const EdgeInsets.only(right: 8),
+            child: GestureDetector(
+              onTap: () => onChanged(o.$1),
+              child: AnimatedContainer(
+                duration: const Duration(milliseconds: 180),
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+                decoration: BoxDecoration(
+                  color: selected ? AppTheme.secondary : AppTheme.secondary.withValues(alpha: 0.08),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: Text(
+                  o.$2,
+                  style: GoogleFonts.manrope(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                    color: selected ? Colors.white : AppTheme.secondary,
+                  ),
+                ),
+              ),
+            ),
+          );
+        }).toList(),
+      ),
+    );
+  }
+}

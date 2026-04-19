@@ -15,7 +15,27 @@ export '../models/models.dart';
 // Existing code that imports supabase_service.dart still sees all model
 // classes via the `import '../models/models.dart'` above.
 
+/// One bill's share of a settle event — see [SupabaseService.settleOrderBills].
+class BillAllocation {
+  final String billNo;
+  final String? orderId;
+  final double amount;
+  final double orderOutstanding;
+
+  const BillAllocation({
+    required this.billNo,
+    this.orderId,
+    required this.amount,
+    required this.orderOutstanding,
+  });
+}
+
 // ─── CORE SERVICE ────────────────────────────────────────────────────────
+
+/// Sentinel marker distinguishing "teamId omitted" (use currentTeam) from
+/// "teamId passed as null" (all teams, no filter). Needed because nullable
+/// String params can't tell omission from explicit null.
+const Object _kTeamIdDefault = Object();
 
 class SupabaseService {
   static SupabaseService? _instance;
@@ -200,15 +220,16 @@ class SupabaseService {
 
   // ─── DATA FETCHING (Filtered by Team) ───
 
-  Future<List<ProductModel>> getProducts({bool forceRefresh = false}) async {
-    final response = await _fetchWithCache('products', () async {
+  Future<List<ProductModel>> getProducts({bool forceRefresh = false, String? teamId}) async {
+    final effectiveTeam = teamId ?? AuthService.currentTeam;
+    final response = await _fetchWithCache('products_$effectiveTeam', () async {
       // Supabase PostgREST caps at 1000 rows per request — paginate to get all
       final all = <dynamic>[];
       const batchSize = 1000;
       int offset = 0;
       while (true) {
         final batch = await client.from('products').select()
-            .eq('team_id', AuthService.currentTeam)
+            .eq('team_id', effectiveTeam)
             .order('name')
             .range(offset, offset + batchSize - 1);
         all.addAll(batch);
@@ -220,9 +241,21 @@ class SupabaseService {
     return response.map((e) => ProductModel.fromJson(Map<String, dynamic>.from(e))).toList();
   }
 
-  Future<List<BeatModel>> getBeats({bool forceRefresh = false}) async {
-    final response = await _fetchWithCache('beats', () async {
-      return await client.from('beats').select().eq('team_id', AuthService.currentTeam).order('beat_name').limit(200);
+  /// When [teamId] is explicitly passed, that team is used (or null = all
+  /// teams, no filter). When the named param is omitted, falls back to
+  /// currentTeam — preserves prior behavior for non-admin callers.
+  Future<List<BeatModel>> getBeats({
+    bool forceRefresh = false,
+    Object? teamId = _kTeamIdDefault,
+  }) async {
+    final String? effectiveTeam = identical(teamId, _kTeamIdDefault)
+        ? AuthService.currentTeam
+        : teamId as String?;
+    final cacheKey = effectiveTeam == null ? 'beats_all' : 'beats_$effectiveTeam';
+    final response = await _fetchWithCache(cacheKey, () async {
+      var q = client.from('beats').select();
+      if (effectiveTeam != null) q = q.eq('team_id', effectiveTeam);
+      return await q.order('beat_name').limit(1000);
     }, forceRefresh: forceRefresh);
     return response.map((e) => BeatModel.fromJson(Map<String, dynamic>.from(e))).toList();
   }
@@ -361,14 +394,35 @@ class SupabaseService {
   }
 
   /// Full-text product search — always fresh, paginated (50 per page).
-  Future<List<ProductModel>> searchProducts(String query, {int page = 0}) async {
+  ///
+  /// When [allowedBrands] is non-empty the query is scoped to those categories
+  /// **across all teams** (matching the category-chip browse behavior for
+  /// brand_reps who have cross-team access). Otherwise it falls back to the
+  /// current team's products — the original behavior for sales_rep.
+  Future<List<ProductModel>> searchProducts(
+    String query, {
+    int page = 0,
+    List<String>? allowedBrands,
+  }) async {
     try {
-      final response = await client
-          .from('products')
-          .select()
-          .ilike('name', '%$query%')
-          .eq('team_id', AuthService.currentTeam)
-          .range(page * 50, (page + 1) * 50 - 1);
+      final tokens = query
+          .trim()
+          .split(RegExp(r'\s+'))
+          .where((t) => t.isNotEmpty)
+          .toList();
+      if (tokens.isEmpty) return [];
+
+      var req = client.from('products').select();
+      if (allowedBrands != null && allowedBrands.isNotEmpty) {
+        req = req.inFilter('category', allowedBrands);
+      } else {
+        req = req.eq('team_id', AuthService.currentTeam);
+      }
+      for (final token in tokens) {
+        req = req.ilike('name', '%$token%');
+      }
+      final response =
+          await req.range(page * 50, (page + 1) * 50 - 1);
       return (response as List)
           .map((e) => ProductModel.fromJson(Map<String, dynamic>.from(e)))
           .toList();
@@ -417,29 +471,85 @@ class SupabaseService {
     return response.map((e) => OrderModel.fromJson(Map<String, dynamic>.from(e))).toList();
   }
 
-  Future<Map<String, dynamic>> getSalesAnalytics({bool myOnly = false}) async {
+  Future<Map<String, dynamic>> getSalesAnalytics({
+    bool myOnly = false,
+    List<String>? allowedBrands,
+    Object? teamId = _kTeamIdDefault,
+  }) async {
     try {
+      final String? effectiveTeam = identical(teamId, _kTeamIdDefault)
+          ? AuthService.currentTeam
+          : teamId as String?;
       final now = DateTime.now();
       final startOfMonth = DateTime(now.year, now.month, 1).toIso8601String();
       final endOfMonth = DateTime(now.year, now.month + 1, 0, 23, 59, 59).toIso8601String();
       final userId = client.auth.currentUser?.id;
+      final bool brandScoped = allowedBrands != null && allowedBrands.isNotEmpty;
 
-      final cacheKey = myOnly ? 'analytics_my' : 'analytics';
+      // Cache key must distinguish brand scope + team scope so different
+      // admin views don't share a cached payload.
+      final brandKey = brandScoped
+          ? 'b_${(List<String>.from(allowedBrands)..sort()).join("|").hashCode}'
+          : 'all';
+      final teamKey = effectiveTeam ?? 'ALL';
+      final cacheKey = '${myOnly ? "analytics_my" : "analytics"}_${brandKey}_$teamKey';
       final response = await _fetchWithCache(cacheKey, () async {
+        // Brand scope needs line items to compute per-brand totals.
         var q = client.from('orders')
-            .select('grand_total, beat_name')
-            .eq('team_id', AuthService.currentTeam)
+            .select(brandScoped
+                ? 'grand_total, beat_name, order_items(product_id, line_total, total_price)'
+                : 'grand_total, beat_name')
             .gte('order_date', startOfMonth)
             .lte('order_date', endOfMonth);
+        if (effectiveTeam != null) q = q.eq('team_id', effectiveTeam);
         if (myOnly && userId != null) q = q.eq('user_id', userId);
         return await q;
       });
 
-      double totalSales = 0; Map<String, double> salesByBeat = {}; int totalOrders = response.length;
+      // For brand scope, build a product_id → category map once and
+      // recompute each order's effective total from allowed-brand items.
+      Map<String, String> categoryMap = {};
+      if (brandScoped) {
+        final productIds = (response as List)
+            .expand((o) => ((o as Map)['order_items'] as List?) ?? [])
+            .map((it) => (it as Map)['product_id'])
+            .whereType<String>()
+            .toSet()
+            .toList();
+        if (productIds.isNotEmpty) {
+          final rows = await client.from('products')
+              .select('id, category')
+              .inFilter('id', productIds);
+          for (final r in rows as List) {
+            final id = (r as Map)['id'] as String?;
+            final cat = r['category'] as String?;
+            if (id != null && cat != null) categoryMap[id] = cat;
+          }
+        }
+      }
+
+      double totalSales = 0; Map<String, double> salesByBeat = {}; int totalOrders = 0;
       for (var order in response) {
-        final double amount = ((order as Map)['grand_total'] as num?)?.toDouble() ?? 0.0;
-        // Change 'beat' to 'beat_name' here:
-        final String beat = order['beat_name']?.toString() ?? 'Unknown';
+        final String beat = (order as Map)['beat_name']?.toString() ?? 'Unknown';
+        double amount;
+        if (brandScoped) {
+          final items = (order['order_items'] as List?) ?? [];
+          double scopedTotal = 0;
+          bool hasAllowed = false;
+          for (final it in items) {
+            final pid = (it as Map)['product_id'] as String?;
+            final cat = pid != null ? categoryMap[pid] : null;
+            if (cat != null && allowedBrands.contains(cat)) {
+              hasAllowed = true;
+              scopedTotal += ((it['line_total'] ?? it['total_price']) as num?)?.toDouble() ?? 0.0;
+            }
+          }
+          if (!hasAllowed) continue;
+          amount = scopedTotal;
+        } else {
+          amount = (order['grand_total'] as num?)?.toDouble() ?? 0.0;
+        }
+        totalOrders += 1;
         totalSales += amount;
         salesByBeat[beat] = (salesByBeat[beat] ?? 0) + amount;
       }
@@ -456,6 +566,7 @@ class SupabaseService {
     required String beat, required DateTime deliveryDate, required double subtotal,
     required double vat, required double grandTotal, required int itemCount,
     required int totalUnits, required String notes, required List<Map<String, dynamic>> items,
+    bool isOutOfBeat = false,
   }) async {
     final userId = client.auth.currentUser?.id;
 
@@ -476,6 +587,7 @@ class SupabaseService {
       'status': 'Pending',
       'notes': notes.isEmpty ? null : notes,
       'team_id': AuthService.currentTeam, // Blueprint Filter
+      'is_out_of_beat': isOutOfBeat,
     });
 
     // 2. Insert the line items
@@ -566,6 +678,7 @@ class SupabaseService {
     required String beatId,
     required String reason,
     String? notes,
+    bool isOutOfBeat = false,
   }) async {
     final now = DateTime.now();
     // Plain date string — compatible with both `date` and `timestamptz` columns
@@ -584,6 +697,7 @@ class SupabaseService {
       'visit_time': visitTime,
       'notes': notes ?? '',
       'team_id': AuthService.currentTeam,
+      'is_out_of_beat': isOutOfBeat,
     });
   }
 
@@ -595,13 +709,19 @@ class SupabaseService {
     int limit = 50,
     int offset = 0,
     bool forceRefresh = false,
+    Object? teamId = _kTeamIdDefault,
   }) async {
+    final String? effectiveTeam = identical(teamId, _kTeamIdDefault)
+        ? AuthService.currentTeam
+        : teamId as String?;
     try {
       Future<List<dynamic>> doFetch() async {
         var query = client
             .from('visit_logs')
-            .select('*, customers(name), beats(beat_name)')
-            .eq('team_id', AuthService.currentTeam);
+            .select('*, customers(name), beats(beat_name)');
+        if (effectiveTeam != null) {
+          query = query.eq('team_id', effectiveTeam);
+        }
         if (startDate != null) {
           query = query.gte('created_at', startDate.toIso8601String());
         }
@@ -1013,7 +1133,9 @@ class SupabaseService {
   }
 
   /// Creates a new auth user via Supabase Admin REST API, then inserts app_users row.
-  Future<void> adminCreateUser({
+  /// Creates an Auth user + app_users row. Returns the new user's uid so the
+  /// caller can set role-specific follow-ups (e.g. brand_access for brand_rep).
+  Future<String> adminCreateUser({
     required String email,
     required String password,
     required String fullName,
@@ -1052,6 +1174,7 @@ class SupabaseService {
       'upi_id': upiId,
       'is_active': true,
     });
+    return uid;
   }
 
   /// Hard-deletes a user from Auth + app_users.
@@ -1195,10 +1318,10 @@ class SupabaseService {
 
   /// Get outstanding bills for a customer from customer_bills table (OPNBIL data).
   /// For reps: filters to last 2 months. For admin: all data.
-  Future<List<Map<String, dynamic>>> getCustomerBills(String customerId, {bool repOnly = false}) async {
+  Future<List<Map<String, dynamic>>> getCustomerBills(String customerId, {bool repOnly = false, String? teamId}) async {
     var query = client.from('customer_bills').select()
         .eq('customer_id', customerId)
-        .eq('team_id', AuthService.currentTeam);
+        .eq('team_id', teamId ?? AuthService.currentTeam);
     if (repOnly) {
       final twoMonthsAgo = DateTime.now().subtract(const Duration(days: 60)).toIso8601String().substring(0, 10);
       query = query.gte('bill_date', twoMonthsAgo);
@@ -1216,10 +1339,10 @@ class SupabaseService {
   }
 
   /// Get receipts for a customer from customer_receipts table (RECT data).
-  Future<List<Map<String, dynamic>>> getCustomerReceipts(String customerId, {bool repOnly = false}) async {
+  Future<List<Map<String, dynamic>>> getCustomerReceipts(String customerId, {bool repOnly = false, String? teamId}) async {
     var query = client.from('customer_receipts').select()
         .eq('customer_id', customerId)
-        .eq('team_id', AuthService.currentTeam);
+        .eq('team_id', teamId ?? AuthService.currentTeam);
     if (repOnly) {
       final twoMonthsAgo = DateTime.now().subtract(const Duration(days: 60)).toIso8601String().substring(0, 10);
       query = query.gte('receipt_date', twoMonthsAgo);
@@ -1229,10 +1352,10 @@ class SupabaseService {
   }
 
   /// Get billed items for a customer from ITTR data (customer_billed_items table).
-  Future<List<Map<String, dynamic>>> getCustomerBilledItems(String customerId, {bool repOnly = false}) async {
+  Future<List<Map<String, dynamic>>> getCustomerBilledItems(String customerId, {bool repOnly = false, String? teamId}) async {
     var query = client.from('customer_billed_items').select()
         .eq('customer_id', customerId)
-        .eq('team_id', AuthService.currentTeam);
+        .eq('team_id', teamId ?? AuthService.currentTeam);
     if (repOnly) {
       final twoMonthsAgo = DateTime.now().subtract(const Duration(days: 60)).toIso8601String().substring(0, 10);
       query = query.gte('bill_date', twoMonthsAgo);
@@ -1354,7 +1477,7 @@ class SupabaseService {
     await invalidateCache('recent_orders');
   }
 
-  Future<List<Map<String, dynamic>>> getOrdersByDate(String dateString) async {
+  Future<List<Map<String, dynamic>>> getOrdersByDate(String dateString, {List<String>? teamIds}) async {
     try {
       final userId = client.auth.currentUser?.id;
       final nextDay = DateTime.parse(dateString).add(const Duration(days: 1));
@@ -1362,8 +1485,16 @@ class SupabaseService {
 
       var query = client
           .from('orders')
-          .select('*, order_items(*)')
-          .eq('team_id', AuthService.currentTeam)
+          .select('*, order_items(*)');
+
+      // Support multi-team fetch for shared-beat reps
+      if (teamIds != null && teamIds.length > 1) {
+        query = query.inFilter('team_id', teamIds);
+      } else {
+        query = query.eq('team_id', AuthService.currentTeam);
+      }
+
+      query = query
           .gte('order_date', dateString)
           .lt('order_date', nextDayString);
 
@@ -1764,17 +1895,27 @@ class SupabaseService {
 
   // ─── 📊 DASHBOARD METRICS ───
 
-  Future<List<Map<String, dynamic>>> getActiveDeliveries() async {
+  Future<List<Map<String, dynamic>>> getActiveDeliveries({bool includeOld = false}) async {
     try {
       // Delivery rep is shared across both teams — fetch orders from all teams.
       // Join customers to restore delivery_route and phone access in the
       // delivery dashboard UI (order['customers']['phone'] / ['delivery_route']).
-      final response = await client
+      // Default: only show orders whose delivery_date is today or within the next
+      // 3 days, so stale forgotten orders don't pollute the route list.
+      var query = client
           .from('orders')
           .select('*, customers(phone, delivery_route, address)')
           .eq('status', 'Pending')
-          .inFilter('team_id', ['JA', 'MA'])
-          .order('order_date', ascending: false);
+          .inFilter('team_id', ['JA', 'MA']);
+      if (!includeOld) {
+        // Include orders with delivery_date in the last 14 days (so Friday
+        // orders still appear on Monday) through 3 days ahead. Orders older
+        // than 14 days are either stuck or forgotten — admin uses includeOld.
+        final minIso = DateTime.now().subtract(const Duration(days: 14)).toIso8601String().substring(0, 10);
+        final maxIso = DateTime.now().add(const Duration(days: 3)).toIso8601String().substring(0, 10);
+        query = query.gte('delivery_date', minIso).lte('delivery_date', maxIso);
+      }
+      final response = await query.order('order_date', ascending: false);
       return List<Map<String, dynamic>>.from(response);
     } catch (e) {
       debugPrint('getActiveDeliveries error: $e');
@@ -1983,8 +2124,138 @@ class SupabaseService {
 
   // ─── 💰 MULTI-BILL SETTLEMENT ───
 
-  /// Settles multiple orders in one payment. Rolls back the collection record if
-  /// the batch status update or balance update fails.
+  /// Single allocation inside a settle event.
+  /// `billNo` is the bill printed on the collection row (rep-typed or derived
+  /// from order id). `orderId` is optional — when present, the order's status
+  /// flips to 'Paid' once the allocation covers its full grand_total.
+  /// `orderOutstanding` is the remaining amount currently owed on that bill;
+  /// used to decide whether the allocation is partial or clears the bill.
+  ///
+  /// Why: the old `settleMultipleOrders` assumed every settle cleared every
+  /// selected bill and zeroed the team's outstanding. Reps actually split
+  /// ₹10k across two bills, or pay ₹400 against a ₹500 bill. The new shape
+  /// lets the caller describe exactly where each rupee goes.
+  ///
+  /// How to apply: wrap each bill the rep is paying into a `BillAllocation`
+  /// and pass them together so the whole settle is one event with one
+  /// cheque photo / one rep-entered timestamp.
+
+  /// Settles one or more bills with per-bill allocations. Writes one
+  /// collection row per allocation, marks an order `Paid` only when its
+  /// allocation covers the full bill, and decrements the team's outstanding
+  /// by the TOTAL paid (never zeroes it out of the blue).
+  ///
+  /// Rolls back inserted collection rows if the downstream update fails.
+  Future<void> settleOrderBills({
+    required List<BillAllocation> allocations,
+    required String customerId,
+    required String customerName,
+    required String paymentMethod,
+    String? chequeNo,
+    String? chequeBank,
+    DateTime? chequeDate,
+    String? chequePhotoUrl,
+    String? driveFileId,
+    String? notes,
+  }) async {
+    if (allocations.isEmpty) return;
+
+    final uid = client.auth.currentUser?.id;
+    String rName = client.auth.currentUser?.email ?? 'Offline Rep';
+    if (uid != null) {
+      final ur = await client
+          .from('app_users')
+          .select('full_name')
+          .eq('id', uid)
+          .maybeSingle();
+      rName = ur?['full_name'] as String? ?? rName;
+    }
+
+    final today = DateTime.now().toIso8601String().substring(0, 10);
+    final team = AuthService.currentTeam;
+    final repEmail = client.auth.currentUser?.email ?? 'Offline Rep';
+    final chequeDateStr =
+        chequeDate?.toIso8601String().substring(0, 10);
+
+    final insertedBillKeys = <String>[];
+
+    try {
+      for (final a in allocations) {
+        final remaining =
+            (a.orderOutstanding - a.amount).clamp(0, double.infinity).toDouble();
+        await client.from('collections').insert({
+          'bill_no': a.billNo,
+          'customer_id': customerId,
+          'customer_name': customerName,
+          'amount_paid': a.amount,
+          'amount_collected': a.amount,
+          'balance_remaining': remaining,
+          'rep_email': repEmail,
+          'collected_by': rName,
+          'team_id': team,
+          'payment_mode': paymentMethod,
+          'collection_date': today,
+          if (chequeNo != null && chequeNo.isNotEmpty) 'cheque_number': chequeNo,
+          if (chequeBank != null && chequeBank.isNotEmpty) 'cheque_bank': chequeBank,
+          if (chequeDateStr != null) 'cheque_date': chequeDateStr,
+          if (chequePhotoUrl != null && chequePhotoUrl.isNotEmpty)
+            'cheque_photo_url': chequePhotoUrl,
+          if (driveFileId != null && driveFileId.isNotEmpty)
+            'drive_file_id': driveFileId,
+          if (notes != null && notes.isNotEmpty) 'notes': notes,
+        });
+        insertedBillKeys.add(a.billNo);
+      }
+
+      // Flip orders to Paid only when their allocation covers the full bill.
+      final paidOrderIds = allocations
+          .where((a) => a.orderId != null && a.amount + 0.009 >= a.orderOutstanding)
+          .map((a) => a.orderId!)
+          .toList();
+      if (paidOrderIds.isNotEmpty) {
+        await client
+            .from('orders')
+            .update({'status': 'Paid'})
+            .inFilter('id', paidOrderIds);
+      }
+
+      // Decrement — don't overwrite. Protects against two reps settling
+      // concurrently on the same customer.
+      final totalPaid = allocations.fold<double>(0, (s, a) => s + a.amount);
+      final outCol = team == 'JA' ? 'outstanding_ja' : 'outstanding_ma';
+      final profile = await client
+          .from('customer_team_profiles')
+          .select(outCol)
+          .eq('customer_id', customerId)
+          .eq('team_id', team)
+          .maybeSingle();
+      final current = (profile?[outCol] as num?)?.toDouble() ?? 0;
+      final next = (current - totalPaid).clamp(0, double.infinity).toDouble();
+      await client
+          .from('customer_team_profiles')
+          .update({outCol: next})
+          .eq('customer_id', customerId)
+          .eq('team_id', team);
+    } catch (e) {
+      // Best-effort rollback of the collection rows we just wrote.
+      for (final billNo in insertedBillKeys) {
+        try {
+          await client
+              .from('collections')
+              .delete()
+              .eq('bill_no', billNo)
+              .eq('customer_id', customerId)
+              .eq('collection_date', today);
+        } catch (_) {}
+      }
+      rethrow;
+    }
+  }
+
+  /// Deprecated — retained so stale callers keep compiling. Builds an
+  /// allocation list that mirrors the old behaviour (split the total
+  /// evenly over the orders) and delegates to [settleOrderBills].
+  @Deprecated('Use settleOrderBills with per-bill allocations.')
   Future<void> settleMultipleOrders({
     required List<String> orderIds,
     required String customerId,
@@ -1993,57 +2264,34 @@ class SupabaseService {
     required double totalAmount,
     String? driveFileId,
   }) async {
-    final combinedBillNo = orderIds.map((id) => id.split('-').last.toUpperCase()).join('+');
-    bool collectionInserted = false;
-    try {
-      // Resolve rep name
-      final uid = client.auth.currentUser?.id;
-      String rName = client.auth.currentUser?.email ?? 'Offline Rep';
-      if (uid != null) {
-        final ur = await client.from('app_users').select('full_name').eq('id', uid).maybeSingle();
-        rName = ur?['full_name'] as String? ?? rName;
-      }
-      await client.from('collections').insert({
-        'bill_no': combinedBillNo,
-        'customer_id': customerId,
-        'customer_name': customerName,
-        'amount_paid': totalAmount,
-        'amount_collected': totalAmount,
-        'balance_remaining': 0,
-        'rep_email': client.auth.currentUser?.email ?? 'Offline Rep',
-        'collected_by': rName,
-        'team_id': AuthService.currentTeam,
-        'payment_mode': paymentMethod,
-        'collection_date': DateTime.now().toIso8601String().substring(0, 10),
-        if (driveFileId != null) 'drive_file_id': driveFileId,
-      });
-      collectionInserted = true;
-
-      await client.from('orders').update({'status': 'Paid'}).inFilter('id', orderIds);
-
-      // CHANGED: unified profile — update team-specific outstanding column
-      final outCol = AuthService.currentTeam == 'JA' ? 'outstanding_ja' : 'outstanding_ma';
-      await client
-          .from('customer_team_profiles')
-          .update({outCol: 0})
-          .eq('customer_id', customerId);
-    } catch (e) {
-      if (collectionInserted) {
-        try {
-          await client.from('collections')
-              .delete()
-              .eq('bill_no', combinedBillNo)
-              .eq('customer_id', customerId);
-        } catch (_) {}
-      }
-      rethrow;
-    }
+    if (orderIds.isEmpty) return;
+    final per = totalAmount / orderIds.length;
+    final allocations = orderIds
+        .map((id) => BillAllocation(
+              billNo: id.split('-').last.toUpperCase(),
+              orderId: id,
+              amount: per,
+              orderOutstanding: per,
+            ))
+        .toList();
+    await settleOrderBills(
+      allocations: allocations,
+      customerId: customerId,
+      customerName: customerName,
+      paymentMethod: paymentMethod,
+      driveFileId: driveFileId,
+    );
   }
 
   // ─── BRAND ACCESS CONTROL ──────────────────────────────────────────────────
 
   /// Returns list of enabled brand names for a user.
-  /// If no records exist → returns [] (means show ALL brands / no restriction).
+  /// Sales_rep with no records → auto-populate all team categories (open
+  /// access is the intended default).
+  /// Brand_rep with no records → return [] (fail safe — admin must explicitly
+  /// enable at least one brand in admin_brand_access_tab before the rep can
+  /// see anything). Prevents an unconfigured brand_rep from silently being
+  /// granted every team brand.
   /// Always fetches from network (no cache) — this is a security control
   /// that must reflect admin changes immediately on the salesman's device.
   Future<List<String>> getUserBrandAccess(String userId) async {
@@ -2066,13 +2314,21 @@ class SupabaseService {
         return [];
       }
 
-      // First login / no config — auto-assign this user's team categories
+      // No records at all — decide based on role.
       final userRow = await client.from('app_users')
-          .select('team_id')
+          .select('team_id, role')
           .eq('id', userId)
           .maybeSingle();
+      final role = userRow?['role'] as String? ?? '';
       final teamId = userRow?['team_id'] as String? ?? AuthService.currentTeam;
 
+      // Brand_rep must be explicitly configured. Return [] so the products
+      // screen lands on its "brand access denied" state and forces admin to
+      // open admin_brand_access_tab and toggle at least one brand on.
+      if (role == 'brand_rep') return [];
+
+      // Sales_rep / other: first login with no config — auto-assign all team
+      // categories so they have open access by default.
       final teamCats = await client.from('product_categories')
           .select('name')
           .eq('team_id', teamId)
@@ -2114,6 +2370,78 @@ class SupabaseService {
         .eq('user_id', userId)
         .eq('team_id', AuthService.currentTeam);
     await invalidateCache('brand_access_$userId');
+  }
+
+  /// Returns IDs of customers in the current team who have purchased any
+  /// product in [brandCategories] — either through an in-app order OR
+  /// through the external billing software (ITTR-synced customer_billed_items).
+  /// Used by the customer list to pin a brand_rep's repeat customers to the top.
+  ///
+  /// Returns only IDs (not full rows) to keep egress minimal — the caller
+  /// already has the full customer list and just needs to partition it.
+  Future<Set<String>> getCustomerIdsWithBrandHistory(List<String> brandCategories) async {
+    if (brandCategories.isEmpty) return {};
+    final team = AuthService.currentTeam;
+    final resultIds = <String>{};
+    try {
+      // Fetch products in allowed brands. Collect both IDs (for in-app order
+      // joins) and names/billing_names (for ITTR item_name string matching).
+      final productsResp = await client
+          .from('products')
+          .select('id, name, billing_name')
+          .inFilter('category', brandCategories)
+          .eq('team_id', team);
+      final productIds = <String>[];
+      final productNames = <String>{};
+      for (final p in (productsResp as List)) {
+        final id = p['id'] as String?;
+        if (id != null) productIds.add(id);
+        final bname = p['billing_name'] as String?;
+        if (bname != null && bname.trim().isNotEmpty) productNames.add(bname);
+        final name = p['name'] as String?;
+        if (name != null && name.trim().isNotEmpty) productNames.add(name);
+      }
+
+      // Path 1: in-app orders → order_items filtered to our product_ids.
+      if (productIds.isNotEmpty) {
+        final orderItemsResp = await client
+            .from('order_items')
+            .select('order_id')
+            .inFilter('product_id', productIds);
+        final orderIds = (orderItemsResp as List)
+            .map((o) => o['order_id'] as String)
+            .toSet()
+            .toList();
+        if (orderIds.isNotEmpty) {
+          final ordersResp = await client
+              .from('orders')
+              .select('customer_id')
+              .inFilter('id', orderIds)
+              .eq('team_id', team);
+          resultIds.addAll((ordersResp as List)
+              .map((o) => o['customer_id'] as String?)
+              .whereType<String>());
+        }
+      }
+
+      // Path 2: ITTR-synced billed items where item_name matches any of
+      // our allowed-brand products. Bills may come in before any in-app
+      // order, so this catches offline-channel customers too.
+      if (productNames.isNotEmpty) {
+        final billedResp = await client
+            .from('customer_billed_items')
+            .select('customer_id')
+            .inFilter('item_name', productNames.toList())
+            .eq('team_id', team)
+            .not('customer_id', 'is', null);
+        resultIds.addAll((billedResp as List)
+            .map((o) => o['customer_id'] as String?)
+            .whereType<String>());
+      }
+    } catch (e) {
+      debugPrint('getCustomerIdsWithBrandHistory error: $e');
+    }
+    return resultIds;
   }
 
   // ─── STOCK VISIBILITY CONTROL ────────────────────────────────────────────────

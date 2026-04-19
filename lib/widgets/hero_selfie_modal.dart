@@ -30,11 +30,12 @@ class _HeroSelfieModalState extends State<HeroSelfieModal> {
   bool _isUploading = false;
   String? _errorMessage;
   XFile? _capturedImage;
+  int _uploadFailCount = 0;
 
   @override
   Widget build(BuildContext context) {
     return PopScope(
-      canPop: false, // Prevent dismissal
+      canPop: _uploadFailCount >= 3, // Allow dismissal after 3 failed uploads
       child: Dialog(
         backgroundColor: Colors.transparent,
         child: Container(
@@ -181,7 +182,7 @@ class _HeroSelfieModalState extends State<HeroSelfieModal> {
   }
 
   Widget _buildActions() {
-    return Row(
+    final row = Row(
       mainAxisAlignment: MainAxisAlignment.spaceEvenly,
       children: [
         if (_capturedImage == null) ...[
@@ -314,6 +315,23 @@ class _HeroSelfieModalState extends State<HeroSelfieModal> {
         ],
       ],
     );
+    if (_uploadFailCount >= 3) {
+      return Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          row,
+          const SizedBox(height: 12),
+          SizedBox(
+            width: double.infinity,
+            child: TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: Text('Skip for now', style: GoogleFonts.manrope(fontSize: 13, color: AppTheme.onSurfaceVariant)),
+            ),
+          ),
+        ],
+      );
+    }
+    return row;
   }
 
   Widget _buildErrorMessage() {
@@ -434,7 +452,9 @@ class _HeroSelfieModalState extends State<HeroSelfieModal> {
       if (imageUrl == null) {
         setState(() {
           _isUploading = false;
-          _errorMessage = 'Upload failed. Please check your internet connection and try again.';
+          _uploadFailCount++;
+          _errorMessage = 'Upload failed. Please check your internet connection and try again.'
+              '${_uploadFailCount >= 3 ? '\nYou can skip for now and retry later.' : ''}';
         });
         return;
       }
@@ -449,7 +469,9 @@ class _HeroSelfieModalState extends State<HeroSelfieModal> {
     } catch (e) {
       setState(() {
         _isUploading = false;
-        _errorMessage = 'Upload failed: $e';
+        _uploadFailCount++;
+        _errorMessage = 'Upload failed: $e'
+            '${_uploadFailCount >= 3 ? '\nYou can skip for now and retry later.' : ''}';
       });
     }
   }

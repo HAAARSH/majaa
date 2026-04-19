@@ -37,7 +37,7 @@ class AuthService {
       // 2. Fetch Team Info from app_users table
       final userData = await client
           .from('app_users')
-          .select('team_id, upi_id, full_name')
+          .select('team_id, upi_id, full_name, role')
           .eq('email', email.trim().toLowerCase())
           .maybeSingle();
 
@@ -65,10 +65,21 @@ class AuthService {
       // 4. Initialize the specific Team Cache
       await initTeamCache(currentTeam);
 
-      // Save to SharedPreferences for offline resume
+      // Save to SharedPreferences for offline resume. Persisting role lets
+      // attemptOfflineResume route the user correctly (admin → admin panel,
+      // delivery_rep → delivery dashboard) even when the network is down.
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString('current_team', currentTeam);
       await prefs.setString('team_upi', teamUpi);
+      final role = userData['role'] as String? ?? 'sales_rep';
+      await prefs.setString('last_role', role);
+      SupabaseService.instance.currentUserRole = role;
+      final fullName = userData['full_name'] as String?;
+      if (fullName != null && fullName.isNotEmpty) {
+        await prefs.setString('last_full_name', fullName);
+      } else {
+        await prefs.remove('last_full_name');
+      }
 
       return true;
     } catch (e) {
@@ -87,6 +98,10 @@ class AuthService {
     if (savedTeam != null) {
       currentTeam = savedTeam;
       teamUpi = prefs.getString('team_upi') ?? '';
+      final cachedName = prefs.getString('last_full_name');
+      if (cachedName != null && cachedName.isNotEmpty) {
+        SupabaseService.instance.currentUserName = cachedName;
+      }
       await initTeamCache(currentTeam);
       return session != null;
     }
@@ -108,8 +123,11 @@ class AuthService {
     }
     currentTeam = 'JA';
     teamUpi = '';
+    SupabaseService.instance.currentUserName = null;
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('current_team');
     await prefs.remove('team_upi');
+    await prefs.remove('last_full_name');
+    await prefs.remove('last_role');
   }
 }

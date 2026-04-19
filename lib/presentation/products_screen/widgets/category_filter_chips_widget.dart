@@ -32,7 +32,7 @@ class CategoryFilterChipsWidget extends StatelessWidget {
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
           child: Text(
-            'Categories (${visibleCategories.length})',
+            'Brands (${visibleCategories.length})',
             style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.bold, color: AppTheme.onSurfaceVariant),
           ),
         ),

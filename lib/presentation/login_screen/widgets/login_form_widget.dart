@@ -104,6 +104,9 @@ class LoginFormWidget extends StatelessWidget {
             enabled: !isLoading,
             keyboardType: TextInputType.emailAddress,
             textInputAction: TextInputAction.next,
+            autocorrect: false,
+            enableSuggestions: false,
+            textCapitalization: TextCapitalization.none,
             autofillHints: [AutofillHints.email],
             style:
                 GoogleFonts.manrope(fontSize: 15, fontWeight: FontWeight.w500),
@@ -134,6 +137,8 @@ class LoginFormWidget extends StatelessWidget {
             enabled: !isLoading,
             obscureText: obscurePassword,
             textInputAction: TextInputAction.done,
+            autocorrect: false,
+            enableSuggestions: false,
             autofillHints: [AutofillHints.password],
             onFieldSubmitted: (_) => _submit(),
             style:

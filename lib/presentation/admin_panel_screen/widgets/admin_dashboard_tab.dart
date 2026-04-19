@@ -9,9 +9,16 @@ import 'package:csv/csv.dart';
 
 import '../../../services/supabase_service.dart';
 import '../../../services/auth_service.dart';
+import './admin_shared_widgets.dart';
+import '../admin_panel_screen.dart' show AdminOrdersNavIntent, adminOrdersNavIntent;
 
 class AdminDashboardTab extends StatefulWidget {
-  const AdminDashboardTab({super.key});
+  /// Called when a summary card / chart bar is tapped — the parent
+  /// (AdminPanelScreen) animates its TabController to this index. Optional so
+  /// the tab still renders standalone for previews/tests.
+  final void Function(int tabIndex)? onNavigateToTab;
+
+  const AdminDashboardTab({super.key, this.onNavigateToTab});
 
   @override
   State<AdminDashboardTab> createState() => _AdminDashboardTabState();
@@ -28,6 +35,10 @@ class _AdminDashboardTabState extends State<AdminDashboardTab>
 
   // Chart toggle: 'beat' or 'pie'
   String _chartView = 'beat';
+
+  // Team scope for analytics. 'All' = cross-team; 'JA' / 'MA' = team-specific.
+  // Default to 'All' so super_admin sees the complete picture on open.
+  String _teamFilter = 'All';
 
   @override
   void initState() {
@@ -50,7 +61,9 @@ class _AdminDashboardTabState extends State<AdminDashboardTab>
       _error = null;
     });
     try {
-      final data = await SupabaseService.instance.getSalesAnalytics();
+      final data = await SupabaseService.instance.getSalesAnalytics(
+        teamId: _teamFilter == 'All' ? null : _teamFilter,
+      );
       if (!mounted) return;
       setState(() {
         _analyticsData = data;
@@ -64,6 +77,49 @@ class _AdminDashboardTabState extends State<AdminDashboardTab>
         _isLoading = false;
       });
     }
+  }
+
+  // ── Drill-through helpers ─────────────────────────────────────
+  // All card taps end up here. Dashboard computes the intent (date range,
+  // optional beat, team) and then asks the parent to switch tabs. The Orders
+  // tab reads `adminOrdersNavIntent` on its next build and applies the filter.
+
+  DateTime get _periodStart => DateTime(DateTime.now().year, DateTime.now().month, 1);
+  DateTime get _periodEnd => DateTime.now();
+
+  void _drillOrdersPeriod() {
+    adminOrdersNavIntent.value = AdminOrdersNavIntent(
+      startDate: _periodStart,
+      endDate: _periodEnd,
+      teamId: _teamFilter == 'All' ? null : _teamFilter,
+    );
+    widget.onNavigateToTab?.call(3); // Orders tab
+  }
+
+  void _drillOrdersToday() {
+    final today = DateTime.now();
+    adminOrdersNavIntent.value = AdminOrdersNavIntent(
+      startDate: DateTime(today.year, today.month, today.day),
+      endDate: today,
+      teamId: _teamFilter == 'All' ? null : _teamFilter,
+    );
+    widget.onNavigateToTab?.call(3);
+  }
+
+  void _drillOrdersBeat(String beatName) {
+    if (beatName.isEmpty) return;
+    adminOrdersNavIntent.value = AdminOrdersNavIntent(
+      startDate: _periodStart,
+      endDate: _periodEnd,
+      beatName: beatName,
+      teamId: _teamFilter == 'All' ? null : _teamFilter,
+    );
+    widget.onNavigateToTab?.call(3);
+  }
+
+  void _drillFieldOpsBeats() {
+    // Field Ops is tab index 2 — its first sub-section ("Beats") is default.
+    widget.onNavigateToTab?.call(2);
   }
 
   Future<void> _uploadBillingCsv() async {
@@ -280,7 +336,17 @@ class _AdminDashboardTabState extends State<AdminDashboardTab>
             children: [
               // ── Header ────────────────────────────────────────
               _buildHeader(),
-              const SizedBox(height: 20),
+              const SizedBox(height: 12),
+
+              // Team scope picker — cross-team view by default.
+              TeamFilterChips(
+                value: _teamFilter,
+                onChanged: (v) {
+                  setState(() => _teamFilter = v);
+                  _loadAnalytics();
+                },
+              ),
+              const SizedBox(height: 12),
 
               // ── KPI Cards Row ─────────────────────────────────
               _buildKpiRow(totalSales, totalOrders, avgOrderValue, fmt),
@@ -366,6 +432,7 @@ class _AdminDashboardTabState extends State<AdminDashboardTab>
           color: _teamColor,
           isHero: true,
           subtitle: 'Across all beats this period',
+          onTap: _drillOrdersPeriod,
         ),
         const SizedBox(height: 12),
         Row(
@@ -376,6 +443,7 @@ class _AdminDashboardTabState extends State<AdminDashboardTab>
                 value: orders.toString(),
                 icon: Icons.receipt_long_rounded,
                 color: Colors.indigo.shade600,
+                onTap: _drillOrdersPeriod,
               ),
             ),
             const SizedBox(width: 12),
@@ -385,6 +453,7 @@ class _AdminDashboardTabState extends State<AdminDashboardTab>
                 value: fmt.format(avg),
                 icon: Icons.trending_up_rounded,
                 color: Colors.teal.shade600,
+                onTap: _drillOrdersPeriod,
               ),
             ),
           ],
@@ -411,6 +480,7 @@ class _AdminDashboardTabState extends State<AdminDashboardTab>
             value: topBeat,
             icon: Icons.emoji_events_rounded,
             iconColor: Colors.amber.shade700,
+            onTap: () => _drillOrdersBeat(topBeat),
           ),
         ),
         const SizedBox(width: 10),
@@ -420,6 +490,7 @@ class _AdminDashboardTabState extends State<AdminDashboardTab>
             value: totalBeats.toString(),
             icon: Icons.route_rounded,
             iconColor: Colors.purple.shade600,
+            onTap: _drillFieldOpsBeats,
           ),
         ),
         const SizedBox(width: 10),
@@ -429,6 +500,7 @@ class _AdminDashboardTabState extends State<AdminDashboardTab>
             value: '\u20B9$dailyAvgStr',
             icon: Icons.trending_up_rounded,
             iconColor: Colors.green.shade600,
+            onTap: _drillOrdersToday,
           ),
         ),
       ],
@@ -558,6 +630,15 @@ class _AdminDashboardTabState extends State<AdminDashboardTab>
               );
             },
           ),
+          // Drill-through: tap a bar to open Orders filtered to that beat.
+          // fl_chart fires `touchCallback` on many gesture phases; only act on
+          // FlTapUpEvent so we don't double-fire on drag/hover.
+          touchCallback: (event, response) {
+            if (event is! FlTapUpEvent) return;
+            final idx = response?.spot?.touchedBarGroupIndex;
+            if (idx == null || idx < 0 || idx >= data.length) return;
+            _drillOrdersBeat(data.keys.elementAt(idx));
+          },
         ),
         titlesData: FlTitlesData(
           bottomTitles: AxisTitles(
@@ -650,6 +731,14 @@ class _AdminDashboardTabState extends State<AdminDashboardTab>
             PieChartData(
               sectionsSpace: 2,
               centerSpaceRadius: 48,
+              pieTouchData: PieTouchData(
+                touchCallback: (event, response) {
+                  if (event is! FlTapUpEvent) return;
+                  final idx = response?.touchedSection?.touchedSectionIndex;
+                  if (idx == null || idx < 0 || idx >= data.length) return;
+                  _drillOrdersBeat(data.keys.elementAt(idx));
+                },
+              ),
               sections: data.entries.toList().asMap().entries.map((e) {
                 final pct = total > 0 ? (e.value.value / total * 100) : 0.0;
                 return PieChartSectionData(
@@ -926,6 +1015,7 @@ class _KpiCard extends StatelessWidget {
   final Color color;
   final bool isHero;
   final String? subtitle;
+  final VoidCallback? onTap;
 
   const _KpiCard({
     required this.label,
@@ -934,11 +1024,12 @@ class _KpiCard extends StatelessWidget {
     required this.color,
     this.isHero = false,
     this.subtitle,
+    this.onTap,
   });
 
   @override
   Widget build(BuildContext context) {
-    return Container(
+    final card = Container(
       padding: EdgeInsets.all(isHero ? 20 : 16),
       decoration: BoxDecoration(
         color: isHero ? color : Colors.white,
@@ -1021,6 +1112,13 @@ class _KpiCard extends StatelessWidget {
         ],
       ),
     );
+    if (onTap == null) return card;
+    return Material(
+      color: Colors.transparent,
+      borderRadius: BorderRadius.circular(18),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(onTap: onTap, child: card),
+    );
   }
 }
 
@@ -1029,17 +1127,19 @@ class _SecondaryCard extends StatelessWidget {
   final String value;
   final IconData icon;
   final Color iconColor;
+  final VoidCallback? onTap;
 
   const _SecondaryCard({
     required this.label,
     required this.value,
     required this.icon,
     required this.iconColor,
+    this.onTap,
   });
 
   @override
   Widget build(BuildContext context) {
-    return Container(
+    final card = Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 14),
       decoration: BoxDecoration(
         color: Colors.white,
@@ -1057,12 +1157,16 @@ class _SecondaryCard extends StatelessWidget {
         children: [
           Icon(icon, color: iconColor, size: 18),
           const SizedBox(height: 8),
+          // Two lines so long beat names ("PANDITWADI BAZAAR") aren't
+          // truncated to "PANDIT...". Font stays 14 to fit two lines in the
+          // secondary-card footprint without overflowing adjacent cards.
           Text(value,
               style: GoogleFonts.manrope(
-                  fontSize: 16,
+                  fontSize: 14,
                   fontWeight: FontWeight.w800,
+                  height: 1.2,
                   color: Colors.grey.shade800),
-              maxLines: 1,
+              maxLines: 2,
               overflow: TextOverflow.ellipsis),
           const SizedBox(height: 2),
           Text(label,
@@ -1072,6 +1176,13 @@ class _SecondaryCard extends StatelessWidget {
               overflow: TextOverflow.ellipsis),
         ],
       ),
+    );
+    if (onTap == null) return card;
+    return Material(
+      color: Colors.transparent,
+      borderRadius: BorderRadius.circular(14),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(onTap: onTap, child: card),
     );
   }
 }
