@@ -276,7 +276,7 @@ class SupabaseService {
       while (true) {
         final batch = await client
             .from('customers')
-            .select('*, customer_team_profiles(id, customer_id, team_ja, team_ma, beat_id_ja, beat_name_ja, outstanding_ja, beat_id_ma, beat_name_ma, outstanding_ma)') // CHANGED: unified profile columns
+            .select('*, customer_team_profiles(id, customer_id, team_ja, team_ma, beat_id_ja, beat_name_ja, outstanding_ja, beat_id_ma, beat_name_ma, outstanding_ma, order_beat_id_ja, order_beat_name_ja, order_beat_id_ma, order_beat_name_ma)') // CHANGED: unified profile columns
             .order('name')
             .range(offset, offset + batchSize - 1);
         all.addAll(batch);
@@ -291,7 +291,7 @@ class SupabaseService {
   Future<CustomerModel?> getCustomerById(String id) async {
     try {
       final resp = await client.from('customers')
-          .select('*, customer_team_profiles(id, customer_id, team_ja, team_ma, beat_id_ja, beat_name_ja, outstanding_ja, beat_id_ma, beat_name_ma, outstanding_ma)')
+          .select('*, customer_team_profiles(id, customer_id, team_ja, team_ma, beat_id_ja, beat_name_ja, outstanding_ja, beat_id_ma, beat_name_ma, outstanding_ma, order_beat_id_ja, order_beat_name_ja, order_beat_id_ma, order_beat_name_ma)')
           .eq('id', id)
           .maybeSingle();
       if (resp == null) return null;
@@ -1567,7 +1567,25 @@ class SupabaseService {
   }
 
   Future<void> deleteProductCategory(String id) async {
+    // Resolve name + team before deletion so we can purge matching
+    // user_brand_access rows. Without this cleanup, brand access rows
+    // become orphaned and inflate rep-level brand counts forever.
+    final cat = await client.from('product_categories')
+        .select('name, team_id')
+        .eq('id', id)
+        .maybeSingle();
     await client.from('product_categories').delete().eq('id', id);
+    if (cat != null) {
+      final name = cat['name'] as String?;
+      final teamId = cat['team_id'] as String?;
+      if (name != null && name.isNotEmpty) {
+        var q = client.from('user_brand_access').delete().eq('brand', name);
+        if (teamId != null && teamId.isNotEmpty) {
+          q = q.eq('team_id', teamId);
+        }
+        await q;
+      }
+    }
   }
 
   // ─── 🏷️ PRODUCT SUBCATEGORIES ───
@@ -2296,13 +2314,38 @@ class SupabaseService {
   /// that must reflect admin changes immediately on the salesman's device.
   Future<List<String>> getUserBrandAccess(String userId) async {
     try {
+      // Resolve auth UID → app_users.id. For early users (e.g. Ranjeet) the
+      // two differ, and the admin sheet keys brand access off app_users.id
+      // while the rep's device passes auth.uid. Without this resolution the
+      // lookup returns empty, the auto-assign path then FK-fails, and the
+      // rep silently ends up with zero brand access (no cross-team fetch).
+      userId = await _resolveAppUserId(userId);
+
       // Fetch ALL enabled brands across all teams for this user
       final response = await client.from('user_brand_access')
           .select('brand')
           .eq('user_id', userId)
           .eq('is_enabled', true);
       final brands = (response as List).map((e) => e['brand'] as String).toList();
-      if (brands.isNotEmpty) return brands;
+
+      // Defensive filter: drop brand names that no longer exist in an active
+      // product_categories row. Heals orphans left over from before the
+      // deleteProductCategory cascade was added so stale rows stop granting
+      // ghost access / inflating admin counts.
+      if (brands.isNotEmpty) {
+        final catResp = await client.from('product_categories')
+            .select('name')
+            .eq('is_active', true)
+            .inFilter('name', brands);
+        final validNames = (catResp as List)
+            .map((e) => e['name'] as String)
+            .toSet();
+        final filtered = brands.where((b) => validNames.contains(b)).toList();
+        debugPrint('🔍 BRAND_ACCESS user=$userId raw=$brands valid=$filtered');
+        // Admin explicitly configured this user — respect the result even if
+        // every enabled brand turned out to be an orphan (return []).
+        return filtered;
+      }
 
       // Check if ANY records exist (including disabled ones)
       final anyRecords = await client.from('user_brand_access')
@@ -2403,40 +2446,54 @@ class SupabaseService {
       }
 
       // Path 1: in-app orders → order_items filtered to our product_ids.
+      // Both inFilters are chunked by 100 to stay under PostgREST URL caps.
       if (productIds.isNotEmpty) {
-        final orderItemsResp = await client
-            .from('order_items')
-            .select('order_id')
-            .inFilter('product_id', productIds);
-        final orderIds = (orderItemsResp as List)
-            .map((o) => o['order_id'] as String)
-            .toSet()
-            .toList();
-        if (orderIds.isNotEmpty) {
-          final ordersResp = await client
-              .from('orders')
-              .select('customer_id')
-              .inFilter('id', orderIds)
-              .eq('team_id', team);
-          resultIds.addAll((ordersResp as List)
-              .map((o) => o['customer_id'] as String?)
-              .whereType<String>());
+        final allOrderIds = <String>{};
+        for (int i = 0; i < productIds.length; i += 100) {
+          final chunk = productIds.sublist(i, (i + 100).clamp(0, productIds.length));
+          final orderItemsResp = await client
+              .from('order_items')
+              .select('order_id')
+              .inFilter('product_id', chunk);
+          allOrderIds.addAll(
+            (orderItemsResp as List).map((o) => o['order_id'] as String),
+          );
+        }
+        if (allOrderIds.isNotEmpty) {
+          final orderIds = allOrderIds.toList();
+          for (int i = 0; i < orderIds.length; i += 100) {
+            final chunk = orderIds.sublist(i, (i + 100).clamp(0, orderIds.length));
+            final ordersResp = await client
+                .from('orders')
+                .select('customer_id')
+                .inFilter('id', chunk)
+                .eq('team_id', team);
+            resultIds.addAll((ordersResp as List)
+                .map((o) => o['customer_id'] as String?)
+                .whereType<String>());
+          }
         }
       }
 
       // Path 2: ITTR-synced billed items where item_name matches any of
       // our allowed-brand products. Bills may come in before any in-app
-      // order, so this catches offline-channel customers too.
+      // order, so this catches offline-channel customers too. Chunk by 100
+      // so the inFilter URL stays well under PostgREST's ~8KB cap even if
+      // a brand_rep has a huge product roster.
       if (productNames.isNotEmpty) {
-        final billedResp = await client
-            .from('customer_billed_items')
-            .select('customer_id')
-            .inFilter('item_name', productNames.toList())
-            .eq('team_id', team)
-            .not('customer_id', 'is', null);
-        resultIds.addAll((billedResp as List)
-            .map((o) => o['customer_id'] as String?)
-            .whereType<String>());
+        final namesList = productNames.toList();
+        for (int i = 0; i < namesList.length; i += 100) {
+          final chunk = namesList.sublist(i, (i + 100).clamp(0, namesList.length));
+          final billedResp = await client
+              .from('customer_billed_items')
+              .select('customer_id')
+              .inFilter('item_name', chunk)
+              .eq('team_id', team)
+              .not('customer_id', 'is', null);
+          resultIds.addAll((billedResp as List)
+              .map((o) => o['customer_id'] as String?)
+              .whereType<String>());
+        }
       }
     } catch (e) {
       debugPrint('getCustomerIdsWithBrandHistory error: $e');

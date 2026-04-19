@@ -156,6 +156,39 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
     }
   }
 
+  /// Paginated list shows ~50 orders; exports must include everything that
+  /// matches the current date-range/team filter. Page through until exhausted
+  /// before handing data to the CSV/PDF builder.
+  Future<bool> _ensureAllOrdersLoaded() async {
+    if (!_hasMore) return true;
+    if (_loadingMore) return false;
+    setState(() => _loadingMore = true);
+    Fluttertoast.showToast(msg: 'Loading all orders for export…');
+    try {
+      while (_hasMore && mounted) {
+        final more = await _service.getOrdersByDateRange(
+          startDate: _startDate,
+          endDate: _endDate,
+          teamId: _selectedTeamFilter,
+          limit: _pageSize,
+          offset: _orders.length,
+        );
+        _orders.addAll(more);
+        _hasMore = more.length >= _pageSize;
+      }
+      if (!mounted) return false;
+      setState(() => _loadingMore = false);
+      _applyStatusFilter();
+      return true;
+    } catch (e) {
+      if (mounted) {
+        setState(() => _loadingMore = false);
+        Fluttertoast.showToast(msg: 'Failed to load all orders: $e');
+      }
+      return false;
+    }
+  }
+
   Future<void> _pickStartDate() async {
     final picked = await showDatePicker(
       context: context,
@@ -234,6 +267,13 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
     required DateTime exportDate,
     String? invoicePrefix,
     int? invoiceStartNum,
+    // Cross-team billing protection: when non-null, line items whose
+    // product_id/sku isn't in these sets are SKIPPED. The selected team's
+    // billing software only knows its own SKUs, so cross-brand items
+    // (e.g. SHADANI in JA export) must be excluded here and will be
+    // exported separately when the admin switches to the other team.
+    Set<String>? teamProductIds,
+    Set<String>? teamProductSkus,
   }) {
     final buffer = StringBuffer();
     const t = '\t';
@@ -244,8 +284,21 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
 
     const months = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
     final dateStr = '="${exportDate.day.toString().padLeft(2, '0')}-${months[exportDate.month - 1]}-${exportDate.year}"';
+    final bool scoped = teamProductIds != null && teamProductIds.isNotEmpty;
+    bool itemBelongsToTeam(OrderItemModel item) {
+      if (!scoped) return true;
+      if (teamProductIds.contains(item.productId)) return true;
+      if (teamProductSkus != null && item.sku.isNotEmpty && teamProductSkus.contains(item.sku)) return true;
+      return false;
+    }
     int invoiceCounter = invoiceStartNum ?? 0;
     for (final o in orders) {
+      // Skip entire order if scoped and no line items belong to the team.
+      final eligibleItems = scoped
+          ? o.lineItems.where(itemBelongsToTeam).toList()
+          : o.lineItems;
+      if (scoped && o.lineItems.isNotEmpty && eligibleItems.isEmpty) continue;
+
       final invoiceNo = (invoicePrefix != null && invoiceStartNum != null)
           ? '$invoicePrefix${invoiceCounter++}'
           : '';
@@ -253,12 +306,12 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
       // Sanitize notes: replace newlines and tabs to prevent breaking rows
       final notes = (o.notes ?? '').replaceAll(RegExp(r'[\r\n\t]+'), ' ').trim();
 
-      if (o.lineItems.isEmpty) {
+      if (eligibleItems.isEmpty) {
         buffer.writeln(
           '$invoiceNo$t${o.id}$t$dateStr$t${o.customerName}${t}0$t$repName$t${t}0.00${t}0.00${t}0.00${t}0.00${t}0.00$t$notes',
         );
       } else {
-        for (final item in o.lineItems) {
+        for (final item in eligibleItems) {
           final mrp = item.mrp > 0 ? item.mrp : (productMrpMap[item.productId] ?? productMrpMap[item.sku] ?? 0.0);
           // Use current product unit_price if it changed after order was placed
           final currentUnitPrice = productUnitPriceMap[item.productId] ?? productUnitPriceMap[item.sku] ?? item.unitPrice;
@@ -279,6 +332,11 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
       Fluttertoast.showToast(msg: 'No orders to export');
       return;
     }
+
+    // Exports must include every order matching the current date-range/team,
+    // not just the paginated slice currently on screen.
+    final fullyLoaded = await _ensureAllOrdersLoaded();
+    if (!fullyLoaded || !mounted) return;
 
     // Step 1: Ask which order status to export
     String exportStatus = 'Pending';
@@ -334,8 +392,62 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
       return;
     }
 
-    // Step 2: Ask which beats to export (multi-select)
-    final beats = statusFilteredOrders.map((o) => o.beat).where((b) => b.isNotEmpty).toSet().toList()..sort();
+    // Pre-load selected team's products + cross-team orders BEFORE the beat
+    // picker so it can show a team-wise split per beat. (The final CSV build
+    // re-uses these same maps/sets further down.)
+    final products = await _service.getProducts(teamId: _selectedTeamFilter);
+    final mrpMap = <String, double>{};
+    final unitPriceMap = <String, double>{};
+    final billingNameMap = <String, String>{};
+    final teamProductIds = <String>{};
+    final teamProductSkus = <String>{};
+    for (final p in products) {
+      mrpMap[p.id] = p.mrp;
+      unitPriceMap[p.id] = p.unitPrice;
+      billingNameMap[p.id] = p.billingName ?? p.name;
+      teamProductIds.add(p.id);
+      if (p.sku.isNotEmpty) {
+        mrpMap[p.sku] = p.mrp;
+        unitPriceMap[p.sku] = p.unitPrice;
+        billingNameMap[p.sku] = p.billingName ?? p.name;
+        teamProductSkus.add(p.sku);
+      }
+    }
+
+    final otherTeam = _selectedTeamFilter == 'JA' ? 'MA' : 'JA';
+    List<OrderModel> crossTeamExtra = const [];
+    try {
+      final otherTeamOrders = await _service.getOrdersByDateRange(
+        startDate: _startDate,
+        endDate: _endDate,
+        teamId: otherTeam,
+        limit: 10000,
+      );
+      crossTeamExtra = otherTeamOrders.where((o) {
+        if (statusResult != 'All' && o.status.toLowerCase() != statusResult!.toLowerCase()) return false;
+        return o.lineItems.any((it) =>
+            teamProductIds.contains(it.productId) ||
+            (it.sku.isNotEmpty && teamProductSkus.contains(it.sku)));
+      }).toList();
+    } catch (e) {
+      debugPrint('[ExportCsv] Cross-team fetch failed: $e — continuing without it');
+    }
+
+    // Step 2: Ask which beats to export (multi-select).
+    // Beats come from BOTH same-team and cross-team orders so the admin can
+    // see team-wise counts per beat. A cross-team order's beat is the beat
+    // the OTHER team's rep was on when the order was booked.
+    final sameTeamBeatCount = <String, int>{};
+    final crossTeamBeatCount = <String, int>{};
+    for (final o in statusFilteredOrders) {
+      if (o.beat.isEmpty) continue;
+      sameTeamBeatCount[o.beat] = (sameTeamBeatCount[o.beat] ?? 0) + 1;
+    }
+    for (final o in crossTeamExtra) {
+      if (o.beat.isEmpty) continue;
+      crossTeamBeatCount[o.beat] = (crossTeamBeatCount[o.beat] ?? 0) + 1;
+    }
+    final beats = {...sameTeamBeatCount.keys, ...crossTeamBeatCount.keys}.toList()..sort();
     final selectedBeats = <String>{...beats}; // all selected by default
     final beatResult = await showDialog<Set<String>?>(
       context: context,
@@ -383,11 +495,23 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
                         itemCount: beats.length,
                         itemBuilder: (_, i) {
                           final beat = beats[i];
-                          final count = statusFilteredOrders.where((o) => o.beat == beat).length;
+                          final sameCount = sameTeamBeatCount[beat] ?? 0;
+                          final crossCount = crossTeamBeatCount[beat] ?? 0;
+                          // Subtitle shows team-wise split so admin sees
+                          // whether the beat carries cross-team pickups too.
+                          // Team-letter labels use the admin's selected team
+                          // first (X same-team), then other team for cross.
+                          final parts = <String>[];
+                          if (sameCount > 0) parts.add('$sameCount $_selectedTeamFilter');
+                          if (crossCount > 0) parts.add('$crossCount cross-team from $otherTeam');
+                          final totalOrders = sameCount + crossCount;
                           return CheckboxListTile(
                             dense: true,
                             title: Text(beat, style: GoogleFonts.manrope(fontSize: 13)),
-                            subtitle: Text('$count orders', style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
+                            subtitle: Text(
+                              '$totalOrders order${totalOrders == 1 ? '' : 's'} · ${parts.join(' + ')}',
+                              style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant),
+                            ),
                             value: selectedBeats.contains(beat),
                             onChanged: (_) {
                               setDialogState(() {
@@ -422,10 +546,19 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
     );
     if (beatResult == null || beatResult.isEmpty) return;
 
-    final exportOrders = beatResult.length == beats.length
+    // Apply the beat filter to BOTH same-team and cross-team sets. Admin's
+    // tick-list now governs both — unticking a beat excludes cross-team
+    // pickups on that beat as well.
+    final allSelected = beatResult.length == beats.length;
+    final exportOrders = allSelected
         ? statusFilteredOrders
         : statusFilteredOrders.where((o) => beatResult.contains(o.beat)).toList();
-    if (exportOrders.isEmpty) {
+    if (!allSelected) {
+      crossTeamExtra = crossTeamExtra
+          .where((o) => beatResult.contains(o.beat))
+          .toList();
+    }
+    if (exportOrders.isEmpty && crossTeamExtra.isEmpty) {
       Fluttertoast.showToast(msg: 'No orders for selected beats');
       return;
     }
@@ -493,21 +626,10 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
     if (pickedDate == null) return;
     exportDate = pickedDate;
 
-    // Build product lookup maps (by id and sku) — use selected team's products
-    final products = await _service.getProducts(teamId: _selectedTeamFilter);
-    final mrpMap = <String, double>{};
-    final unitPriceMap = <String, double>{};
-    final billingNameMap = <String, String>{};
-    for (final p in products) {
-      mrpMap[p.id] = p.mrp;
-      unitPriceMap[p.id] = p.unitPrice;
-      billingNameMap[p.id] = p.billingName ?? p.name;
-      if (p.sku.isNotEmpty) {
-        mrpMap[p.sku] = p.mrp;
-        unitPriceMap[p.sku] = p.unitPrice;
-        billingNameMap[p.sku] = p.billingName ?? p.name;
-      }
-    }
+    // products / teamProductIds / teamProductSkus / crossTeamExtra were all
+    // computed earlier (before the beat picker) so that the picker could
+    // show per-beat team-wise counts. They flow into the final _buildCsv
+    // call below unchanged.
 
     // Build user name lookup map
     // Map by app_users.id AND by email (handles early users like Ranjeet
@@ -527,8 +649,81 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
       if (name != null) userNameMap[uid] = name;
     }
 
+    // Pre-export summary: show the admin a breakdown of same-team vs
+    // cross-team orders BEFORE the CSV is generated. Cross-team pickups
+    // happen automatically when a rep from the other team sold one of this
+    // team's products (e.g. JA rep sold SHADANI → appears in MA export).
+    // Giving admin visibility prevents surprise if the order count looks
+    // higher than the Orders tab's team-filtered list.
+    if (crossTeamExtra.isNotEmpty) {
+      final proceed = await showDialog<bool>(
+        context: context,
+        barrierDismissible: false,
+        builder: (ctx) => AlertDialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          title: Text('Export Summary', style: GoogleFonts.manrope(fontWeight: FontWeight.w800)),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Billing export for team $_selectedTeamFilter will include:',
+                style: GoogleFonts.manrope(fontSize: 13, color: AppTheme.onSurfaceVariant),
+              ),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Icon(Icons.check_circle_rounded, size: 16, color: Colors.green.shade700),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      '${exportOrders.length} order(s) booked under $_selectedTeamFilter',
+                      style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.w600),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 6),
+              Row(
+                children: [
+                  Icon(Icons.compare_arrows_rounded, size: 16, color: Colors.orange.shade800),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      '${crossTeamExtra.length} cross-team order(s) from $otherTeam-booked reps with $_selectedTeamFilter products',
+                      style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.w600),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 10),
+              Text(
+                'Line items that don\'t belong to $_selectedTeamFilter will be skipped — each team\'s billing software only sees its own SKUs.',
+                style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant, fontStyle: FontStyle.italic),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: Text('Cancel', style: GoogleFonts.manrope(fontWeight: FontWeight.w600)),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: Text('Export CSV', style: GoogleFonts.manrope(fontWeight: FontWeight.w700)),
+            ),
+          ],
+        ),
+      );
+      if (proceed != true) return;
+    }
+
+    // Merge the same-team picked orders with the cross-team orders that carry
+    // this-team products. _buildCsv will skip any line items that don't
+    // belong to this team, so mixed orders are automatically trimmed.
+    final mergedExportOrders = <OrderModel>[...exportOrders, ...crossTeamExtra];
     final csv = _buildCsv(
-      orders: exportOrders,
+      orders: mergedExportOrders,
       productMrpMap: mrpMap,
       productUnitPriceMap: unitPriceMap,
       productBillingNameMap: billingNameMap,
@@ -536,6 +731,8 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
       exportDate: exportDate,
       invoicePrefix: invoicePrefix,
       invoiceStartNum: invoiceStartNum,
+      teamProductIds: teamProductIds,
+      teamProductSkus: teamProductSkus,
     );
     final dateLabel = _startDate != null || _endDate != null
         ? '_${_formatDate(_startDate).replaceAll('/', '-')}_to_${_formatDate(_endDate).replaceAll('/', '-')}'
@@ -551,6 +748,11 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
       Fluttertoast.showToast(msg: 'No orders to export');
       return;
     }
+
+    // Exports must include every order matching the current date-range/team,
+    // not just the paginated slice currently on screen.
+    final fullyLoaded = await _ensureAllOrdersLoaded();
+    if (!fullyLoaded || !mounted) return;
 
     setState(() => _generatingPdf = true);
 

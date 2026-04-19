@@ -158,6 +158,20 @@ class _AdminCustomersTabState extends State<AdminCustomersTab> {
     String? selectedBeatIdJA = _beatsJA.any((b) => b.id == jaBeatId) ? jaBeatId : null;
     String? selectedBeatIdMA = _beatsMA.any((b) => b.id == maBeatId) ? maBeatId : null;
 
+    // Per-team ordering-beat override — null means "use primary beat for
+    // ordering too". Loaded from existing override if present; cleared to
+    // null when admin unchecks the checkbox.
+    final jaOrderBeatId = customer?.orderBeatIdOverrideForTeam('JA');
+    final maOrderBeatId = customer?.orderBeatIdOverrideForTeam('MA');
+    String? selectedOrderBeatIdJA =
+        _beatsJA.any((b) => b.id == jaOrderBeatId) ? jaOrderBeatId : null;
+    String? selectedOrderBeatIdMA =
+        _beatsMA.any((b) => b.id == maOrderBeatId) ? maOrderBeatId : null;
+    bool useOrderBeatJA =
+        customer?.hasOrderBeatOverrideForTeam('JA') ?? false;
+    bool useOrderBeatMA =
+        customer?.hasOrderBeatOverrideForTeam('MA') ?? false;
+
     // Pre-populate team from customer profile
     String selectedTeamAssignment;
     if (customer != null) {
@@ -232,6 +246,49 @@ class _AdminCustomersTabState extends State<AdminCustomersTab> {
                     ],
                     onChanged: (v) => setDialogState(() => selectedBeatIdJA = v),
                   ),
+                  // JA ordering-beat override: ACMAST-synced beat above is
+                  // used for collection/outstanding. When this checkbox is
+                  // on, the customer ALSO appears on the picked beat's list
+                  // for order-taking (so rep on that route can place orders
+                  // even though the billing office is on a different route).
+                  CheckboxListTile(
+                    value: useOrderBeatJA,
+                    onChanged: (v) => setDialogState(() {
+                      useOrderBeatJA = v ?? false;
+                      if (!useOrderBeatJA) selectedOrderBeatIdJA = null;
+                    }),
+                    title: Text(
+                      'Different ordering beat (JA)',
+                      style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w600),
+                    ),
+                    subtitle: Text(
+                      useOrderBeatJA
+                          ? 'Rep will see this customer on the chosen beat for orders; collection stays on the primary beat above.'
+                          : 'Rep sees the customer only on the primary beat.',
+                      style: GoogleFonts.manrope(fontSize: 10, color: AppTheme.onSurfaceVariant),
+                    ),
+                    controlAffinity: ListTileControlAffinity.leading,
+                    contentPadding: EdgeInsets.zero,
+                    dense: true,
+                  ),
+                  if (useOrderBeatJA) ...[
+                    const SizedBox(height: 4),
+                    DropdownButtonFormField<String?>(
+                      value: selectedOrderBeatIdJA,
+                      isExpanded: true,
+                      decoration: InputDecoration(
+                        labelText: 'Ordering beat (JA)',
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+                      ),
+                      items: _beatsJA
+                          .map((b) => DropdownMenuItem<String?>(
+                                value: b.id,
+                                child: Text(b.beatName, style: GoogleFonts.manrope(fontSize: 13), overflow: TextOverflow.ellipsis),
+                              ))
+                          .toList(),
+                      onChanged: (v) => setDialogState(() => selectedOrderBeatIdJA = v),
+                    ),
+                  ],
                 ],
                 // MA Beat dropdown — shown when team is MA or Both
                 if (selectedTeamAssignment == 'MA' || selectedTeamAssignment == 'Both') ...[
@@ -259,6 +316,45 @@ class _AdminCustomersTabState extends State<AdminCustomersTab> {
                     ],
                     onChanged: (v) => setDialogState(() => selectedBeatIdMA = v),
                   ),
+                  // MA ordering-beat override — same pattern as JA.
+                  CheckboxListTile(
+                    value: useOrderBeatMA,
+                    onChanged: (v) => setDialogState(() {
+                      useOrderBeatMA = v ?? false;
+                      if (!useOrderBeatMA) selectedOrderBeatIdMA = null;
+                    }),
+                    title: Text(
+                      'Different ordering beat (MA)',
+                      style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w600),
+                    ),
+                    subtitle: Text(
+                      useOrderBeatMA
+                          ? 'Rep will see this customer on the chosen beat for orders; collection stays on the primary beat above.'
+                          : 'Rep sees the customer only on the primary beat.',
+                      style: GoogleFonts.manrope(fontSize: 10, color: AppTheme.onSurfaceVariant),
+                    ),
+                    controlAffinity: ListTileControlAffinity.leading,
+                    contentPadding: EdgeInsets.zero,
+                    dense: true,
+                  ),
+                  if (useOrderBeatMA) ...[
+                    const SizedBox(height: 4),
+                    DropdownButtonFormField<String?>(
+                      value: selectedOrderBeatIdMA,
+                      isExpanded: true,
+                      decoration: InputDecoration(
+                        labelText: 'Ordering beat (MA)',
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+                      ),
+                      items: _beatsMA
+                          .map((b) => DropdownMenuItem<String?>(
+                                value: b.id,
+                                child: Text(b.beatName, style: GoogleFonts.manrope(fontSize: 13), overflow: TextOverflow.ellipsis),
+                              ))
+                          .toList(),
+                      onChanged: (v) => setDialogState(() => selectedOrderBeatIdMA = v),
+                    ),
+                  ],
                 ],
                 const SizedBox(height: 10),
                 DropdownButtonFormField<String>(
@@ -320,6 +416,19 @@ class _AdminCustomersTabState extends State<AdminCustomersTab> {
                   // Resolve beat names
                   final beatNameJA = _beatsJA.where((b) => b.id == selectedBeatIdJA).map((b) => b.beatName).firstOrNull ?? '';
                   final beatNameMA = _beatsMA.where((b) => b.id == selectedBeatIdMA).map((b) => b.beatName).firstOrNull ?? '';
+                  // Resolve ordering-beat override values. Only set when the
+                  // checkbox is on AND a beat is picked; otherwise null out
+                  // both fields so a previously-saved override is cleared.
+                  final String? orderBeatIdJaPersist =
+                      (useOrderBeatJA && selectedOrderBeatIdJA != null) ? selectedOrderBeatIdJA : null;
+                  final String orderBeatNameJaPersist = orderBeatIdJaPersist == null
+                      ? ''
+                      : (_beatsJA.where((b) => b.id == orderBeatIdJaPersist).map((b) => b.beatName).firstOrNull ?? '');
+                  final String? orderBeatIdMaPersist =
+                      (useOrderBeatMA && selectedOrderBeatIdMA != null) ? selectedOrderBeatIdMA : null;
+                  final String orderBeatNameMaPersist = orderBeatIdMaPersist == null
+                      ? ''
+                      : (_beatsMA.where((b) => b.id == orderBeatIdMaPersist).map((b) => b.beatName).firstOrNull ?? '');
 
                   if (customer == null) {
                     // Create customer with default beat for current team
@@ -339,6 +448,10 @@ class _AdminCustomersTabState extends State<AdminCustomersTab> {
                             'team_ja': teamJa, 'team_ma': teamMa,
                             'beat_id_ja': selectedBeatIdJA, 'beat_name_ja': beatNameJA,
                             'beat_id_ma': selectedBeatIdMA, 'beat_name_ma': beatNameMA,
+                            'order_beat_id_ja': orderBeatIdJaPersist,
+                            'order_beat_name_ja': orderBeatNameJaPersist,
+                            'order_beat_id_ma': orderBeatIdMaPersist,
+                            'order_beat_name_ma': orderBeatNameMaPersist,
                           })
                           .eq('customer_id', created.first.id);
                     }
@@ -349,13 +462,18 @@ class _AdminCustomersTabState extends State<AdminCustomersTab> {
                       address: addressCtrl.text.trim(), type: selectedType ?? customer.type,
                       beatId: null, beat: '', deliveryRoute: selectedRoute ?? 'Unassigned',
                     );
-                    // Update team flags + per-team beats
+                    // Update team flags + per-team beats + ordering-beat
+                    // overrides (cleared to null when the checkbox was off).
                     final profileUpdate = <String, dynamic>{
                       'team_ja': teamJa, 'team_ma': teamMa,
                       'beat_id_ja': teamJa ? selectedBeatIdJA : null,
                       'beat_name_ja': teamJa ? beatNameJA : '',
                       'beat_id_ma': teamMa ? selectedBeatIdMA : null,
                       'beat_name_ma': teamMa ? beatNameMA : '',
+                      'order_beat_id_ja': teamJa ? orderBeatIdJaPersist : null,
+                      'order_beat_name_ja': teamJa ? orderBeatNameJaPersist : '',
+                      'order_beat_id_ma': teamMa ? orderBeatIdMaPersist : null,
+                      'order_beat_name_ma': teamMa ? orderBeatNameMaPersist : '',
                     };
                     // Outstanding balance (admin only)
                     if (_isSuperAdmin) {

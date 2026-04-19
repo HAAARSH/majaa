@@ -10,11 +10,18 @@ class AppUserModel {
   final String teamId;
   final String upiId;
   final String? heroImageUrl;
+  /// Installed app version reported on last login (semver, e.g. "1.2.3").
+  /// Null = never reported (pre-1.2.3 client or never logged in since feature shipped).
+  final String? appVersion;
+  /// UTC ISO-8601 timestamp of when [appVersion] was last written. Used so
+  /// admin can tell fresh installs from stale devices that haven't logged in.
+  final String? appVersionAt;
 
   const AppUserModel({
     required this.id, required this.email, required this.fullName,
     required this.role, required this.isActive, this.assignedBeats = const [],
     required this.teamId, required this.upiId, this.heroImageUrl,
+    this.appVersion, this.appVersionAt,
   });
 
   factory AppUserModel.fromJson(Map<String, dynamic> json) => AppUserModel(
@@ -26,6 +33,8 @@ class AppUserModel {
     teamId: json['team_id'] as String? ?? 'JA',
     upiId: json['upi_id'] as String? ?? '',
     heroImageUrl: json['hero_image_url'] as String?,
+    appVersion: json['app_version'] as String?,
+    appVersionAt: json['app_version_at'] as String?,
     assignedBeats: (json['assigned_beats'] as List?)?.map((e) => BeatModel.fromJson(e)).toList() ?? [],
   );
 
@@ -33,5 +42,6 @@ class AppUserModel {
     id: id, email: email, fullName: fullName, role: role, isActive: isActive,
     assignedBeats: assignedBeats ?? this.assignedBeats, teamId: teamId, upiId: upiId,
     heroImageUrl: heroImageUrl ?? this.heroImageUrl,
+    appVersion: appVersion, appVersionAt: appVersionAt,
   );
 }

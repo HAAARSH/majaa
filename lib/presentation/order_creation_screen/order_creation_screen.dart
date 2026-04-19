@@ -176,13 +176,21 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
       return;
     }
 
-    // Resolve beat_name with explicit fallbacks. Reject submit if none found —
-    // an empty beat_name breaks route grouping, Next-Day-Due, and delivery manifests.
+    // Resolve beat_name with explicit fallbacks. The REP's currently-selected
+    // beat wins — the order belongs to wherever the rep physically placed it
+    // (so pending lists and delivery manifests bucket correctly). Customer's
+    // primary ACMAST beat is only a fallback for admin / edit / cart-restore
+    // paths where no rep beat is set. This also makes the ordering-beat
+    // override feature work naturally: a customer with primary=Dharampur,
+    // order_beat=Panditvari gets tagged Panditvari when the rep is on that
+    // route, so the pending order shows up in the right rep's list.
+    // Empty beat still rejects — an untagged order breaks NDD + manifests.
+    final repBeatName = _selectedBeat?.beatName ?? '';
     final customerBeatName = _selectedCustomer!.beatNameForTeam(AuthService.currentTeam);
-    final resolvedBeatName = customerBeatName.isNotEmpty
-        ? customerBeatName
-        : (_selectedBeat?.beatName.isNotEmpty == true
-            ? _selectedBeat!.beatName
+    final resolvedBeatName = repBeatName.isNotEmpty
+        ? repBeatName
+        : (customerBeatName.isNotEmpty
+            ? customerBeatName
             : (CartService.instance.editingOriginalBeatName ?? ''));
 
     if (resolvedBeatName.isEmpty) {

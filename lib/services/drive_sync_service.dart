@@ -1184,6 +1184,22 @@ class DriveSyncService {
         }
       }
 
+      // Pre-load each team's beats once so the GROUP → beat lookup in the
+      // existing-customer update path is O(1). Keyed by lowercased beat
+      // name, matching how ACMAST's GROUP column is compared.
+      final savedTeamForBeatLoad = AuthService.currentTeam;
+      AuthService.currentTeam = 'JA';
+      final jaBeats = await SupabaseService.instance.getBeats();
+      AuthService.currentTeam = 'MA';
+      final maBeats = await SupabaseService.instance.getBeats();
+      AuthService.currentTeam = savedTeamForBeatLoad;
+      final Map<String, BeatModel> jaBeatByName = {
+        for (final b in jaBeats) b.beatName.toLowerCase().trim(): b,
+      };
+      final Map<String, BeatModel> maBeatByName = {
+        for (final b in maBeats) b.beatName.toLowerCase().trim(): b,
+      };
+
       // 4. Parse each ACMAST file with team tagging
       final List<Map<String, dynamic>> allDebtors = [];
       for (final file in acmastFiles) {
@@ -1378,6 +1394,36 @@ class DriveSyncService {
         if (custUpdate.isNotEmpty) {
           final id = existing.id;
           pendingUpdates.add(() => dbClient.from('customers').update(custUpdate).eq('id', id));
+        }
+
+        // Beat correction: ACMAST's GROUP is the authoritative
+        // collection/billing beat for this team. Update customer_team_profiles
+        // if it differs from current. This ONLY touches beat_id_<team> and
+        // beat_name_<team> — order_beat_id_<team> (admin manual override)
+        // is never read or written here, so manual splits are preserved
+        // across syncs.
+        final group = (debtor['group'] as String?)?.trim() ?? '';
+        if (group.isNotEmpty) {
+          final beatLookup = team == 'JA' ? jaBeatByName : maBeatByName;
+          final targetBeat = beatLookup[group.toLowerCase()];
+          if (targetBeat != null) {
+            final currentBeatId = existing.beatIdForTeam(team);
+            final currentBeatName = existing.beatNameForTeam(team);
+            if (currentBeatId != targetBeat.id ||
+                currentBeatName != targetBeat.beatName) {
+              final custId = existing.id;
+              final beatIdCol = team == 'JA' ? 'beat_id_ja' : 'beat_id_ma';
+              final beatNameCol = team == 'JA' ? 'beat_name_ja' : 'beat_name_ma';
+              pendingUpdates.add(() => dbClient.from('customer_team_profiles').upsert({
+                    'customer_id': custId,
+                    beatIdCol: targetBeat.id,
+                    beatNameCol: targetBeat.beatName,
+                  }, onConflict: 'customer_id'));
+              debugPrint(
+                '🗺️ CustomerSync: Beat updated for "${existing.name}" ($team) — "$currentBeatName" → "${targetBeat.beatName}"',
+              );
+            }
+          }
         }
       }
 

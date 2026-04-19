@@ -14,6 +14,14 @@ class CustomerTeamProfile {
   final double outstandingMa;
   final double creditNotesMa;
   final double currentYearBilledMa;
+  // Manual ordering-beat override. Non-null means admin set a different beat
+  // for the rep's ordering route (customer appears on this beat's list for
+  // order-taking). Collection / outstanding always use the ACMAST-synced
+  // beat above. Null means no override — ordering uses the primary beat too.
+  final String? orderBeatIdJa;
+  final String orderBeatNameJa;
+  final String? orderBeatIdMa;
+  final String orderBeatNameMa;
 
   const CustomerTeamProfile({
     required this.id,
@@ -30,6 +38,10 @@ class CustomerTeamProfile {
     this.outstandingMa = 0.0,
     this.creditNotesMa = 0.0,
     this.currentYearBilledMa = 0.0,
+    this.orderBeatIdJa,
+    this.orderBeatNameJa = '',
+    this.orderBeatIdMa,
+    this.orderBeatNameMa = '',
   });
 
   factory CustomerTeamProfile.fromJson(Map<String, dynamic> json) =>
@@ -48,6 +60,10 @@ class CustomerTeamProfile {
         outstandingMa: (json['outstanding_ma'] as num?)?.toDouble() ?? 0.0,
         creditNotesMa: (json['credit_notes_ma'] as num?)?.toDouble() ?? 0.0,
         currentYearBilledMa: (json['current_year_billed_ma'] as num?)?.toDouble() ?? 0.0,
+        orderBeatIdJa: json['order_beat_id_ja'] as String?,
+        orderBeatNameJa: json['order_beat_name_ja'] as String? ?? '',
+        orderBeatIdMa: json['order_beat_id_ma'] as String?,
+        orderBeatNameMa: json['order_beat_name_ma'] as String? ?? '',
       );
 
   Map<String, dynamic> toJson() => {
@@ -64,16 +80,28 @@ class CustomerTeamProfile {
         'outstanding_ma': outstandingMa,
         'credit_notes_ma': creditNotesMa,
         'current_year_billed_ma': currentYearBilledMa,
+        'order_beat_id_ja': orderBeatIdJa,
+        'order_beat_name_ja': orderBeatNameJa,
+        'order_beat_id_ma': orderBeatIdMa,
+        'order_beat_name_ma': orderBeatNameMa,
       };
 
   /// Helper: does this customer belong to a given team?
   bool belongsToTeam(String team) => team == 'JA' ? teamJa : teamMa;
 
-  /// Helper: beat ID for a given team
+  /// Helper: beat ID for a given team (the ACMAST/collection beat).
   String? beatIdFor(String team) => team == 'JA' ? beatIdJa : beatIdMa;
 
-  /// Helper: beat name for a given team
+  /// Helper: beat name for a given team (the ACMAST/collection beat).
   String beatNameFor(String team) => team == 'JA' ? beatNameJa : beatNameMa;
+
+  /// Manual ordering-beat override for a given team. Null means no override.
+  String? orderBeatIdFor(String team) =>
+      team == 'JA' ? orderBeatIdJa : orderBeatIdMa;
+
+  /// Manual ordering-beat display name for a given team.
+  String orderBeatNameFor(String team) =>
+      team == 'JA' ? orderBeatNameJa : orderBeatNameMa;
 
   /// Helper: outstanding for a given team
   double outstandingFor(String team) => team == 'JA' ? outstandingJa : outstandingMa;
@@ -170,11 +198,33 @@ class CustomerModel {
   /// Current year billed for [team].
   double currentYearBilledForTeam(String team) => _profile?.currentYearBilledFor(team) ?? 0.0;
 
-  /// Beat ID for [team].
+  /// Primary beat ID for [team] — the ACMAST-synced collection/billing beat.
+  /// Use this for outstanding reports, collection flows, and Next-Day-Due.
   String? beatIdForTeam(String team) => _profile?.beatIdFor(team);
 
-  /// Beat display name for [team].
+  /// Primary beat display name for [team].
   String beatNameForTeam(String team) => _profile?.beatNameFor(team) ?? '';
+
+  /// Manual ordering-beat override for [team]. Null if no override (ordering
+  /// uses primary). Use this to decide which beat's customer list a customer
+  /// should appear on for order-taking.
+  String? orderBeatIdOverrideForTeam(String team) =>
+      _profile?.orderBeatIdFor(team);
+
+  /// Effective beat ID used when deciding whether a customer appears on a
+  /// beat's customer list for ORDERING. Falls back to primary when override
+  /// is null — i.e. same as today's behavior for customers without a split.
+  String? effectiveOrderBeatIdForTeam(String team) =>
+      _profile?.orderBeatIdFor(team) ?? _profile?.beatIdFor(team);
+
+  /// True if admin has explicitly set a different ordering beat for this
+  /// team. Used by the customer list + beat counters to know the customer
+  /// should appear under two different beats (primary for collection,
+  /// override for ordering).
+  bool hasOrderBeatOverrideForTeam(String team) {
+    final override = _profile?.orderBeatIdFor(team);
+    return override != null && override.isNotEmpty;
+  }
 
   /// Does this customer belong to [team]?
   bool belongsToTeam(String team) => _profile?.belongsToTeam(team) ?? false;

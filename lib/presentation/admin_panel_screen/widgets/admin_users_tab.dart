@@ -22,6 +22,9 @@ class _AdminUsersTabState extends State<AdminUsersTab> {
   List<AppUserModel> _filtered = [];
   String? _error;
   final _searchCtrl = TextEditingController();
+  /// Latest app version from app_settings. Used to color user cards green
+  /// (up-to-date) or orange (behind). Null = couldn't fetch, no color.
+  String? _latestAppVersion;
 
   @override
   void initState() {
@@ -41,13 +44,46 @@ class _AdminUsersTabState extends State<AdminUsersTab> {
     try {
       final users = await SupabaseService.instance.getAppUsers(forceRefresh: forceRefresh, allTeams: true);
       users.sort((a, b) => a.fullName.toLowerCase().compareTo(b.fullName.toLowerCase()));
+      // Fetch latest published version so cards can flag out-of-date devices.
+      String? latest;
+      try {
+        final resp = await SupabaseService.instance.client
+            .from('app_settings')
+            .select('latest_version')
+            .eq('id', 1)
+            .maybeSingle();
+        latest = resp?['latest_version'] as String?;
+      } catch (_) {}
       if (!mounted) return;
-      setState(() { _users = users; _filtered = users; _isLoading = false; });
+      setState(() {
+        _users = users;
+        _filtered = users;
+        _latestAppVersion = latest;
+        _isLoading = false;
+      });
       _applySearch();
     } catch (e) {
       if (!mounted) return;
       setState(() { _error = e.toString(); _isLoading = false; });
     }
+  }
+
+  /// Semver compare — returns true iff [installed] < [latest]. Missing
+  /// installed version counts as outdated.
+  bool _isOutdated(String? installed) {
+    if (_latestAppVersion == null || _latestAppVersion!.isEmpty) return false;
+    if (installed == null || installed.isEmpty) return true;
+    List<int> parts(String v) =>
+        v.split('+').first.split('.').map((p) => int.tryParse(p) ?? 0).toList();
+    final a = parts(installed);
+    final b = parts(_latestAppVersion!);
+    while (a.length < 3) { a.add(0); }
+    while (b.length < 3) { b.add(0); }
+    for (int i = 0; i < 3; i++) {
+      if (a[i] < b[i]) return true;
+      if (a[i] > b[i]) return false;
+    }
+    return false;
   }
 
   void _applySearch() {
@@ -641,6 +677,48 @@ class _AdminUsersTabState extends State<AdminUsersTab> {
                                       decoration: BoxDecoration(color: AppTheme.primary.withValues(alpha: 0.08), borderRadius: BorderRadius.circular(6)),
                                       child: Text(u.teamId, style: GoogleFonts.manrope(fontSize: 10, fontWeight: FontWeight.w700, color: AppTheme.primary)),
                                     ),
+                                    // App-version chip. Green = matches latest
+                                    // published, orange = behind. No chip if
+                                    // the rep never reported a version.
+                                    if (u.appVersion != null && u.appVersion!.isNotEmpty) ...[
+                                      Builder(builder: (_) {
+                                        final outdated = _isOutdated(u.appVersion);
+                                        final bg = outdated ? Colors.orange.shade100 : Colors.green.shade100;
+                                        final fg = outdated ? Colors.orange.shade900 : Colors.green.shade900;
+                                        return Container(
+                                          padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                                          decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(6)),
+                                          child: Row(
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              Icon(
+                                                outdated ? Icons.warning_amber_rounded : Icons.check_circle_rounded,
+                                                size: 10,
+                                                color: fg,
+                                              ),
+                                              const SizedBox(width: 3),
+                                              Text(
+                                                'v${u.appVersion}',
+                                                style: GoogleFonts.manrope(
+                                                  fontSize: 10,
+                                                  fontWeight: FontWeight.w700,
+                                                  color: fg,
+                                                  fontFeatures: [const FontFeature.tabularFigures()],
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        );
+                                      }),
+                                    ] else
+                                      Container(
+                                        padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                                        decoration: BoxDecoration(color: Colors.grey.shade200, borderRadius: BorderRadius.circular(6)),
+                                        child: Text(
+                                          'v?',
+                                          style: GoogleFonts.manrope(fontSize: 10, fontWeight: FontWeight.w700, color: Colors.grey.shade700),
+                                        ),
+                                      ),
                                     if (u.upiId.isNotEmpty)
                                       ConstrainedBox(
                                         constraints: const BoxConstraints(maxWidth: 180),

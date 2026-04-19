@@ -224,11 +224,22 @@ class _AdminUserBeatsTabState extends State<AdminUserBeatsTab> {
             children: _allDays.map((day) {
               final isSelected = selected.contains(day);
               return FilterChip(
-                label: Text(day[0].toUpperCase() + day.substring(1),
-                    style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w600)),
+                label: Text(
+                  day[0].toUpperCase() + day.substring(1),
+                  style: GoogleFonts.manrope(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                    color: isSelected ? Colors.white : AppTheme.primary,
+                  ),
+                ),
                 selected: isSelected,
-                selectedColor: AppTheme.primary.withValues(alpha: 0.2),
-                checkmarkColor: AppTheme.primary,
+                backgroundColor: Colors.white,
+                selectedColor: AppTheme.primary,
+                checkmarkColor: Colors.white,
+                side: BorderSide(
+                  color: isSelected ? AppTheme.primary : AppTheme.primary.withValues(alpha: 0.5),
+                  width: 1.2,
+                ),
                 onSelected: (v) => setDialogState(() => v ? selected.add(day) : selected.remove(day)),
               );
             }).toList(),

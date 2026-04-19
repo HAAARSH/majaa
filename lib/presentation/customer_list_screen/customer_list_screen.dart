@@ -37,11 +37,26 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
   String _searchQuery = '';
 
   // Brand-rep only: customers in this team who have ordered any product
-  // from the rep's allowed brands. Used to pin those customers to the top
-  // with a "Your Brand" badge so reps see their active customers first.
+  // from the rep's allowed brands. The brand_rep UI splits customers into
+  // two tabs ("<brand>" and "All") and labels the card badge with the actual
+  // brand name so reps don't see a generic "Your Brand" string.
   bool get _isBrandRep =>
       SupabaseService.instance.currentUserRole == 'brand_rep';
   Set<String> _brandCustomerIds = {};
+  List<String> _brandNames = [];
+
+  /// Label used for the brand tab and the card badge. 1 brand → the name,
+  /// 2 → "A / B", 3+ → "My Brands" to stop the tab from overflowing.
+  String get _brandLabel {
+    if (_brandNames.isEmpty) return 'My Brand';
+    if (_brandNames.length == 1) return _brandNames.first;
+    if (_brandNames.length == 2) return _brandNames.join(' / ');
+    return 'My Brands';
+  }
+
+  /// Show the brand tab only when the rep actually has brands assigned —
+  /// otherwise the tab is noise and Tab 1 would always be empty.
+  bool get _showBrandTabs => _isBrandRep && _brandNames.isNotEmpty;
 
   // Multi-beat merged view
   List<BeatModel> _beats = [];
@@ -116,14 +131,25 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
           if (beatTeam != AuthService.currentTeam) {
             AuthService.currentTeam = beatTeam;
           }
-          _allCustomers = customers
-              .where((c) => c.beatIdForTeam(beatTeam) == _beat!.id)
-              .toList();
+          _allCustomers = customers.where((c) {
+            final primary = c.beatIdForTeam(beatTeam);
+            final orderOverride = c.orderBeatIdOverrideForTeam(beatTeam);
+            // Appear on this beat's list if primary matches (collection context)
+            // OR the admin-set ordering override matches (order context).
+            return primary == _beat!.id ||
+                (orderOverride != null && orderOverride == _beat!.id);
+          }).toList();
         } else {
-          // Normal beat mode: strictly filter to this beat.
-          _allCustomers = customers
-              .where((c) => c.beatIdForTeam(AuthService.currentTeam) == _beat!.id)
-              .toList();
+          // Normal beat mode: strictly filter to this beat — but include
+          // customers whose ordering-beat override points here, so reps
+          // working the route can place orders for them even if their
+          // billing beat is elsewhere.
+          _allCustomers = customers.where((c) {
+            final primary = c.beatIdForTeam(AuthService.currentTeam);
+            final orderOverride = c.orderBeatIdOverrideForTeam(AuthService.currentTeam);
+            return primary == _beat!.id ||
+                (orderOverride != null && orderOverride == _beat!.id);
+          }).toList();
         }
         _visitedIds = visitedIds;
         _applyFilters('');
@@ -146,6 +172,10 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
       if (userId == null) return;
       final allowedBrands =
           await SupabaseService.instance.getUserBrandAccess(userId);
+      if (!mounted) return;
+      setState(() {
+        _brandNames = List<String>.from(allowedBrands)..sort();
+      });
       if (allowedBrands.isEmpty) return;
       final ids = await SupabaseService.instance
           .getCustomerIdsWithBrandHistory(allowedBrands);
@@ -155,7 +185,7 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
         _applyFilters(_searchQuery);
       });
     } catch (_) {
-      // Silent fallback — list still works without the pin-to-top behavior.
+      // Silent fallback — list still works without the tab split.
     }
   }
 
@@ -167,20 +197,6 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
 
     if (_sortBy == 'Alphabetical') {
       temp.sort((a, b) => a.name.compareTo(b.name));
-      // Brand_rep: pin customers who have ordered the rep's brand before
-      // to the top. Both groups stay alphabetically sorted within themselves.
-      if (_isBrandRep && _brandCustomerIds.isNotEmpty) {
-        final brandFirst = <CustomerModel>[];
-        final others = <CustomerModel>[];
-        for (final c in temp) {
-          if (_brandCustomerIds.contains(c.id)) {
-            brandFirst.add(c);
-          } else {
-            others.add(c);
-          }
-        }
-        temp = [...brandFirst, ...others];
-      }
     } else if (_sortBy == 'High Value') {
       temp.sort((a, b) => b.lastOrderValue.compareTo(a.lastOrderValue));
     } else if (_sortBy == 'Recent Order') {
@@ -409,13 +425,9 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
           Expanded(
             child: _isLoading
                 ? const Center(child: CircularProgressIndicator())
-                : AlphabetScrollList(
-                    itemCount: _filteredCustomers.length,
-                    itemBuilder: (context, index) => _buildCustomerCard(_filteredCustomers[index]),
-                    labelForIndex: (index) => _filteredCustomers[index].name,
-                    padding: const EdgeInsets.symmetric(horizontal: 16),
-                    onRefresh: () => _loadCustomers(forceRefresh: true),
-                  ),
+                : _showBrandTabs
+                    ? _buildBrandTabbedList()
+                    : _buildPlainList(_filteredCustomers),
           ),
         ],
       ),
@@ -423,6 +435,96 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
   }
 
   // --- UI COMPONENTS ---
+
+  Widget _buildPlainList(List<CustomerModel> customers) {
+    return AlphabetScrollList(
+      itemCount: customers.length,
+      itemBuilder: (context, index) => _buildCustomerCard(customers[index]),
+      labelForIndex: (index) => customers[index].name,
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      onRefresh: () => _loadCustomers(forceRefresh: true),
+    );
+  }
+
+  Widget _buildBrandTabbedList() {
+    final brandCustomers = _filteredCustomers
+        .where((c) => _brandCustomerIds.contains(c.id))
+        .toList();
+    return DefaultTabController(
+      length: 2,
+      child: Column(
+        children: [
+          Material(
+            color: AppTheme.surface,
+            child: TabBar(
+              labelColor: AppTheme.primary,
+              unselectedLabelColor: AppTheme.onSurfaceVariant,
+              indicatorColor: AppTheme.primary,
+              labelStyle: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.w700),
+              unselectedLabelStyle: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.w600),
+              tabs: [
+                Tab(text: '$_brandLabel (${brandCustomers.length})'),
+                Tab(text: 'All (${_filteredCustomers.length})'),
+              ],
+            ),
+          ),
+          Expanded(
+            child: TabBarView(
+              children: [
+                brandCustomers.isEmpty
+                    ? _buildBrandEmptyState()
+                    : _buildPlainList(brandCustomers),
+                _buildPlainList(_filteredCustomers),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildBrandEmptyState() {
+    return RefreshIndicator(
+      onRefresh: () => _loadCustomers(forceRefresh: true),
+      child: ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        children: [
+          SizedBox(
+            height: MediaQuery.of(context).size.height * 0.4,
+            child: Center(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 32),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.storefront_outlined,
+                        size: 48, color: AppTheme.onSurfaceVariant.withAlpha(100)),
+                    const SizedBox(height: 12),
+                    Text(
+                      'No $_brandLabel customers here yet',
+                      textAlign: TextAlign.center,
+                      style: GoogleFonts.manrope(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w700,
+                          color: AppTheme.onSurface),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      'Check the All tab to see every customer on this beat.',
+                      textAlign: TextAlign.center,
+                      style: GoogleFonts.manrope(
+                          fontSize: 12,
+                          color: AppTheme.onSurfaceVariant),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 
   Widget _buildCustomerCard(CustomerModel customer) {
     final phoneIsMissing = customer.phone.isEmpty || customer.phone == 'No Phone';
@@ -502,8 +604,9 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
                             maxLines: 2,
                             overflow: TextOverflow.ellipsis,
                           ),
-                          // "Your Brand" chip — brand_rep only, for customers
-                          // who have ordered from the rep's allowed brands.
+                          // Brand badge — brand_rep only, for customers who
+                          // have ordered from the rep's allowed brands. Label
+                          // matches the brand tab so they're visually linked.
                           if (_isBrandRep && _brandCustomerIds.contains(customer.id)) ...[
                             const SizedBox(height: 4),
                             Container(
@@ -519,7 +622,7 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
                                   Icon(Icons.star_rounded, size: 12, color: Colors.amber.shade800),
                                   const SizedBox(width: 3),
                                   Text(
-                                    'Your Brand',
+                                    _brandLabel,
                                     style: GoogleFonts.manrope(
                                       fontSize: 10,
                                       fontWeight: FontWeight.w700,
@@ -979,19 +1082,29 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
           .update({'phone': '+91$newPhone'})
           .eq('id', customer.id);
 
-      final box = Hive.box('cache_${AuthService.currentTeam}');
       final updatedCustomer = customer.copyWith(phone: '+91$newPhone');
 
-      // Use team-namespaced cache key to match _fetchWithCache pattern
-      final cacheKey = 'customers_${AuthService.currentTeam}';
-      final cachedStr = box.get(cacheKey) as String?;
-      if (cachedStr != null) {
-        List<dynamic> cachedList = jsonDecode(cachedStr);
-        final index = cachedList.indexWhere((c) => c['id'] == customer.id);
-        if (index != -1) {
-          cachedList[index] = updatedCustomer.toJson();
-          await box.put(cacheKey, jsonEncode(cachedList));
+      // Update Hive cache to keep the phone consistent across tab switches.
+      // Guarded because the cache box may not exist on fresh installs or if
+      // the team was just switched; a missing cache isn't a save failure —
+      // the next getCustomers call will pick up the DB write.
+      try {
+        final boxName = 'cache_${AuthService.currentTeam}';
+        if (Hive.isBoxOpen(boxName)) {
+          final box = Hive.box(boxName);
+          final cacheKey = 'customers_${AuthService.currentTeam}';
+          final cachedStr = box.get(cacheKey) as String?;
+          if (cachedStr != null) {
+            final List<dynamic> cachedList = jsonDecode(cachedStr);
+            final index = cachedList.indexWhere((c) => c['id'] == customer.id);
+            if (index != -1) {
+              cachedList[index] = updatedCustomer.toJson();
+              await box.put(cacheKey, jsonEncode(cachedList));
+            }
+          }
         }
+      } catch (e) {
+        debugPrint('[CustomerList] phone cache update skipped: $e');
       }
 
       setState(() {

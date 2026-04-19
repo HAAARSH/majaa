@@ -6,6 +6,7 @@ import 'package:http/http.dart' as http;
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import 'supabase_service.dart';
 import '../theme/app_theme.dart';
@@ -370,6 +371,24 @@ class _UpdateDialogState extends State<_UpdateDialog> {
               onPressed: () => Navigator.pop(context),
               child: Text('Cancel', style: GoogleFonts.manrope(color: AppTheme.onSurfaceVariant, fontWeight: FontWeight.w700)),
             ),
+          // Fallback: if the in-app downloader keeps failing (Drive URL
+          // format changes, permission issues, etc.) give the rep a path
+          // that completely bypasses update_service — open the URL in the
+          // device browser so they can download + install manually.
+          TextButton.icon(
+            icon: Icon(Icons.open_in_browser_rounded, size: 18, color: AppTheme.primary),
+            label: Text('Download in Browser', style: GoogleFonts.manrope(fontWeight: FontWeight.w700, color: AppTheme.primary)),
+            onPressed: () async {
+              final uri = Uri.tryParse(widget.apkUrl);
+              if (uri == null) return;
+              try {
+                await launchUrl(uri, mode: LaunchMode.externalApplication);
+              } catch (_) {
+                // launchUrl swallows its own errors in most cases; nothing
+                // useful to surface here.
+              }
+            },
+          ),
           FilledButton.icon(
             icon: const Icon(Icons.refresh_rounded, size: 18, color: Colors.white),
             label: Text('Retry', style: GoogleFonts.manrope(fontWeight: FontWeight.w700, color: Colors.white)),

@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart';
 import 'package:hive_flutter/hive_flutter.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
@@ -81,10 +82,32 @@ class AuthService {
         await prefs.remove('last_full_name');
       }
 
+      // Report installed app version to app_users so admin can see at a
+      // glance which reps are still on an old build. Fire-and-forget —
+      // login must not fail if this write errors (older DB, offline, etc).
+      _reportAppVersion(res.user!.id);
+
       return true;
     } catch (e) {
       debugPrint('Login Error: $e');
       return await attemptOfflineResume();
+    }
+  }
+
+  /// Writes the installed semver + timestamp to app_users so admin can spot
+  /// devices still on old versions. Swallows all errors — this is telemetry,
+  /// not a login gate.
+  Future<void> _reportAppVersion(String userId) async {
+    try {
+      final info = await PackageInfo.fromPlatform();
+      final version = info.version; // e.g. "1.2.3"
+      if (version.isEmpty) return;
+      await client.from('app_users').update({
+        'app_version': version,
+        'app_version_at': DateTime.now().toUtc().toIso8601String(),
+      }).eq('id', userId);
+    } catch (e) {
+      debugPrint('[AuthService] App version report failed: $e');
     }
   }
 

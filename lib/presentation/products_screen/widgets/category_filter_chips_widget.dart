@@ -25,6 +25,8 @@ class CategoryFilterChipsWidget extends StatelessWidget {
         ? categories
         : ['All', ...allowedBrands.where((b) => categories.contains(b))];
 
+    debugPrint('🔍 CHIPS categories=$categories allowed=$allowedBrands visible=$visibleCategories');
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [

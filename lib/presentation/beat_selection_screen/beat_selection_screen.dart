@@ -9,6 +9,7 @@ import 'package:share_plus/share_plus.dart';
 import 'package:http/http.dart' as http;
 
 import '../../core/search_utils.dart';
+import '../../core/time_utils.dart';
 import '../../main.dart' show routeObserver;
 import '../../routes/app_routes.dart';
 import '../../services/auth_service.dart';
@@ -135,7 +136,10 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen>
       final beats = await SupabaseService.instance.getUserBeats(userId, allTeams: true);
 
       final allCustomers = await SupabaseService.instance.getCustomers(forceRefresh: forceRefresh);
-      final todayStr = DateTime.now().toIso8601String().substring(0, 10);
+      // IST + Sunday-shift: on Sunday the "today" we work with is Monday,
+      // so date-scoped fetches pull the upcoming working day's data instead
+      // of an empty Sunday slice.
+      final todayStr = _effectiveToday.toIso8601String().substring(0, 10);
 
       // Detect cross-team beats for today (e.g., Sourab covering Kaulagarh for both JA & MA)
       final todayBeatsList = beats.where((b) => _isBeatToday(b)).toList();
@@ -164,17 +168,29 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen>
         for (var b in todayBeats) {
           // Use each beat's own team for stats (supports cross-team beats)
           final beatTeam = b.teamId;
-          final beatCustomers = allCustomers.where((c) {
-            final bid = c.beatIdForTeam(beatTeam);
-            return bid == b.id;
+          // "Customers on this beat" for the rep's visit count uses OR
+          // semantics — a customer with an ordering-beat override should
+          // appear on BOTH beats' count so the rep knows to stop by on
+          // whichever route they're running that day.
+          final orderContextCustomers = allCustomers.where((c) {
+            final primary = c.beatIdForTeam(beatTeam);
+            final orderOverride = c.orderBeatIdOverrideForTeam(beatTeam);
+            return primary == b.id ||
+                (orderOverride != null && orderOverride == b.id);
           }).toList();
-          todayTotalMap[b.id] = beatCustomers.length;
+          // Outstanding is a collection metric — use PRIMARY beat only
+          // (ACMAST-synced billing address). Including order-override
+          // customers would double-count their dues across beats.
+          final collectionCustomers = allCustomers
+              .where((c) => c.beatIdForTeam(beatTeam) == b.id)
+              .toList();
+          todayTotalMap[b.id] = orderContextCustomers.length;
           todayOrderMap[b.id] = orders
               .where((o) => o['beat_name'] == b.beatName)
               .map((o) => o['customer_id'])
               .toSet()
               .length;
-          outstandingMap[b.id] = beatCustomers.fold(
+          outstandingMap[b.id] = collectionCustomers.fold(
             0.0,
             (sum, c) => sum + c.outstandingForTeam(beatTeam),
           );
@@ -203,7 +219,10 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen>
 
   Future<void> _loadTabData(List<CustomerModel> allCustomers, List<BeatModel> allBeats) async {
     try {
-      final today = DateTime.now();
+      // Collections / next-day base off IST + Sunday-shift so Sunday users
+      // see Monday's working set. NDD jumps one day forward from _effectiveToday,
+      // which keeps Sat→Mon, Sun→Mon, Mon→Tue correct.
+      final today = _effectiveToday;
       final todayStr = today.toIso8601String().substring(0, 10);
 
       // Load today's collections for logged-in rep only
@@ -221,10 +240,12 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen>
       }
 
       // Load next day beat outstanding (sales_rep only).
-      // Skip Sunday — on Saturday, "next day" jumps to Monday so the rep sees
-      // the actual next working day's outstanding, not an empty Sunday tab.
+      // NDD is computed from RAW IST now (not _effectiveToday) so Sunday
+      // still shows Monday (spec: Sat→Mon, Sun→Mon, Mon→Tue). If we used
+      // _effectiveToday here, Sunday would incorrectly advance to Tuesday.
       if (!_isBrandRep) {
-        var tomorrow = today.add(const Duration(days: 1));
+        final istNow = TimeUtils.nowIst();
+        var tomorrow = istNow.add(const Duration(days: 1));
         if (tomorrow.weekday == DateTime.sunday) {
           tomorrow = tomorrow.add(const Duration(days: 1));
         }
@@ -440,9 +461,21 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen>
     'thursday', 'friday', 'saturday', 'sunday',
   ];
 
+  /// Returns the weekday the UI should behave as "today" for working-day
+  /// flows. Normally just IST today, but on Sunday it shifts to Monday —
+  /// reps don't work Sundays, so the collection tab + today's beat list
+  /// should show the upcoming Monday's data instead of an empty Sunday.
+  DateTime get _effectiveToday {
+    final now = TimeUtils.nowIst();
+    if (now.weekday == DateTime.sunday) {
+      return now.add(const Duration(days: 1));
+    }
+    return now;
+  }
+
   bool _isBeatToday(BeatModel beat) {
     if (beat.weekdays.isEmpty) return false;
-    final todayName = _weekdayNames[DateTime.now().weekday - 1];
+    final todayName = _weekdayNames[_effectiveToday.weekday - 1];
     // FIX 1 (BUG 2): case-insensitive full-name comparison
     return beat.weekdays.any((day) => day.toLowerCase().trim() == todayName);
   }
@@ -1401,45 +1434,7 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen>
                   style: GoogleFonts.manrope(fontSize: 11, fontWeight: FontWeight.w700, color: AppTheme.onSurfaceVariant),
                 ),
               ),
-              Row(children: [
-                Expanded(
-                  child: SizedBox(
-                    height: 46,
-                    child: FilledButton.icon(
-                      onPressed: () => _shareOutstandingReport(
-                        primaryBeatNames: _todayPrimaryBeatNames,
-                        crossTeamId: _todayCrossTeamId,
-                        crossBeatNames: _todayCrossBeatNames,
-                      ),
-                      icon: const Icon(Icons.share_rounded, size: 16),
-                      label: Text('Share', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700)),
-                      style: FilledButton.styleFrom(
-                        backgroundColor: Colors.green.shade700,
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                      ),
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: SizedBox(
-                    height: 46,
-                    child: OutlinedButton.icon(
-                      onPressed: () => _printOutstandingReport(
-                        primaryBeatNames: _todayPrimaryBeatNames,
-                        crossTeamId: _todayCrossTeamId,
-                        crossBeatNames: _todayCrossBeatNames,
-                      ),
-                      icon: Icon(Icons.print_rounded, size: 16, color: AppTheme.primary),
-                      label: Text('Print', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700, color: AppTheme.primary)),
-                      style: OutlinedButton.styleFrom(
-                        side: BorderSide(color: AppTheme.primary),
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                      ),
-                    ),
-                  ),
-                ),
-              ]),
+              _buildCollectionActionsRow(),
             ],
           ],
         ),
@@ -1500,42 +1495,9 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen>
               padding: const EdgeInsets.fromLTRB(16, 8, 16, 80),
               itemCount: customers.length + 1, // +1 for overlay buttons
               itemBuilder: (_, i) {
-                // Last item = overlay buttons
+                // Last item = unified share/print row (dispatches on state).
                 if (i == customers.length) {
-                  return Padding(
-                    padding: const EdgeInsets.only(top: 8, bottom: 16),
-                    child: Row(children: [
-                      Expanded(
-                        child: SizedBox(
-                          height: 44,
-                          child: OutlinedButton.icon(
-                            onPressed: _printCollectionOverlay,
-                            icon: Icon(Icons.print_rounded, size: 16, color: AppTheme.primary),
-                            label: Text('Print Overlay', style: GoogleFonts.manrope(fontSize: 11, fontWeight: FontWeight.w700, color: AppTheme.primary)),
-                            style: OutlinedButton.styleFrom(
-                              side: BorderSide(color: AppTheme.primary),
-                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                            ),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: SizedBox(
-                          height: 44,
-                          child: FilledButton.icon(
-                            onPressed: _shareCollectionOverlay,
-                            icon: const Icon(Icons.share_rounded, size: 16),
-                            label: Text('Share Overlay', style: GoogleFonts.manrope(fontSize: 11, fontWeight: FontWeight.w700)),
-                            style: FilledButton.styleFrom(
-                              backgroundColor: Colors.green.shade700,
-                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                            ),
-                          ),
-                        ),
-                      ),
-                    ]),
-                  );
+                  return _buildCollectionActionsRow();
                 }
                 final entry = customers[i];
                 final custName = entry.key;
@@ -1597,6 +1559,60 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen>
           }),
         ),
       ],
+    );
+  }
+
+  /// Unified Share / Print row on the Collections tab. One pair of buttons
+  /// regardless of whether any collections have been recorded yet:
+  /// - Empty collections  → today's outstanding (same layout as Next-Day-Due)
+  /// - Has collections     → overlay PDF with cash/UPI/cheque breakdown per bill
+  Widget _buildCollectionActionsRow() {
+    final hasCollections = _todayCollections.isNotEmpty;
+    return Padding(
+      padding: const EdgeInsets.only(top: 8, bottom: 16),
+      child: Row(children: [
+        Expanded(
+          child: SizedBox(
+            height: 46,
+            child: FilledButton.icon(
+              onPressed: hasCollections
+                  ? _shareCollectionOverlay
+                  : () => _shareOutstandingReport(
+                        primaryBeatNames: _todayPrimaryBeatNames,
+                        crossTeamId: _todayCrossTeamId,
+                        crossBeatNames: _todayCrossBeatNames,
+                      ),
+              icon: const Icon(Icons.share_rounded, size: 16),
+              label: Text('Share', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700)),
+              style: FilledButton.styleFrom(
+                backgroundColor: Colors.green.shade700,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(width: 10),
+        Expanded(
+          child: SizedBox(
+            height: 46,
+            child: OutlinedButton.icon(
+              onPressed: hasCollections
+                  ? _printCollectionOverlay
+                  : () => _printOutstandingReport(
+                        primaryBeatNames: _todayPrimaryBeatNames,
+                        crossTeamId: _todayCrossTeamId,
+                        crossBeatNames: _todayCrossBeatNames,
+                      ),
+              icon: Icon(Icons.print_rounded, size: 16, color: AppTheme.primary),
+              label: Text('Print', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700, color: AppTheme.primary)),
+              style: OutlinedButton.styleFrom(
+                side: BorderSide(color: AppTheme.primary),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              ),
+            ),
+          ),
+        ),
+      ]),
     );
   }
 
@@ -2377,14 +2393,20 @@ class _OutOfBeatSheetContentState extends State<_OutOfBeatSheetContent> {
     try {
       final allowedBeatIds = allowedBeats.map((b) => b.id).toSet();
       final allCustomers = await SupabaseService.instance.getCustomers();
-      // A customer is "on" an allowed beat if their beat_id for either team
-      // matches one of the rep's allowed beat IDs. Works for both sales_rep
-      // and brand_rep since allowedBeats comes from getUserBeats (role-agnostic).
+      // A customer is "on" an allowed beat if their PRIMARY beat OR their
+      // ordering-beat override for either team matches an allowed beat id.
+      // Including override beats here lets the OOB search find customers
+      // whose split (e.g. Dobhal & Navi: primary=Dharampur 2nd,
+      // order_beat=Panditvari) puts them on a route the rep is running.
       final scoped = allCustomers.where((c) {
-        final jaBeat = c.beatIdForTeam('JA');
-        final maBeat = c.beatIdForTeam('MA');
-        return (jaBeat != null && allowedBeatIds.contains(jaBeat)) ||
-            (maBeat != null && allowedBeatIds.contains(maBeat));
+        final jaPrimary = c.beatIdForTeam('JA');
+        final jaOverride = c.orderBeatIdOverrideForTeam('JA');
+        final maPrimary = c.beatIdForTeam('MA');
+        final maOverride = c.orderBeatIdOverrideForTeam('MA');
+        return (jaPrimary != null && allowedBeatIds.contains(jaPrimary)) ||
+            (jaOverride != null && allowedBeatIds.contains(jaOverride)) ||
+            (maPrimary != null && allowedBeatIds.contains(maPrimary)) ||
+            (maOverride != null && allowedBeatIds.contains(maOverride));
       }).toList();
       if (!mounted) return;
       setState(() {
@@ -2401,24 +2423,32 @@ class _OutOfBeatSheetContentState extends State<_OutOfBeatSheetContent> {
   }
 
   /// Resolve which of the rep's allowed beats this customer should be opened
-  /// under. If the customer is on beats in both teams (dual-team customer),
-  /// prefer the one matching currentTeam, else fall back to the first match.
+  /// under. Tap-from-OOB-search jumps straight to the customer detail with
+  /// this beat as context — so pick the beat that best represents the
+  /// ORDERING context (override first, primary fallback). Per-team, prefers
+  /// the current team to keep the rep on their logged-in side when possible.
   BeatModel? _resolveCustomerBeat(
     CustomerModel customer,
     List<BeatModel> allowedBeats,
   ) {
     final allowedById = {for (final b in allowedBeats) b.id: b};
-    final jaBeatId = customer.beatIdForTeam('JA');
-    final maBeatId = customer.beatIdForTeam('MA');
     final current = AuthService.currentTeam;
-    if (current == 'JA' && jaBeatId != null && allowedById.containsKey(jaBeatId)) {
-      return allowedById[jaBeatId];
+
+    // For each team, prefer the ordering override if present, else primary.
+    String? bestForTeam(String team) {
+      final override = customer.orderBeatIdOverrideForTeam(team);
+      if (override != null && allowedById.containsKey(override)) return override;
+      final primary = customer.beatIdForTeam(team);
+      if (primary != null && allowedById.containsKey(primary)) return primary;
+      return null;
     }
-    if (current == 'MA' && maBeatId != null && allowedById.containsKey(maBeatId)) {
-      return allowedById[maBeatId];
-    }
-    if (jaBeatId != null && allowedById.containsKey(jaBeatId)) return allowedById[jaBeatId];
-    if (maBeatId != null && allowedById.containsKey(maBeatId)) return allowedById[maBeatId];
+
+    // Current team first so rep stays in their team's flow.
+    final currentBeat = bestForTeam(current);
+    if (currentBeat != null) return allowedById[currentBeat];
+    final otherTeam = current == 'JA' ? 'MA' : 'JA';
+    final otherBeat = bestForTeam(otherTeam);
+    if (otherBeat != null) return allowedById[otherBeat];
     return null;
   }
 
