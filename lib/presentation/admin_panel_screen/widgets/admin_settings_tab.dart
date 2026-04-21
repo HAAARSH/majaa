@@ -188,6 +188,12 @@ class _AdminSettingsTabState extends State<AdminSettingsTab> {
       // Phase B additions — parity with syncAll()'s step order.
       await runStep('Credit Notes (CRN)', DriveSyncService.instance.syncCreditNotesFromDrive);
       await runStep('Advances (ADV)', DriveSyncService.instance.syncAdvancesFromDrive);
+      // Tier 4 (2026-04-21) — new tables
+      await runStep('Opening Bills (OPUBL)', DriveSyncService.instance.syncOpeningBillsFromDrive);
+      await runStep('Ledger (LEDGER)', DriveSyncService.instance.syncLedgerFromDrive);
+      await runStep('Discount Schemes (CSDS)', DriveSyncService.instance.syncCustomerDiscountSchemesFromDrive);
+      await runStep('Item Batches (ITBNO)', DriveSyncService.instance.syncItemBatchesFromDrive);
+      await runStep('Bill Books (IBOOK)', DriveSyncService.instance.syncBillBooksFromDrive);
       await runStep('Outstanding (BILLED_COLLECTED)', DriveSyncService.instance.syncBilledCollectedFromDrive);
       // 2026-04-21 — pull sync_metadata.csv last so the "DUA exported X hrs ago"
       // banner reflects a successful, complete sync cycle.

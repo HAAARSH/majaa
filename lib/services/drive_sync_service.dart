@@ -9,6 +9,7 @@ import 'google_drive_auth_service.dart';
 import 'supabase_service.dart';
 import 'auth_service.dart';
 import 'csv_reconciliation_service.dart';
+import '../core/pricing.dart';
 
 /// Syncs bill photos from Supabase Storage → Google Drive using a service account.
 /// Failures are persisted in Hive and retried up to 5 times at 30-min intervals.
@@ -94,6 +95,12 @@ class DriveSyncService {
         'ITTR (Billed Items)': syncBilledItemsFromDrive,
         'CRN (Credit Notes)': syncCreditNotesFromDrive,
         'ADV (Unallocated Advances)': syncAdvancesFromDrive,
+        // Tier 4 additions (2026-04-21) — feeds new Supabase tables
+        'OPUBL (Prior-Year Opening Bills)': syncOpeningBillsFromDrive,
+        'LEDGER (Transactions)': syncLedgerFromDrive,
+        'CSDS (Customer Discount Schemes)': syncCustomerDiscountSchemesFromDrive,
+        'ITBNO (Item Batches)': syncItemBatchesFromDrive,
+        'IBOOK (Bill Books)': syncBillBooksFromDrive,
         'BILLED_COLLECTED (Outstanding)': syncBilledCollectedFromDrive,
         // Run last so freshness banner reflects a completed sync cycle
         // rather than a partial one.
@@ -3153,6 +3160,539 @@ final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false).conv
     } catch (e) {
       debugPrint('_downloadFile error: $e');
       return null;
+    }
+  }
+
+  // ─── OPUBL (Prior-Year Opening Bills) SYNC ─────────────────────────────────
+  //
+  // OPUBL carries last-year's unpaid bills forward as line items so the
+  // Outstanding PDF can show e.g. DEHRA GEN's ZBY-1 from 2023-12-29 instead
+  // of "(no bill details)". Upsert-only, no wipe — these are historical.
+
+  bool _isOpeningBillsSyncing = false;
+
+  Future<void> syncOpeningBillsFromDrive() async {
+    if (_isOpeningBillsSyncing) return;
+    _isOpeningBillsSyncing = true;
+    try {
+      await _ensureFolderIds();
+      final headers = await GoogleDriveAuthService.instance.authHeaders();
+      if (headers.isEmpty) return;
+      if (dataUploadFolderId == null || dataUploadFolderId!.isEmpty) return;
+
+      final files = await _findFilesByPrefix(headers, dataUploadFolderId!, 'OPUBL');
+      if (files.isEmpty) { debugPrint('⚠️ OPUBL: No files found'); return; }
+
+      final customers = await _getCachedCustomers();
+      final Map<String, String> jaLookup = {};
+      final Map<String, String> maLookup = {};
+      for (final c in customers) {
+        if (c.accCodeJa != null && c.accCodeJa!.isNotEmpty) jaLookup[c.accCodeJa!] = c.id;
+        if (c.accCodeMa != null && c.accCodeMa!.isNotEmpty) maLookup[c.accCodeMa!] = c.id;
+      }
+
+      final dbClient = SupabaseService.instance.client;
+      final allRows = <Map<String, dynamic>>[];
+
+      for (final file in files) {
+        final fileName = file['name'] ?? '';
+        final team = _teamFromSuffix(fileName);
+        final lookup = team == 'JA' ? jaLookup : maLookup;
+        debugPrint('📄 OPUBL: Processing $fileName as $team');
+
+        final csv = await _downloadFile(headers, file['id']!);
+        if (csv == null || csv.isEmpty) continue;
+        final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false).convert(csv.replaceAll('\r\n', '\n').replaceAll('\r', '\n'));
+        if (rows.isEmpty) continue;
+        final hdr = _parseHeaders(rows.first);
+
+        final acCodeI = hdr['ACCODE'] ?? -1;
+        final billNoI = hdr['BILLNO'] ?? -1;
+        final billDateI = hdr['BILLDATE'] ?? -1;
+        final billAmtI = hdr['BILLAMOUNT'] ?? -1;
+        final recdI = hdr['RECDAMOUNT'] ?? -1;
+        final clearedI = hdr['CLEARED'] ?? -1;
+        final snoI = hdr['SNO'] ?? -1;
+        final imptypeI = hdr['IMPTYPE'] ?? -1;
+
+        if (acCodeI < 0 || billNoI < 0) continue;
+
+        int accepted = 0, skippedAcc = 0;
+        for (int i = 1; i < rows.length; i++) {
+          final row = rows[i];
+          if (row.length <= acCodeI) continue;
+          final acCode = row[acCodeI].toString().trim();
+          final custId = lookup[acCode];
+          if (custId == null) { skippedAcc++; continue; }
+
+          final billNo = _col(row, billNoI);
+          if (billNo.isEmpty) continue;
+
+          allRows.add({
+            'customer_id': custId,
+            'team_id': team,
+            'acc_code': acCode,
+            // OPUBL has no BOOK column — use 'OPENING' as marker for UI.
+            'book': 'OPENING',
+            'bill_no': billNo,
+            'bill_date': _parseDate(_col(row, billDateI)),
+            'bill_amount': double.tryParse(_col(row, billAmtI)) ?? 0,
+            'recd_amount': double.tryParse(_col(row, recdI)) ?? 0,
+            'cleared': _col(row, clearedI),
+            'imptype': _col(row, imptypeI),
+            'sno': int.tryParse(_col(row, snoI)),
+          });
+          accepted++;
+        }
+        debugPrint('📊 OPUBL: $fileName — ${rows.length - 1} data rows → $accepted accepted, $skippedAcc dropped (acc_code not in lookup)');
+      }
+
+      final deduped = _dedup(allRows, ['team_id', 'customer_id', 'book', 'bill_no']);
+      int upserted = 0, failedBatches = 0;
+      for (int i = 0; i < deduped.length; i += 50) {
+        final chunk = deduped.sublist(i, (i + 50).clamp(0, deduped.length));
+        try {
+          await dbClient.from('opening_bills').upsert(chunk, onConflict: 'team_id,customer_id,book,bill_no');
+          upserted += chunk.length;
+        } catch (e) {
+          failedBatches++;
+          debugPrint('⚠️ OPUBL upsert batch ${i ~/ 50 + 1} failed: $e — continuing');
+        }
+      }
+      debugPrint('✅ OPUBL: Done — $upserted bills upserted (${allRows.length} raw, ${deduped.length} deduped${failedBatches > 0 ? ", $failedBatches failed" : ""})');
+    } catch (e) {
+      debugPrint('❌ OPUBL error: $e');
+    } finally {
+      _isOpeningBillsSyncing = false;
+    }
+  }
+
+  // ─── LEDGER (Full Transaction Log) SYNC ────────────────────────────────────
+  //
+  // Authoritative transaction source. Every D/C posted in DUA. Upsert-only,
+  // keyed on (team, customer_id, entry_date, book, bill_no, type, sno).
+  // Drives the future Statement-of-Account screen and live closing-balance
+  // computation (bypasses stale BILLED_COLLECTED snapshot).
+
+  bool _isLedgerSyncing = false;
+
+  Future<void> syncLedgerFromDrive() async {
+    if (_isLedgerSyncing) return;
+    _isLedgerSyncing = true;
+    try {
+      await _ensureFolderIds();
+      final headers = await GoogleDriveAuthService.instance.authHeaders();
+      if (headers.isEmpty) return;
+      if (dataUploadFolderId == null || dataUploadFolderId!.isEmpty) return;
+
+      final files = await _findFilesByPrefix(headers, dataUploadFolderId!, 'LEDGER');
+      if (files.isEmpty) { debugPrint('⚠️ LEDGER: No files found'); return; }
+
+      final customers = await _getCachedCustomers();
+      final Map<String, String> jaLookup = {};
+      final Map<String, String> maLookup = {};
+      for (final c in customers) {
+        if (c.accCodeJa != null && c.accCodeJa!.isNotEmpty) jaLookup[c.accCodeJa!] = c.id;
+        if (c.accCodeMa != null && c.accCodeMa!.isNotEmpty) maLookup[c.accCodeMa!] = c.id;
+      }
+
+      final dbClient = SupabaseService.instance.client;
+      final allRows = <Map<String, dynamic>>[];
+
+      for (final file in files) {
+        final fileName = file['name'] ?? '';
+        final team = _teamFromSuffix(fileName);
+        final lookup = team == 'JA' ? jaLookup : maLookup;
+        debugPrint('📄 LEDGER: Processing $fileName as $team');
+
+        final csv = await _downloadFile(headers, file['id']!);
+        if (csv == null || csv.isEmpty) continue;
+        final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false).convert(csv.replaceAll('\r\n', '\n').replaceAll('\r', '\n'));
+        if (rows.isEmpty) continue;
+        final hdr = _parseHeaders(rows.first);
+
+        final dateI = hdr['DATE'] ?? -1;
+        final passDateI = hdr['PASSDATE'] ?? -1;
+        final bookI = hdr['BOOK'] ?? -1;
+        final billNoI = hdr['BILLNO'] ?? -1;
+        final acCodeI = hdr['ACCODE'] ?? -1;
+        final narr1I = hdr['NARRATION1'] ?? -1;
+        final narr2I = hdr['NARRATION2'] ?? -1;
+        final typeI = hdr['TYPE'] ?? -1;
+        final amtI = hdr['AMOUNT'] ?? -1;
+        final snoI = hdr['SNO'] ?? -1;
+
+        if (acCodeI < 0 || typeI < 0 || amtI < 0) continue;
+
+        int accepted = 0, skippedAcc = 0, skippedBadRow = 0;
+        for (int i = 1; i < rows.length; i++) {
+          final row = rows[i];
+          if (row.length <= acCodeI) { skippedBadRow++; continue; }
+          final acCode = row[acCodeI].toString().trim();
+          final custId = lookup[acCode];
+          if (custId == null) { skippedAcc++; continue; }
+
+          final type = _col(row, typeI).toUpperCase();
+          if (type != 'D' && type != 'C') continue;
+          final amount = double.tryParse(_col(row, amtI)) ?? 0;
+          if (amount == 0) continue;
+
+          final narr1 = _col(row, narr1I);
+          final narr2 = _col(row, narr2I);
+          final narration = [narr1, narr2].where((s) => s.isNotEmpty).join(' | ');
+
+          allRows.add({
+            'customer_id': custId,
+            'team_id': team,
+            'acc_code': acCode,
+            'entry_date': _parseDate(_col(row, dateI)),
+            'pass_date': _parseDate(_col(row, passDateI)),
+            'book': _col(row, bookI),
+            'bill_no': _col(row, billNoI),
+            'type': type,
+            'amount': amount,
+            'narration': narration,
+            'sno': int.tryParse(_col(row, snoI)),
+          });
+          accepted++;
+        }
+        debugPrint('📊 LEDGER: $fileName — ${rows.length - 1} data rows → $accepted accepted, $skippedAcc dropped (acc_code), $skippedBadRow dropped (row too short)');
+      }
+
+      final deduped = _dedup(allRows, ['team_id', 'customer_id', 'entry_date', 'book', 'bill_no', 'type', 'sno']);
+      int upserted = 0, failedBatches = 0;
+      for (int i = 0; i < deduped.length; i += 100) {
+        final chunk = deduped.sublist(i, (i + 100).clamp(0, deduped.length));
+        try {
+          await dbClient.from('customer_ledger').upsert(chunk, onConflict: 'team_id,customer_id,entry_date,book,bill_no,type,sno');
+          upserted += chunk.length;
+        } catch (e) {
+          failedBatches++;
+          debugPrint('⚠️ LEDGER upsert batch ${i ~/ 100 + 1} failed: $e — continuing');
+        }
+      }
+      debugPrint('✅ LEDGER: Done — $upserted entries upserted (${allRows.length} raw, ${deduped.length} deduped${failedBatches > 0 ? ", $failedBatches failed" : ""})');
+    } catch (e) {
+      debugPrint('❌ LEDGER error: $e');
+    } finally {
+      _isLedgerSyncing = false;
+    }
+  }
+
+  // ─── CSDS (Customer Discount Schemes) SYNC ─────────────────────────────────
+  //
+  // Per-customer × brand × item-group pricing rules. Verified from Y206 ITTR:
+  // multiplicative cascade D1→D5 on ORIGRATE×QTY; SCHEMEPER adds free-goods
+  // on top. Wipe-per-team-on-sync (gated on ≥1 matched row) since CSDS is
+  // current-state (rules removed in DUA must disappear here).
+
+  bool _isCsdsSyncing = false;
+
+  Future<void> syncCustomerDiscountSchemesFromDrive() async {
+    if (_isCsdsSyncing) return;
+    _isCsdsSyncing = true;
+    try {
+      await _ensureFolderIds();
+      final headers = await GoogleDriveAuthService.instance.authHeaders();
+      if (headers.isEmpty) return;
+      if (dataUploadFolderId == null || dataUploadFolderId!.isEmpty) return;
+
+      final files = await _findFilesByPrefix(headers, dataUploadFolderId!, 'CSDS');
+      if (files.isEmpty) { debugPrint('⚠️ CSDS: No files found'); return; }
+
+      final customers = await _getCachedCustomers();
+      final Map<String, String> jaLookup = {};
+      final Map<String, String> maLookup = {};
+      for (final c in customers) {
+        if (c.accCodeJa != null && c.accCodeJa!.isNotEmpty) jaLookup[c.accCodeJa!] = c.id;
+        if (c.accCodeMa != null && c.accCodeMa!.isNotEmpty) maLookup[c.accCodeMa!] = c.id;
+      }
+
+      final dbClient = SupabaseService.instance.client;
+      final allRows = <Map<String, dynamic>>[];
+      final teamsWithFile = <String>{};
+
+      for (final file in files) {
+        final fileName = file['name'] ?? '';
+        final team = _teamFromSuffix(fileName);
+        final lookup = team == 'JA' ? jaLookup : maLookup;
+        debugPrint('📄 CSDS: Processing $fileName as $team');
+
+        final csv = await _downloadFile(headers, file['id']!);
+        if (csv == null || csv.isEmpty) continue;
+        final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false).convert(csv.replaceAll('\r\n', '\n').replaceAll('\r', '\n'));
+        if (rows.isEmpty) continue;
+        teamsWithFile.add(team);
+        final hdr = _parseHeaders(rows.first);
+
+        final acCodeI = hdr['ACCODE'] ?? -1;
+        final custGroupI = hdr['CUSTGROUP'] ?? -1;
+        final companyI = hdr['COMPANY'] ?? -1;
+        final itemGroupI = hdr['ITEMGROUP'] ?? -1;
+        final schemeI = hdr['SCHEMEPER'] ?? -1;
+        final disc1I = hdr['DISCPER'] ?? -1;
+        final disc3I = hdr['DISCPER3'] ?? -1;
+        final disc5I = hdr['DISCPER5'] ?? -1;
+        final vatI = hdr['VATPER'] ?? -1;
+
+        if (acCodeI < 0) continue;
+
+        int accepted = 0, skippedAcc = 0;
+        for (int i = 1; i < rows.length; i++) {
+          final row = rows[i];
+          if (row.length <= acCodeI) continue;
+          final acCode = row[acCodeI].toString().trim();
+          final custId = lookup[acCode];
+          if (custId == null) { skippedAcc++; continue; }
+
+          final schemePer = double.tryParse(_col(row, schemeI)) ?? 0;
+          final disc1 = double.tryParse(_col(row, disc1I)) ?? 0;
+          final disc3 = double.tryParse(_col(row, disc3I)) ?? 0;
+          final disc5 = double.tryParse(_col(row, disc5I)) ?? 0;
+          final vatOverride = double.tryParse(_col(row, vatI));
+          // Skip all-zero rules
+          if (schemePer == 0 && disc1 == 0 && disc3 == 0 && disc5 == 0 && vatOverride == null) continue;
+
+          allRows.add({
+            'customer_id': custId,
+            'team_id': team,
+            'acc_code': acCode,
+            'cust_group': _col(row, custGroupI),
+            'company': _col(row, companyI),
+            'item_group': _col(row, itemGroupI),
+            'scheme_per': schemePer,
+            'disc_per': disc1,
+            'disc_per_3': disc3,
+            'disc_per_5': disc5,
+            if (vatOverride != null) 'vat_per_override': vatOverride,
+          });
+          accepted++;
+        }
+        debugPrint('📊 CSDS: $fileName — ${rows.length - 1} data rows → $accepted accepted, $skippedAcc dropped (acc_code)');
+      }
+
+      final deduped = _dedup(allRows, ['team_id', 'customer_id', 'company', 'item_group']);
+      final teamsWithData = deduped.map((r) => r['team_id'] as String).toSet();
+      final teamsToWipe = teamsWithFile.intersection(teamsWithData);
+      for (final team in teamsToWipe) {
+        await dbClient.from('customer_discount_schemes').delete().eq('team_id', team);
+        debugPrint('🗑️ CSDS: Cleared old customer_discount_schemes for team $team');
+      }
+      if (teamsWithFile.isNotEmpty && teamsToWipe.isEmpty) {
+        debugPrint('⚠️ CSDS: file processed but 0 rows matched — skipping wipe to avoid data loss');
+      }
+
+      int upserted = 0, failedBatches = 0;
+      for (int i = 0; i < deduped.length; i += 50) {
+        final chunk = deduped.sublist(i, (i + 50).clamp(0, deduped.length));
+        try {
+          await dbClient.from('customer_discount_schemes').upsert(chunk, onConflict: 'team_id,customer_id,company,item_group');
+          upserted += chunk.length;
+        } catch (e) {
+          failedBatches++;
+          debugPrint('⚠️ CSDS upsert batch ${i ~/ 50 + 1} failed: $e — continuing');
+        }
+      }
+      debugPrint('✅ CSDS: Done — $upserted rules upserted (${allRows.length} raw, ${deduped.length} deduped${failedBatches > 0 ? ", $failedBatches failed" : ""})');
+      // Invalidate in-memory rule cache so next priceFor() call re-fetches.
+      CsdsPricing.invalidateCache();
+    } catch (e) {
+      debugPrint('❌ CSDS error: $e');
+    } finally {
+      _isCsdsSyncing = false;
+    }
+  }
+
+  // ─── ITBNO (Item Batches + Expiry) SYNC ────────────────────────────────────
+  //
+  // Per-batch MRP, mfg date, expiry. Upsert-only (batches accumulate).
+  // Keyed on (team, company, item_name, packing, batch_no).
+
+  bool _isBatchesSyncing = false;
+
+  Future<void> syncItemBatchesFromDrive() async {
+    if (_isBatchesSyncing) return;
+    _isBatchesSyncing = true;
+    try {
+      await _ensureFolderIds();
+      final headers = await GoogleDriveAuthService.instance.authHeaders();
+      if (headers.isEmpty) return;
+      if (dataUploadFolderId == null || dataUploadFolderId!.isEmpty) return;
+
+      final files = await _findFilesByPrefix(headers, dataUploadFolderId!, 'ITBNO');
+      if (files.isEmpty) { debugPrint('⚠️ ITBNO: No files found'); return; }
+
+      final dbClient = SupabaseService.instance.client;
+      final allRows = <Map<String, dynamic>>[];
+
+      for (final file in files) {
+        final fileName = file['name'] ?? '';
+        final team = _teamFromSuffix(fileName);
+        debugPrint('📄 ITBNO: Processing $fileName as $team');
+
+        final csv = await _downloadFile(headers, file['id']!);
+        if (csv == null || csv.isEmpty) continue;
+        final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false).convert(csv.replaceAll('\r\n', '\n').replaceAll('\r', '\n'));
+        if (rows.isEmpty) continue;
+        final hdr = _parseHeaders(rows.first);
+
+        final companyI = hdr['COMPANY'] ?? -1;
+        final itemNameI = hdr['ITEMNAME'] ?? -1;
+        final packingI = hdr['PACKING'] ?? -1;
+        final mrpI = hdr['MRP'] ?? -1;
+        final rateNoI = hdr['RATENO'] ?? -1;
+        final batchNoI = hdr['BATCHNO'] ?? -1;
+        final mfgI = hdr['MFGDATE'] ?? -1;
+        final expiryI = hdr['EXPIRY'] ?? -1;
+        final billNoI = hdr['BILLNO'] ?? -1;
+        final billDateI = hdr['BILLDATE'] ?? -1;
+        final acNameI = hdr['ACNAME'] ?? -1;
+        final recdDateI = hdr['RECDDATE'] ?? -1;
+
+        if (itemNameI < 0 || batchNoI < 0) continue;
+
+        int accepted = 0;
+        for (int i = 1; i < rows.length; i++) {
+          final row = rows[i];
+          if (row.length <= itemNameI) continue;
+          final itemName = _col(row, itemNameI);
+          final batchNo = _col(row, batchNoI);
+          if (itemName.isEmpty || batchNo.isEmpty) continue;
+
+          allRows.add({
+            'team_id': team,
+            'company': _col(row, companyI),
+            'item_name': itemName,
+            'packing': _col(row, packingI),
+            'batch_no': batchNo,
+            'mfg_date': _parseDate(_col(row, mfgI)),
+            'expiry': _parseDate(_col(row, expiryI)),
+            'mrp': double.tryParse(_col(row, mrpI)) ?? 0,
+            'rate_no': int.tryParse(_col(row, rateNoI)),
+            'bill_no': _col(row, billNoI),
+            'bill_date': _parseDate(_col(row, billDateI)),
+            'ac_name': _col(row, acNameI),
+            'recd_date': _parseDate(_col(row, recdDateI)),
+          });
+          accepted++;
+        }
+        debugPrint('📊 ITBNO: $fileName — ${rows.length - 1} data rows → $accepted accepted');
+      }
+
+      final deduped = _dedup(allRows, ['team_id', 'company', 'item_name', 'packing', 'batch_no']);
+      int upserted = 0, failedBatches = 0;
+      for (int i = 0; i < deduped.length; i += 100) {
+        final chunk = deduped.sublist(i, (i + 100).clamp(0, deduped.length));
+        try {
+          await dbClient.from('item_batches').upsert(chunk, onConflict: 'team_id,company,item_name,packing,batch_no');
+          upserted += chunk.length;
+        } catch (e) {
+          failedBatches++;
+          debugPrint('⚠️ ITBNO upsert batch ${i ~/ 100 + 1} failed: $e — continuing');
+        }
+      }
+      debugPrint('✅ ITBNO: Done — $upserted batches upserted (${allRows.length} raw, ${deduped.length} deduped${failedBatches > 0 ? ", $failedBatches failed" : ""})');
+    } catch (e) {
+      debugPrint('❌ ITBNO error: $e');
+    } finally {
+      _isBatchesSyncing = false;
+    }
+  }
+
+  // ─── IBOOK (Bill Book Definitions) SYNC ────────────────────────────────────
+  //
+  // Small reference table (5-20 books per team). Wipe-and-replace on each
+  // sync since it's reference data.
+
+  bool _isBillBooksSyncing = false;
+
+  Future<void> syncBillBooksFromDrive() async {
+    if (_isBillBooksSyncing) return;
+    _isBillBooksSyncing = true;
+    try {
+      await _ensureFolderIds();
+      final headers = await GoogleDriveAuthService.instance.authHeaders();
+      if (headers.isEmpty) return;
+      if (dataUploadFolderId == null || dataUploadFolderId!.isEmpty) return;
+
+      final files = await _findFilesByPrefix(headers, dataUploadFolderId!, 'IBOOK');
+      if (files.isEmpty) { debugPrint('⚠️ IBOOK: No files found'); return; }
+
+      final dbClient = SupabaseService.instance.client;
+      final allRows = <Map<String, dynamic>>[];
+      final teamsWithFile = <String>{};
+
+      for (final file in files) {
+        final fileName = file['name'] ?? '';
+        final team = _teamFromSuffix(fileName);
+        debugPrint('📄 IBOOK: Processing $fileName as $team');
+
+        final csv = await _downloadFile(headers, file['id']!);
+        if (csv == null || csv.isEmpty) continue;
+        final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false).convert(csv.replaceAll('\r\n', '\n').replaceAll('\r', '\n'));
+        if (rows.isEmpty) continue;
+        teamsWithFile.add(team);
+        final hdr = _parseHeaders(rows.first);
+
+        final bookI = hdr['BOOK'] ?? -1;
+        final bookTypeI = hdr['BOOKTYPE'] ?? -1;
+        final regI = hdr['REGUNREG'] ?? -1;
+        final servI = hdr['SERVINVYN'] ?? -1;
+        final gstBookI = hdr['GSTBOOK'] ?? -1;
+        final memoTypeI = hdr['MEMOTYPE'] ?? -1;
+        final plainI = hdr['PLAINYESNO'] ?? -1;
+        final performaI = hdr['PERFORMA'] ?? -1;
+        final compNameI = hdr['COMPNAME'] ?? -1;
+        final compAddI = hdr['COMPADD1'] ?? -1;
+        final compTinI = hdr['COMPTIN'] ?? -1;
+
+        if (bookI < 0) continue;
+
+        for (int i = 1; i < rows.length; i++) {
+          final row = rows[i];
+          if (row.length <= bookI) continue;
+          final book = _col(row, bookI);
+          if (book.isEmpty) continue;
+          allRows.add({
+            'team_id': team,
+            'book': book,
+            'book_type': _col(row, bookTypeI),
+            'reg_unreg': _col(row, regI),
+            'serv_inv_yn': _col(row, servI),
+            'gst_book_yn': _col(row, gstBookI),
+            'memo_type': _col(row, memoTypeI),
+            'plain_yn': _col(row, plainI),
+            'performa': _col(row, performaI),
+            'comp_name': _col(row, compNameI),
+            'comp_add1': _col(row, compAddI),
+            'comp_tin': _col(row, compTinI),
+          });
+        }
+      }
+
+      final deduped = _dedup(allRows, ['team_id', 'book']);
+      final teamsWithData = deduped.map((r) => r['team_id'] as String).toSet();
+      final teamsToWipe = teamsWithFile.intersection(teamsWithData);
+      for (final team in teamsToWipe) {
+        await dbClient.from('bill_books').delete().eq('team_id', team);
+      }
+
+      int upserted = 0, failedBatches = 0;
+      for (int i = 0; i < deduped.length; i += 50) {
+        final chunk = deduped.sublist(i, (i + 50).clamp(0, deduped.length));
+        try {
+          await dbClient.from('bill_books').upsert(chunk, onConflict: 'team_id,book');
+          upserted += chunk.length;
+        } catch (e) {
+          failedBatches++;
+          debugPrint('⚠️ IBOOK upsert batch ${i ~/ 50 + 1} failed: $e — continuing');
+        }
+      }
+      debugPrint('✅ IBOOK: Done — $upserted books upserted (${deduped.length} deduped${failedBatches > 0 ? ", $failedBatches failed" : ""})');
+    } catch (e) {
+      debugPrint('❌ IBOOK error: $e');
+    } finally {
+      _isBillBooksSyncing = false;
     }
   }
 
