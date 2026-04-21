@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:intl/intl.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../../../theme/app_theme.dart';
@@ -9,6 +10,7 @@ import '../../../services/auth_service.dart';
 import '../../../services/supabase_service.dart';
 import '../../../services/drive_sync_service.dart';
 import '../../../services/google_drive_auth_service.dart';
+import '../../../services/offline_service.dart';
 import '../../../services/pin_service.dart';
 import '../../../routes/app_routes.dart';
 
@@ -117,59 +119,105 @@ class _AdminSettingsTabState extends State<AdminSettingsTab> {
 
   Future<void> _syncFromDrive() async {
     setState(() => _stockSyncing = true);
-    try {
-      final msgs = <String>[];
-      bool hasError = false;
+    // Structured per-step summary. Each entry:
+    //   { 'step': 'CRN', 'status': 'ok'|'error', 'detail': '...', 'ms': 1234 }
+    // Stored to Hive so the UI panel below the button persists across rebuilds
+    // and tab switches — supersedes the old 6-second snackbar.
+    final summary = <Map<String, dynamic>>[];
+    final startedAt = DateTime.now();
 
+    Future<void> runStep(String step, Future<void> Function() fn) async {
+      final t = DateTime.now();
+      try {
+        await fn();
+        summary.add({
+          'step': step,
+          'status': 'ok',
+          'detail': 'done',
+          'ms': DateTime.now().difference(t).inMilliseconds,
+        });
+      } catch (e) {
+        summary.add({
+          'step': step,
+          'status': 'error',
+          'detail': e.toString(),
+          'ms': DateTime.now().difference(t).inMilliseconds,
+        });
+      }
+    }
+
+    try {
       // Cleanup old app collections first
       await SupabaseService.instance.cleanupOldAppCollections();
 
-      // 1. ITMRP (Stock)
+      // 1. ITMRP (Stock) — uses a result object, not a throw
+      final stockT = DateTime.now();
       final stockResult = await DriveSyncService.instance.syncStockFromDrive();
-      if (stockResult.hasError) { msgs.add('Stock: ${stockResult.error}'); hasError = true; }
-      else { msgs.add('Stock: ${stockResult.updated} updated'); }
+      summary.add({
+        'step': 'Stock (ITMRP)',
+        'status': stockResult.hasError ? 'error' : 'ok',
+        'detail': stockResult.hasError ? stockResult.error : '${stockResult.updated} updated',
+        'ms': DateTime.now().difference(stockT).inMilliseconds,
+      });
 
       // 2. ITTR (Bills)
+      final billT = DateTime.now();
       final billResult = await DriveSyncService.instance.syncBillsFromDrive();
-      if (billResult.hasError) { msgs.add('Bills: ${billResult.error}'); hasError = true; }
-      else { msgs.add('Bills: ${billResult.totalBills}'); }
+      summary.add({
+        'step': 'Bills (ITTR)',
+        'status': billResult.hasError ? 'error' : 'ok',
+        'detail': billResult.hasError ? billResult.error : '${billResult.totalBills} bills',
+        'ms': DateTime.now().difference(billT).inMilliseconds,
+      });
 
       // 3. ACMAST (Customers)
+      final custT = DateTime.now();
       final custResult = await DriveSyncService.instance.syncCustomersFromDrive();
-      if (custResult.hasError) { msgs.add('Customers: ${custResult.error}'); hasError = true; }
-      else { msgs.add('Cust: ${custResult.matched} matched'); }
+      summary.add({
+        'step': 'Customers (ACMAST)',
+        'status': custResult.hasError ? 'error' : 'ok',
+        'detail': custResult.hasError ? custResult.error : '${custResult.matched} matched',
+        'ms': DateTime.now().difference(custT).inMilliseconds,
+      });
 
-      // 4. OPNBIL (Opening Bills)
-      try { await DriveSyncService.instance.syncOutstandingBillsFromDrive(); msgs.add('OPNBIL: done'); }
-      catch (e) { msgs.add('OPNBIL: $e'); hasError = true; }
+      // 4-10. Remaining steps share the same try/catch pattern.
+      await runStep('OPNBIL (Opening Bills)', DriveSyncService.instance.syncOutstandingBillsFromDrive);
+      await runStep('INV (Invoices)', DriveSyncService.instance.syncInvoicesFromDrive);
+      await runStep('Receipts (RECT+RCTBIL)', DriveSyncService.instance.syncReceiptsFromDrive);
+      await runStep('Billed Items (ITTR)', DriveSyncService.instance.syncBilledItemsFromDrive);
+      // Phase B additions — parity with syncAll()'s step order.
+      await runStep('Credit Notes (CRN)', DriveSyncService.instance.syncCreditNotesFromDrive);
+      await runStep('Advances (ADV)', DriveSyncService.instance.syncAdvancesFromDrive);
+      await runStep('Outstanding (BILLED_COLLECTED)', DriveSyncService.instance.syncBilledCollectedFromDrive);
+      // 2026-04-21 — pull sync_metadata.csv last so the "DUA exported X hrs ago"
+      // banner reflects a successful, complete sync cycle.
+      await runStep('DUA Export Timestamp (sync_metadata)', DriveSyncService.instance.syncDuaMetadataFromDrive);
 
-      // 5. INV (Invoices)
-      try { await DriveSyncService.instance.syncInvoicesFromDrive(); msgs.add('INV: done'); }
-      catch (e) { msgs.add('INV: $e'); hasError = true; }
+      final errorCount = summary.where((s) => s['status'] == 'error').length;
 
-      // 6. RECT + RCTBIL (Receipts)
-      try { await DriveSyncService.instance.syncReceiptsFromDrive(); msgs.add('Receipts: done'); }
-      catch (e) { msgs.add('Receipts: $e'); hasError = true; }
-
-      // 7. ITTR Billed Items (per-customer)
-      try { await DriveSyncService.instance.syncBilledItemsFromDrive(); msgs.add('Billed: done'); }
-      catch (e) { msgs.add('Billed: $e'); hasError = true; }
-
-      // 8. BILLED_COLLECTED (Outstanding totals)
-      try { await DriveSyncService.instance.syncBilledCollectedFromDrive(); msgs.add('Outstanding: done'); }
-      catch (e) { msgs.add('Outstanding: $e'); hasError = true; }
-
-      // Save last synced timestamp
+      // Persist summary + timestamp for the UI panel to read
       final box = await Hive.openBox('app_settings');
       await box.put('last_drive_sync', DateTime.now().toIso8601String());
-      if (mounted) setState(() {});
+      await box.put('last_drive_sync_summary', summary);
+      await box.put('last_drive_sync_total_ms', DateTime.now().difference(startedAt).inMilliseconds);
 
       if (!mounted) return;
+      setState(() {});
+
+      final quick = summary.map((s) {
+        final icon = s['status'] == 'ok' ? '✓' : '✗';
+        return '$icon ${s['step']}';
+      }).join(' · ');
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(msgs.join(' | '), maxLines: 3),
-          backgroundColor: hasError ? Colors.orange : Colors.green,
-          duration: const Duration(seconds: 6),
+          content: Text(
+            errorCount == 0
+                ? 'Sync complete — ${summary.length} steps OK'
+                : 'Sync finished with $errorCount error${errorCount == 1 ? "" : "s"}. $quick',
+            maxLines: 3,
+          ),
+          backgroundColor: errorCount == 0 ? Colors.green : Colors.orange,
+          duration: const Duration(seconds: 4),
         ),
       );
     } catch (e) {
@@ -272,7 +320,19 @@ class _AdminSettingsTabState extends State<AdminSettingsTab> {
           padding: const EdgeInsets.all(16),
           decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(12), border: Border.all(color: AppTheme.outlineVariant)),
           child: Column(children: [
-            _buildInfoTile('App Version', '1.0.0+1'),
+            FutureBuilder<PackageInfo>(
+              future: PackageInfo.fromPlatform(),
+              builder: (_, snap) {
+                // Pubspec version like "1.2.5+9" maps to version + buildNumber.
+                // Fall back to "loading..." during the first frame; "unknown"
+                // if the plugin fails (shouldn't happen on mobile builds).
+                final v = snap.data;
+                final label = v == null
+                    ? 'loading…'
+                    : '${v.version}+${v.buildNumber}';
+                return _buildInfoTile('App Version', label);
+              },
+            ),
             const Divider(height: 12),
             _buildInfoTile('Environment', 'Production'),
             const Divider(height: 12),
@@ -337,6 +397,42 @@ class _AdminSettingsTabState extends State<AdminSettingsTab> {
             // `offline_operations`, and `cart` — which hold queued-but-
             // unsynced orders and partial cart state. A single accidental
             // tap previously destroyed work irreversibly.
+
+            // GUARD 1: refuse if currently offline. Previously the dialog
+            // only WARNED about being online; user could see the warning,
+            // tap Clear, and lose queued orders if their assumption was
+            // wrong. Now the action is blocked outright when offline.
+            final isOnline = await OfflineService.instance.isOnline();
+            if (!mounted) return;
+            if (!isOnline) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: const Text(
+                    'Cannot clear cache while offline. Queued orders may not have synced yet — come back when you have internet.',
+                  ),
+                  backgroundColor: Colors.red.shade700,
+                  duration: const Duration(seconds: 5),
+                ),
+              );
+              return;
+            }
+
+            // Count pending queue content so the dialog shows REAL risk
+            // (e.g. "3 offline orders + 2 ops will be destroyed") instead
+            // of generic text.
+            int pendingOrders = 0;
+            int pendingOps = 0;
+            try {
+              pendingOrders = Hive.isBoxOpen('offline_orders')
+                  ? Hive.box('offline_orders').length
+                  : (await Hive.openBox('offline_orders')).length;
+              pendingOps = Hive.isBoxOpen('offline_operations')
+                  ? Hive.box('offline_operations').length
+                  : (await Hive.openBox('offline_operations')).length;
+            } catch (_) {}
+            final hasPending = (pendingOrders + pendingOps) > 0;
+            if (!mounted) return;
+
             final confirmed = await showDialog<bool>(
               context: context,
               builder: (ctx) => AlertDialog(
@@ -361,20 +457,39 @@ class _AdminSettingsTabState extends State<AdminSettingsTab> {
                       style: GoogleFonts.manrope(fontSize: 12),
                     ),
                     const SizedBox(height: 10),
-                    Container(
-                      padding: const EdgeInsets.all(10),
-                      decoration: BoxDecoration(color: Colors.red.shade50, borderRadius: BorderRadius.circular(8)),
-                      child: Row(
-                        children: [
-                          Icon(Icons.warning_rounded, color: Colors.red.shade700, size: 16),
-                          const SizedBox(width: 8),
-                          Expanded(child: Text(
-                            'Any offline order that hasn\'t reached Supabase will be lost. Make sure you are ONLINE and all syncs are green before clearing.',
-                            style: GoogleFonts.manrope(fontSize: 11, color: Colors.red.shade900, fontWeight: FontWeight.w600),
-                          )),
-                        ],
+                    if (hasPending)
+                      Container(
+                        padding: const EdgeInsets.all(10),
+                        decoration: BoxDecoration(color: Colors.red.shade100, borderRadius: BorderRadius.circular(8), border: Border.all(color: Colors.red.shade700)),
+                        child: Row(
+                          children: [
+                            Icon(Icons.error_rounded, color: Colors.red.shade900, size: 18),
+                            const SizedBox(width: 8),
+                            Expanded(child: Text(
+                              'STOP: ${pendingOrders > 0 ? "$pendingOrders queued order${pendingOrders == 1 ? "" : "s"}" : ""}'
+                              '${(pendingOrders > 0 && pendingOps > 0) ? " and " : ""}'
+                              '${pendingOps > 0 ? "$pendingOps pending operation${pendingOps == 1 ? "" : "s"}" : ""}'
+                              ' have NOT reached Supabase. Run sync first — these will be permanently lost if you clear now.',
+                              style: GoogleFonts.manrope(fontSize: 11, color: Colors.red.shade900, fontWeight: FontWeight.w800),
+                            )),
+                          ],
+                        ),
+                      )
+                    else
+                      Container(
+                        padding: const EdgeInsets.all(10),
+                        decoration: BoxDecoration(color: Colors.red.shade50, borderRadius: BorderRadius.circular(8)),
+                        child: Row(
+                          children: [
+                            Icon(Icons.warning_rounded, color: Colors.red.shade700, size: 16),
+                            const SizedBox(width: 8),
+                            Expanded(child: Text(
+                              'Queue is currently empty. Still, you\'ll have to re-download products, customers and brands on next login.',
+                              style: GoogleFonts.manrope(fontSize: 11, color: Colors.red.shade900, fontWeight: FontWeight.w600),
+                            )),
+                          ],
+                        ),
                       ),
-                    ),
                   ],
                 ),
                 actions: [
@@ -388,6 +503,21 @@ class _AdminSettingsTabState extends State<AdminSettingsTab> {
               ),
             );
             if (confirmed != true || !mounted) return;
+
+            // GUARD 2: re-check connectivity right before clearing in case
+            // it dropped between confirm-tap and now (background sync might
+            // have pushed the phone off Wi-Fi, etc).
+            final stillOnline = await OfflineService.instance.isOnline();
+            if (!mounted) return;
+            if (!stillOnline) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: const Text('Connection dropped — cache clear aborted to protect queued orders.'),
+                  backgroundColor: Colors.red.shade700,
+                ),
+              );
+              return;
+            }
             try {
               // Clear ALL Hive boxes
               final boxNames = ['cache_JA', 'cache_MA', 'orders', 'offline_orders', 'offline_operations', 'cart', 'hero_cache', 'drive_sync_failures'];
@@ -553,6 +683,45 @@ class _AdminSettingsTabState extends State<AdminSettingsTab> {
                 return Text('Last synced: $label', style: GoogleFonts.manrope(fontSize: 10, color: Colors.green.shade700));
               },
             ),
+            // 2026-04-21 — DUA export freshness. Red when > 24h stale so
+            // super_admin knows the office PC export hasn't run today.
+            FutureBuilder<String?>(
+              future: Hive.openBox('app_settings').then((b) => b.get('last_dua_export') as String?),
+              builder: (_, snap) {
+                final ts = snap.data;
+                if (ts == null || ts.isEmpty) {
+                  return Text(
+                    'DUA export: unknown',
+                    style: GoogleFonts.manrope(fontSize: 10, color: AppTheme.onSurfaceVariant),
+                  );
+                }
+                // sync_metadata.csv writes 'YYYY-MM-DD HH:MM:SS' in IST.
+                DateTime? dt;
+                try {
+                  dt = DateTime.parse(ts.replaceFirst(' ', 'T'));
+                } catch (_) {}
+                final ageHours = dt != null
+                    ? DateTime.now().difference(dt).inHours
+                    : null;
+                final stale = (ageHours ?? 0) > 24;
+                final color = stale ? Colors.red.shade700 : Colors.green.shade700;
+                final ageStr = ageHours == null
+                    ? ''
+                    : ageHours < 1
+                        ? ' (<1h ago)'
+                        : ' (${ageHours}h ago)';
+                return Text(
+                  'DUA export: $ts$ageStr',
+                  style: GoogleFonts.manrope(
+                    fontSize: 10,
+                    color: color,
+                    fontWeight: stale ? FontWeight.w700 : FontWeight.w400,
+                  ),
+                );
+              },
+            ),
+            const SizedBox(height: 8),
+            const _SyncSummaryPanel(),
           ],
         ],
       ),
@@ -571,6 +740,192 @@ class _AdminSettingsTabState extends State<AdminSettingsTab> {
         children: [
           Text(label, style: GoogleFonts.manrope(fontSize: 13, color: AppTheme.onSurfaceVariant)),
           Text(value, style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.w700)),
+        ],
+      ),
+    );
+  }
+}
+
+/// Collapsible panel under the "Sync from Drive" button that shows the
+/// outcome of every step of the last sync run. Persisted in Hive under
+/// `last_drive_sync_summary` so it survives tab switches and app restarts.
+/// Read-only — the summary is written by `_syncFromDrive`.
+class _SyncSummaryPanel extends StatefulWidget {
+  const _SyncSummaryPanel();
+
+  @override
+  State<_SyncSummaryPanel> createState() => _SyncSummaryPanelState();
+}
+
+class _SyncSummaryPanelState extends State<_SyncSummaryPanel> {
+  bool _expanded = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<Box>(
+      future: Hive.openBox('app_settings'),
+      builder: (_, snap) {
+        final box = snap.data;
+        // Waiting for Hive to open — show a tiny placeholder so the panel
+        // slot is visible instead of silently empty.
+        if (box == null) {
+          return _placeholder('Loading sync details…');
+        }
+
+        final raw = box.get('last_drive_sync_summary');
+        // No sync has been run yet (or last summary was cleared). Show an
+        // explainer so the user knows the panel exists and will populate
+        // after they tap Sync from Drive.
+        if (raw is! List || raw.isEmpty) {
+          return _placeholder('No sync details yet — press Sync from Drive to populate.');
+        }
+
+        // Hive may return List<dynamic> of Map<dynamic,dynamic> — coerce.
+        final entries = raw
+            .map((e) => e is Map ? Map<String, dynamic>.from(e) : <String, dynamic>{})
+            .where((m) => m.isNotEmpty)
+            .toList();
+        if (entries.isEmpty) {
+          return _placeholder('Sync summary empty — press Sync from Drive to populate.');
+        }
+
+        final okCount = entries.where((e) => e['status'] == 'ok').length;
+        final errCount = entries.where((e) => e['status'] == 'error').length;
+        final totalMs = box.get('last_drive_sync_total_ms') as int? ?? 0;
+        final totalSec = (totalMs / 1000).toStringAsFixed(1);
+        final headerColor = errCount == 0 ? Colors.green.shade700 : Colors.orange.shade800;
+
+        return Container(
+          decoration: BoxDecoration(
+            border: Border.all(color: headerColor.withValues(alpha: 0.3)),
+            borderRadius: BorderRadius.circular(10),
+            color: headerColor.withValues(alpha: 0.05),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              InkWell(
+                onTap: () => setState(() => _expanded = !_expanded),
+                borderRadius: BorderRadius.circular(10),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                  child: Row(
+                    children: [
+                      Icon(
+                        errCount == 0 ? Icons.check_circle_rounded : Icons.warning_rounded,
+                        size: 16,
+                        color: headerColor,
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          errCount == 0
+                              ? 'Sync Summary — all ${entries.length} steps OK · ${totalSec}s'
+                              : 'Sync Summary — $okCount OK, $errCount failed · ${totalSec}s',
+                          style: GoogleFonts.manrope(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w700,
+                            color: headerColor,
+                          ),
+                        ),
+                      ),
+                      Icon(
+                        _expanded ? Icons.expand_less_rounded : Icons.expand_more_rounded,
+                        size: 18,
+                        color: headerColor,
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+              if (_expanded) ...[
+                const Divider(height: 1),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: entries.map((e) => _buildRow(e)).toList(),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildRow(Map<String, dynamic> entry) {
+    final step = entry['step']?.toString() ?? '?';
+    final status = entry['status']?.toString() ?? '?';
+    final detail = entry['detail']?.toString() ?? '';
+    final ms = entry['ms'] is int ? entry['ms'] as int : 0;
+    final isOk = status == 'ok';
+    final color = isOk ? Colors.green.shade700 : Colors.red.shade700;
+    final icon = isOk ? Icons.check_circle_outline_rounded : Icons.error_outline_rounded;
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, size: 14, color: color),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  step,
+                  style: GoogleFonts.manrope(fontSize: 11, fontWeight: FontWeight.w700, color: color),
+                ),
+                if (detail.isNotEmpty)
+                  Text(
+                    detail,
+                    style: GoogleFonts.manrope(
+                      fontSize: 10,
+                      color: AppTheme.onSurfaceVariant,
+                    ),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+              ],
+            ),
+          ),
+          Text(
+            '${(ms / 1000).toStringAsFixed(1)}s',
+            style: GoogleFonts.manrope(fontSize: 10, color: AppTheme.onSurfaceVariant),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Shown when no sync summary exists yet (or Hive is still loading).
+  /// Makes the panel slot visible so the user knows the feature exists
+  /// instead of wondering where the "sync details" went.
+  Widget _placeholder(String message) {
+    return Container(
+      decoration: BoxDecoration(
+        border: Border.all(color: AppTheme.outlineVariant),
+        borderRadius: BorderRadius.circular(10),
+        color: Colors.grey.shade50,
+      ),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+      child: Row(
+        children: [
+          Icon(Icons.info_outline_rounded, size: 14, color: AppTheme.onSurfaceVariant),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              message,
+              style: GoogleFonts.manrope(
+                fontSize: 11,
+                color: AppTheme.onSurfaceVariant,
+                fontStyle: FontStyle.italic,
+              ),
+            ),
+          ),
         ],
       ),
     );

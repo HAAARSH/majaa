@@ -92,7 +92,12 @@ class DriveSyncService {
         'INV (Invoices)': syncInvoicesFromDrive,
         'RECT+RCTBIL (Receipts)': syncReceiptsFromDrive,
         'ITTR (Billed Items)': syncBilledItemsFromDrive,
+        'CRN (Credit Notes)': syncCreditNotesFromDrive,
+        'ADV (Unallocated Advances)': syncAdvancesFromDrive,
         'BILLED_COLLECTED (Outstanding)': syncBilledCollectedFromDrive,
+        // Run last so freshness banner reflects a completed sync cycle
+        // rather than a partial one.
+        'sync_metadata (DUA export timestamp)': syncDuaMetadataFromDrive,
       };
       for (final entry in syncSteps.entries) {
         try {
@@ -951,6 +956,8 @@ class DriveSyncService {
               'mrp': csvRow['mrp'] as double?,
               'rate': csvRow['rate'] as double?,
             });
+            debugPrint('🆕 StockSync NEW PRODUCT detected: "$name" [${csvRow['company']}] '
+                'team=${catToTeam[companyKey]} qty=$newQtyCheck mrp=${csvRow['mrp']} rate=${csvRow['rate']}');
           }
           if (!unmatched.contains(name)) unmatched.add(name);
           continue;
@@ -1154,22 +1161,34 @@ class DriveSyncService {
         return CustomerSyncResult(error: 'DRIVE_FOLDER_DATA_UPLOAD not set in env.json');
       }
 
-      // 1. Find ACMAST*.csv files
+      // 1. Find ACMAST*.csv files. Log everything the folder DOES contain
+      // so the error message is self-diagnosing when Drive-for-desktop
+      // hasn't finished uploading, or when env.json points to a folder
+      // different from where the script writes.
+      debugPrint('📂 ACMAST sync: looking in Drive folder $dataUploadFolderId');
+      final allFiles = await _listFilesInFolder(headers, dataUploadFolderId!);
+      debugPrint('📂 ACMAST sync: folder contains ${allFiles.length} files — ${allFiles.map((f) => f['name']).join(', ')}');
+
       final acmastFiles = await _findFilesByPrefix(headers, dataUploadFolderId!, 'ACMAST');
       if (acmastFiles.isEmpty) {
-        return CustomerSyncResult(error: 'No ACMAST*.csv files found');
+        final diagnostic = allFiles.isEmpty
+            ? 'Folder is empty. Either Drive-for-desktop is still uploading or env.json DRIVE_FOLDER_DATA_UPLOAD points to the wrong folder.'
+            : 'Folder has ${allFiles.length} files but none match ACMAST*. Present: ${allFiles.map((f) => f['name']).take(8).join(', ')}${allFiles.length > 8 ? "..." : ""}';
+        return CustomerSyncResult(error: 'No ACMAST*.csv files found. $diagnostic');
       }
 
       // 2. Determine team from file suffix: <10 (07,08,09) = JA, >=10 (11,12,13) = MA
 
       // 3. Load all existing customers (cache-first)
       final customers = await _getCachedCustomers();
-      // Build lookups: by acc_code per team, by name, by normalized name, and by GSTIN
+      // Build lookups: by acc_code per team, by exact name.
+      // 2026-04-21 — normalizer, Levenshtein, AND GSTIN-based matching
+      // all removed per user directive. Two physical shops with the same
+      // owner share a GSTIN but are distinct customers; only (team, acc_code)
+      // or (team, exact_name) may auto-link.
       final Map<String, CustomerModel> accCodeJaLookup = {};
       final Map<String, CustomerModel> accCodeMaLookup = {};
       final Map<String, CustomerModel> nameLookup = {};
-      final Map<String, CustomerModel> normalizedNameLookup = {};
-      final Map<String, CustomerModel> gstinLookup = {};
       for (final c in customers) {
         if (c.accCodeJa != null && c.accCodeJa!.isNotEmpty) {
           accCodeJaLookup[c.accCodeJa!] = c;
@@ -1178,15 +1197,16 @@ class DriveSyncService {
           accCodeMaLookup[c.accCodeMa!] = c;
         }
         nameLookup[c.name.toLowerCase().trim()] = c;
-        normalizedNameLookup[_normalizeName(c.name)] = c;
-        if (c.gstin != null && c.gstin!.isNotEmpty) {
-          gstinLookup[c.gstin!.trim().toUpperCase()] = c;
-        }
       }
 
       // Pre-load each team's beats once so the GROUP → beat lookup in the
-      // existing-customer update path is O(1). Keyed by lowercased beat
-      // name, matching how ACMAST's GROUP column is compared.
+      // existing-customer update path is O(1). Name normalization collapses
+      // internal whitespace + trims + lowercases so "PALTAN  BAZAR" matches
+      // "Paltan Bazar" matches "paltan bazar". ACMAST exports inconsistent
+      // casing and stray double-spaces; this tolerates all three.
+      String normBeatName(String s) =>
+          s.toLowerCase().trim().replaceAll(RegExp(r'\s+'), ' ');
+
       final savedTeamForBeatLoad = AuthService.currentTeam;
       AuthService.currentTeam = 'JA';
       final jaBeats = await SupabaseService.instance.getBeats();
@@ -1194,11 +1214,14 @@ class DriveSyncService {
       final maBeats = await SupabaseService.instance.getBeats();
       AuthService.currentTeam = savedTeamForBeatLoad;
       final Map<String, BeatModel> jaBeatByName = {
-        for (final b in jaBeats) b.beatName.toLowerCase().trim(): b,
+        for (final b in jaBeats) normBeatName(b.beatName): b,
       };
       final Map<String, BeatModel> maBeatByName = {
-        for (final b in maBeats) b.beatName.toLowerCase().trim(): b,
+        for (final b in maBeats) normBeatName(b.beatName): b,
       };
+      // Track GROUP values we can't match so the admin sees which ACMAST
+      // entries weren't auto-applied. Deduplicated by (team, lowercased).
+      final unmatchedGroups = <String>{};
 
       // 4. Parse each ACMAST file with team tagging
       final List<Map<String, dynamic>> allDebtors = [];
@@ -1294,47 +1317,18 @@ class DriveSyncService {
         final accCodeCol = team == 'JA' ? 'acc_code_ja' : 'acc_code_ma';
         final csvGstin = (debtor['gstin'] as String?)?.trim() ?? '';
 
-        // Try match by team-specific acc_code first, then by name
+        // Try match by team-specific acc_code first, then by name.
+        // 2026-04-21 — previous "name must be >=95% similar" safety check
+        // removed per user directive (no name normalizer, no similarity).
+        // acc_code from DUA is authoritative: if it matches, trust it.
         final accLookup = team == 'JA' ? accCodeJaLookup : accCodeMaLookup;
         CustomerModel? existing = accLookup[code];
-        // If matched by acc_code, verify name is >=95% similar — reject if mismatch
-        if (existing != null && _nameSimilarity(name, existing.name) < 0.95) {
-          final similarity = (_nameSimilarity(name, existing.name) * 100).toStringAsFixed(0);
-          debugPrint('⚠️ CustomerSync: acc_code "$code" matched "${existing.name}" but CSV name "$name" is only $similarity% similar — auto-clearing wrong acc_code & treating as new');
-          accCodeMismatches.add({
-            'acc_code': code,
-            'csv_name': name,
-            'db_name': existing.name,
-            'db_id': existing.id,
-            'team': team,
-            'similarity': similarity,
-          });
-          // Auto-fix: clear the wrong acc_code from the wrongly-linked customer
-          final wrongId = existing.id;
-          final colToClear = accCodeCol;
-          pendingUpdates.add(() => dbClient.from('customers').update({colToClear: null}).eq('id', wrongId));
-          existing = null;
-        }
         existing ??= nameLookup[name.toLowerCase().trim()];
-        // Fallback: match by normalized name (handles dash/space/dot differences)
-        existing ??= normalizedNameLookup[_normalizeName(name)];
-        // Fallback: match by GSTIN (same business entity across teams)
-        if (existing == null && csvGstin.isNotEmpty) {
-          existing = gstinLookup[csvGstin.toUpperCase()];
-          if (existing != null) {
-            debugPrint('🔗 CustomerSync: Matched "$name" to "${existing.name}" via GSTIN $csvGstin');
-          }
-        }
-        // Fallback: similarity search across all customers (catches minor spelling differences)
-        if (existing == null) {
-          for (final c in customers) {
-            if (_nameSimilarity(name, c.name) >= 0.90) {
-              debugPrint('🔗 CustomerSync: Matched "$name" to "${c.name}" via ${(_nameSimilarity(name, c.name) * 100).toStringAsFixed(0)}% similarity');
-              existing = c;
-              break;
-            }
-          }
-        }
+        // 2026-04-21 — GSTIN-based auto-match REMOVED per user directive.
+        // GSTIN identifies the legal owner, not the physical location. Two
+        // shops with the same owner (e.g. "A S ASSOCIATES - RISPANA PULL"
+        // and "A S ASSOCIATES - CANAL ROAD") share a GSTIN but are distinct
+        // customers. Matching only via (team, acc_code) OR (team, exact name).
 
         if (existing == null) {
           newCustomers.add(debtor);
@@ -1346,16 +1340,16 @@ class DriveSyncService {
         // Consolidate all fields into a single update map
         final custUpdate = <String, dynamic>{};
 
-        // acc_code — auto-link if name is >=90% similar OR matched via GSTIN
+        // acc_code — auto-link only when names are EXACTLY equal (case/trim).
+        // 2026-04-21 — GSTIN-based auto-link removed (see note at match
+        // section above). Same GSTIN ≠ same customer location.
         final existingCode = team == 'JA' ? existing.accCodeJa : existing.accCodeMa;
         if (code.isNotEmpty && (existingCode == null || existingCode.isEmpty)) {
-          final nameSim = _nameSimilarity(name, existing.name);
-          final matchedViaGstin = csvGstin.isNotEmpty && existing.gstin != null && existing.gstin!.trim().toUpperCase() == csvGstin.toUpperCase();
-          if (nameSim >= 0.90 || matchedViaGstin) {
+          if (name.toLowerCase().trim() == existing.name.toLowerCase().trim()) {
             custUpdate[accCodeCol] = code;
             autoLinked++;
           } else {
-            debugPrint('⚠️ CustomerSync: Skipped auto-link acc_code "$code" to "${existing.name}" — CSV name "$name" too different (${(nameSim * 100).toStringAsFixed(0)}%)');
+            debugPrint('⚠️ CustomerSync: Skipped auto-link acc_code "$code" to "${existing.name}" — CSV name "$name" differs');
           }
         }
 
@@ -1401,11 +1395,12 @@ class DriveSyncService {
         // if it differs from current. This ONLY touches beat_id_<team> and
         // beat_name_<team> — order_beat_id_<team> (admin manual override)
         // is never read or written here, so manual splits are preserved
-        // across syncs.
+        // across syncs. Unmatched GROUP values are recorded so admin can see
+        // which ACMAST entries need a beat created.
         final group = (debtor['group'] as String?)?.trim() ?? '';
         if (group.isNotEmpty) {
           final beatLookup = team == 'JA' ? jaBeatByName : maBeatByName;
-          final targetBeat = beatLookup[group.toLowerCase()];
+          final targetBeat = beatLookup[normBeatName(group)];
           if (targetBeat != null) {
             final currentBeatId = existing.beatIdForTeam(team);
             final currentBeatName = existing.beatNameForTeam(team);
@@ -1414,29 +1409,75 @@ class DriveSyncService {
               final custId = existing.id;
               final beatIdCol = team == 'JA' ? 'beat_id_ja' : 'beat_id_ma';
               final beatNameCol = team == 'JA' ? 'beat_name_ja' : 'beat_name_ma';
+              // Also set team_ja/team_ma = true in the SAME upsert.
+              // Without this, a beat can get assigned without the team
+              // flag flipping, which made the admin Customers tab hide
+              // the customer even though the rep saw them on their beat.
+              final teamCol = team == 'JA' ? 'team_ja' : 'team_ma';
               pendingUpdates.add(() => dbClient.from('customer_team_profiles').upsert({
                     'customer_id': custId,
                     beatIdCol: targetBeat.id,
                     beatNameCol: targetBeat.beatName,
+                    teamCol: true,
                   }, onConflict: 'customer_id'));
               debugPrint(
                 '🗺️ CustomerSync: Beat updated for "${existing.name}" ($team) — "$currentBeatName" → "${targetBeat.beatName}"',
               );
             }
+          } else {
+            unmatchedGroups.add('$team: "$group"');
           }
         }
       }
 
-      // Execute all updates in parallel batches of 20
+      // Refresh the auth session so mid-sync JWT expiry doesn't cascade into
+      // RLS 42501 rejections. Without this, Supabase can drop auth.role() to
+      // anon briefly and the policy (auth.role() = 'authenticated') blocks
+      // writes — we saw ~20 customers miss updates from batches 30-31 on a
+      // real sync.
+      try {
+        await dbClient.auth.refreshSession();
+        debugPrint('🔐 CustomerSync: session refreshed before bulk writes');
+      } catch (e) {
+        debugPrint('⚠️ CustomerSync: session refresh failed: $e — proceeding anyway');
+      }
+
+      // Execute all updates in parallel batches of 20. On per-batch RLS
+      // failure, try refreshing the session once and retrying that batch so
+      // a transient auth drop mid-sync doesn't silently lose updates.
+      int rlsRetries = 0;
       for (int i = 0; i < pendingUpdates.length; i += 10) {
         final chunk = pendingUpdates.sublist(i, (i + 10).clamp(0, pendingUpdates.length));
         try {
           await Future.wait(chunk.map((fn) => fn()));
         } catch (e) {
+          final msg = e.toString();
+          final isRls = msg.contains('42501') || msg.contains('row-level security');
+          if (isRls && rlsRetries < 2) {
+            rlsRetries++;
+            debugPrint('⚠️ Sync batch ${i ~/ 10 + 1} hit RLS — refreshing session and retrying');
+            try { await dbClient.auth.refreshSession(); } catch (_) {}
+            try {
+              await Future.wait(chunk.map((fn) => fn()));
+              debugPrint('✅ Sync batch ${i ~/ 10 + 1} recovered on retry');
+              continue;
+            } catch (retryErr) {
+              debugPrint('⚠️ Sync batch ${i ~/ 10 + 1} still failing after retry: $retryErr');
+            }
+          }
           debugPrint('⚠️ Sync batch ${i ~/ 10 + 1} failed: $e — continuing');
         }
       }
       debugPrint('📊 CustomerSync: ${pendingUpdates.length} customers updated in ${(pendingUpdates.length / 20).ceil()} batches');
+
+      if (unmatchedGroups.isNotEmpty) {
+        debugPrint(
+          '📛 CustomerSync: ${unmatchedGroups.length} ACMAST GROUP value(s) did not match any beat — these customers did not get a beat update:',
+        );
+        for (final g in unmatchedGroups) {
+          debugPrint('   • $g');
+        }
+      }
 
       // Invalidate cache — always refresh after customer sync
       await SupabaseService.instance.invalidateCache('customers');
@@ -1500,13 +1541,32 @@ class DriveSyncService {
     return {'new_customers': newCusts, 'changed_customers': changedCusts};
   }
 
-  /// Apply a new customer from ACMAST (admin approved).
+  /// Run a single Supabase write; if RLS 42501 fires (usually stale JWT
+  /// dropping auth.role() to anon), refresh the session and retry once.
+  Future<T> _retryOnRls<T>(Future<T> Function() op) async {
+    final client = SupabaseService.instance.client;
+    try {
+      return await op();
+    } catch (e) {
+      final msg = e.toString();
+      final isRls = msg.contains('42501') || msg.contains('row-level security');
+      if (!isRls) rethrow;
+      debugPrint('⚠️ RLS 42501 — refreshing session and retrying');
+      try { await client.auth.refreshSession(); } catch (_) {}
+      return await op();
+    }
+  }
+
   /// Apply a new customer from ACMAST (admin approved).
   /// Checks for duplicate by name before inserting. Creates customer_team_profiles row.
   Future<void> applyNewCustomer(Map<String, dynamic> debtor) async {
     final team = debtor['team_id'] as String? ?? 'JA';
     final name = debtor['name'] as String;
     final client = SupabaseService.instance.client;
+
+    // Proactive refresh so the admin-approved add doesn't hit a stale JWT on
+    // the customer_team_profiles insert (observed 42501 in the field).
+    try { await client.auth.refreshSession(); } catch (_) {}
 
     // Check duplicate: first by team-specific acc_code, then by name
     final accCol = team == 'JA' ? 'acc_code_ja' : 'acc_code_ma';
@@ -1523,47 +1583,34 @@ class DriveSyncService {
       }
     }
 
-    // 2. Check by GSTIN (most reliable cross-team match)
-    final csvGstin = (debtor['gstin'] as String?)?.trim() ?? '';
-    if (csvGstin.isNotEmpty) {
-      final byGstin = await client.from('customers')
-          .select('id, name, customer_team_profiles(team_ja, team_ma)')
-          .eq('gstin', csvGstin);
-      for (final row in byGstin) {
-        final profiles = row['customer_team_profiles'] as List? ?? [];
-        final profile = profiles.isNotEmpty ? profiles.first : null;
-        // Link acc_code and enable team regardless of name spelling
-        await client.from('customers').update({accCol: accCode}).eq('id', row['id']);
-        final teamCol = team == 'JA' ? 'team_ja' : 'team_ma';
-        if (profile == null || (team == 'JA' ? profile['team_ja'] != true : profile['team_ma'] != true)) {
-          await client.from('customer_team_profiles').upsert({
-            'customer_id': row['id'], teamCol: true,
-          }, onConflict: 'customer_id');
-        }
-        debugPrint('CustomerSync: "$name" matched "${row['name']}" via GSTIN $csvGstin, linked $accCol for $team');
-        return;
-      }
-    }
-
-    // 3. Check by name — but only match if customer belongs to this team
+    // 2. Check by exact name — but only match if customer belongs to this team.
+    // 2026-04-21 — GSTIN fallback removed (GSTIN identifies legal owner not
+    // physical location; two shops with same owner are separate customers).
+    // PostgREST embeds a one-to-one relation as a single Map (not a List), so
+    // normalize both shapes before checking team membership.
     final byName = await client.from('customers')
         .select('id, customer_team_profiles(team_ja, team_ma)')
         .eq('name', name);
     for (final row in byName) {
-      final profiles = row['customer_team_profiles'] as List? ?? [];
-      final profile = profiles.isNotEmpty ? profiles.first : null;
+      final raw = row['customer_team_profiles'];
+      final List profiles = raw is List
+          ? raw
+          : (raw is Map ? [raw] : const []);
+      final Map? profile = profiles.isNotEmpty
+          ? (profiles.first is Map ? Map<String, dynamic>.from(profiles.first as Map) : null)
+          : null;
       final belongsToTeam = profile != null &&
           ((team == 'JA' && profile['team_ja'] == true) ||
            (team == 'MA' && profile['team_ma'] == true));
       if (belongsToTeam || profiles.isEmpty) {
         // Link acc_code to existing customer
-        await client.from('customers').update({accCol: accCode}).eq('id', row['id']);
+        await _retryOnRls(() => client.from('customers').update({accCol: accCode}).eq('id', row['id']));
         // Ensure team profile exists
         if (profiles.isEmpty || !belongsToTeam) {
           final teamCol = team == 'JA' ? 'team_ja' : 'team_ma';
-          await client.from('customer_team_profiles').upsert({
+          await _retryOnRls(() => client.from('customer_team_profiles').upsert({
             'customer_id': row['id'], teamCol: true,
-          }, onConflict: 'customer_id');
+          }, onConflict: 'customer_id'));
         }
         debugPrint('CustomerSync: "$name" exists for $team, linked $accCol');
         return;
@@ -1571,7 +1618,7 @@ class DriveSyncService {
     }
 
     final custId = 'CUST-${DateTime.now().millisecondsSinceEpoch}';
-    await client.from('customers').insert({
+    await _retryOnRls(() => client.from('customers').insert({
       'id': custId,
       'name': name,
       'address': debtor['address'] as String? ?? '',
@@ -1581,7 +1628,7 @@ class DriveSyncService {
       'type': 'General Trade',
       'last_order_value': 0,
       'delivery_route': 'Unassigned',
-    });
+    }));
 
     // Create customer_team_profiles row with beat assignment from ACMAST GROUP
     final group = (debtor['group'] as String?)?.trim() ?? '';
@@ -1599,7 +1646,7 @@ class DriveSyncService {
 
     final beatIdCol = team == 'JA' ? 'beat_id_ja' : 'beat_id_ma';
     final beatNameCol = team == 'JA' ? 'beat_name_ja' : 'beat_name_ma';
-    await client.from('customer_team_profiles').insert({
+    await _retryOnRls(() => client.from('customer_team_profiles').insert({
       'customer_id': custId,
       'team_ja': team == 'JA',
       'team_ma': team == 'MA',
@@ -1607,7 +1654,7 @@ class DriveSyncService {
       'outstanding_ma': 0,
       if (beatId != null) beatIdCol: beatId,
       if (beatName.isNotEmpty) beatNameCol: beatName,
-    });
+    }));
   }
 
   /// Apply changed customer data from ACMAST (admin approved).
@@ -1621,7 +1668,9 @@ class DriveSyncService {
       }
     }
     if (data.isNotEmpty) {
-      await SupabaseService.instance.client.from('customers').update(data).eq('id', customerId);
+      final client = SupabaseService.instance.client;
+      try { await client.auth.refreshSession(); } catch (_) {}
+      await _retryOnRls(() => client.from('customers').update(data).eq('id', customerId));
     }
   }
 
@@ -1674,6 +1723,10 @@ class DriveSyncService {
       final dbClient = SupabaseService.instance.client;
       int upserted = 0;
       final allBillRows = <Map<String, dynamic>>[];
+      // Track teams whose OPNBIL file we processed. Wipe is file-based (not
+      // row-based) so an all-bills-cleared state in local software still
+      // propagates — previously an empty file left stale rows alive.
+      final teamsWithFile = <String>{};
 
       for (final file in files) {
         final fileName = file['name'] ?? '';
@@ -1684,8 +1737,15 @@ class DriveSyncService {
         final csv = await _downloadFile(headers, file['id']!);
         if (csv == null || csv.isEmpty) continue;
 
-        final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false).convert(csv);
+        // 2026-04-21 — strip \r before parse. Windows-written CSVs use \r\n; with
+// eol='\n' the parser reads '\r' as part of the preceding field, which
+// confuses the quoted-field state machine when a field contains a comma
+// (e.g. multi-phone "7300957028, 7078734158"). After the first such row,
+// the parser eats every subsequent line as if still inside the quote.
+// Dropped 143 OPNBIL07 rows on 2026-04-21 until this fix landed.
+final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false).convert(csv.replaceAll('\r\n', '\n').replaceAll('\r', '\n'));
         if (rows.isEmpty) continue;
+        teamsWithFile.add(team);
         final hdr = _parseHeaders(rows.first);
 
         final acCodeI = hdr['ACCODE'] ?? -1;
@@ -1701,15 +1761,23 @@ class DriveSyncService {
 
         if (acCodeI < 0 || invoiceI < 0) continue;
 
+        // 2026-04-21 — diagnostic counters to track where rows are dropped.
+        int skippedShort = 0, skippedUnknownAcc = 0, skippedEmptyInv = 0, accepted = 0;
+        final unknownAccCodes = <String, int>{};
+
         for (int i = 1; i < rows.length; i++) {
           final row = rows[i];
-          if (row.length <= acCodeI) continue;
+          if (row.length <= acCodeI) { skippedShort++; continue; }
           final acCode = row[acCodeI].toString().trim();
           final custId = lookup[acCode];
-          if (custId == null) continue;
+          if (custId == null) {
+            skippedUnknownAcc++;
+            unknownAccCodes[acCode] = (unknownAccCodes[acCode] ?? 0) + 1;
+            continue;
+          }
 
           final invoiceNo = _col(row, invoiceI);
-          if (invoiceNo.isEmpty) continue;
+          if (invoiceNo.isEmpty) { skippedEmptyInv++; continue; }
 
           // AMOUNT = net bill (after scheme), BILLAMOUNT = gross (before scheme)
           // Use AMOUNT as bill_amount — matches billing software
@@ -1734,26 +1802,54 @@ class DriveSyncService {
             'team_id': team,
             'synced_at': DateTime.now().toIso8601String(),
           });
+          accepted++;
+        }
+        debugPrint('📊 OPNBIL: $fileName — ${rows.length - 1} data rows → $accepted accepted, '
+            '$skippedUnknownAcc dropped (acc_code not in lookup), '
+            '$skippedEmptyInv dropped (empty invoice_no), '
+            '$skippedShort dropped (row too short)');
+        if (unknownAccCodes.isNotEmpty) {
+          final top = unknownAccCodes.entries.toList()
+            ..sort((a, b) => b.value.compareTo(a.value));
+          final sample = top.take(10).map((e) => '${e.key}(x${e.value})').join(', ');
+          debugPrint('📊 OPNBIL: $fileName — top unmatched acc_codes: $sample '
+              '(total ${unknownAccCodes.length} distinct)');
         }
       }
 
-      // Delete stale bills before fresh insert — bills cleared by cheques in
-      // the billing software are removed from OPNBIL CSV, but upsert alone
-      // never removes them from the database.
-      final teamsInData = allBillRows.map((r) => r['team_id'] as String).toSet();
-      for (final team in teamsInData) {
+      // De-dup first so we can gate the wipe on rows-to-insert
+      final deduped = _dedup(allBillRows, ['customer_id', 'invoice_no', 'book', 'team_id']);
+
+      // Delete stale bills before fresh insert — but ONLY for teams that
+      // produced ≥1 usable row. If lookups fail for every row a file-based
+      // wipe would empty the Outstanding tab with no replacement data.
+      final teamsWithData = deduped.map((r) => r['team_id'] as String).toSet();
+      final teamsToWipe = teamsWithFile.intersection(teamsWithData);
+      for (final team in teamsToWipe) {
         await dbClient.from('customer_bills').delete().eq('team_id', team);
         debugPrint('🗑️ OPNBIL: Cleared old customer_bills for team $team');
       }
+      if (teamsWithFile.isNotEmpty && teamsToWipe.isEmpty) {
+        debugPrint('⚠️ OPNBIL: file processed but 0 rows matched — skipping wipe to avoid data loss');
+      }
 
-      // De-dup and batch insert fresh
-      final deduped = _dedup(allBillRows, ['customer_id', 'invoice_no', 'book', 'team_id']);
+      // Per-batch try/catch — a single failing batch (constraint collision,
+      // transient 409, one bad row) must NOT silently drop every subsequent
+      // batch. 2026-04-21: discovered HANUMAN CHOWK bills dated 21-27 Mar
+      // were dropping off Ranjeet's print because batch ~5 was throwing and
+      // batches 6+ never ran. Matches the resilience pattern used by CRN.
+      int failedBatches = 0;
       for (int i = 0; i < deduped.length; i += 50) {
         final chunk = deduped.sublist(i, (i + 50).clamp(0, deduped.length));
-        await dbClient.from('customer_bills').upsert(chunk, onConflict: 'customer_id,invoice_no,book,team_id');
-        upserted += chunk.length;
+        try {
+          await dbClient.from('customer_bills').upsert(chunk, onConflict: 'customer_id,invoice_no,book,team_id');
+          upserted += chunk.length;
+        } catch (e) {
+          failedBatches++;
+          debugPrint('⚠️ OPNBIL upsert batch ${i ~/ 50 + 1} (rows $i–${i + chunk.length - 1}) failed: $e — continuing');
+        }
       }
-      debugPrint('✅ OPNBIL: Done — $upserted bills upserted (${allBillRows.length} raw, ${deduped.length} deduped)');
+      debugPrint('✅ OPNBIL: Done — $upserted bills upserted (${allBillRows.length} raw, ${deduped.length} deduped${failedBatches > 0 ? ", $failedBatches batch(es) failed — see prior warnings" : ""})');
       // Outstanding is now handled by BILLED_COLLECTED sync — not OPNBIL
     } catch (e) {
       debugPrint('❌ OPNBIL error: $e');
@@ -1807,7 +1903,13 @@ class DriveSyncService {
         final csv = await _downloadFile(headers, file['id']!);
         if (csv == null || csv.isEmpty) continue;
 
-        final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false).convert(csv);
+        // 2026-04-21 — strip \r before parse. Windows-written CSVs use \r\n; with
+// eol='\n' the parser reads '\r' as part of the preceding field, which
+// confuses the quoted-field state machine when a field contains a comma
+// (e.g. multi-phone "7300957028, 7078734158"). After the first such row,
+// the parser eats every subsequent line as if still inside the quote.
+// Dropped 143 OPNBIL07 rows on 2026-04-21 until this fix landed.
+final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false).convert(csv.replaceAll('\r\n', '\n').replaceAll('\r', '\n'));
         if (rows.isEmpty) continue;
         final hdr = _parseHeaders(rows.first);
 
@@ -1860,18 +1962,292 @@ class DriveSyncService {
         debugPrint('📊 INV: $fileName — ${rows.length - 1} rows parsed');
       }
 
-      // De-dup and batch upsert into customer_bills (same table as OPNBIL)
+      // De-dup and batch upsert into customer_bills (same table as OPNBIL).
+      //
+      // NO WIPE here. OPNBIL runs BEFORE INV and already wiped customer_bills
+      // per team then inserted the authoritative opening-bills set (last year
+      // carryover + all current outstanding). INV just upserts on conflict
+      // key — overlapping invoices get INV's fresher values, OPNBIL-only bills
+      // (e.g. last-year carryover not re-emitted in INV) survive. Bills
+      // deleted in DUA propagate via OPNBIL's wipe; wiping here again would
+      // destroy OPNBIL's last-year data, which regressed real users.
       final deduped = _dedup(allBillRows, ['customer_id', 'invoice_no', 'book', 'team_id']);
+
+      // Per-batch try/catch — same resilience pattern as OPNBIL. A single
+      // failing batch must NOT halt subsequent batches.
+      int failedInvBatches = 0;
       for (int i = 0; i < deduped.length; i += 50) {
         final chunk = deduped.sublist(i, (i + 50).clamp(0, deduped.length));
-        await dbClient.from('customer_bills').upsert(chunk, onConflict: 'customer_id,invoice_no,book,team_id');
-        upserted += chunk.length;
+        try {
+          await dbClient.from('customer_bills').upsert(chunk, onConflict: 'customer_id,invoice_no,book,team_id');
+          upserted += chunk.length;
+        } catch (e) {
+          failedInvBatches++;
+          debugPrint('⚠️ INV upsert batch ${i ~/ 50 + 1} (rows $i–${i + chunk.length - 1}) failed: $e — continuing');
+          continue;
+        }
       }
-      debugPrint('✅ INV: Done — $upserted bills upserted (${allBillRows.length} raw, ${deduped.length} deduped)');
+      debugPrint('✅ INV: Done — $upserted bills upserted (${allBillRows.length} raw, ${deduped.length} deduped${failedInvBatches > 0 ? ", $failedInvBatches batch(es) failed — see prior warnings" : ""})');
     } catch (e) {
       debugPrint('❌ INV error: $e');
     } finally {
       _isInvSyncing = false;
+    }
+  }
+
+  // ─── CRN (Credit Notes) SYNC ───────────────────────────────────────────────
+
+  bool _isCreditNoteSyncing = false;
+
+  /// Sync per-row credit notes from CRN CSV.
+  ///
+  /// CRN CSV has 188 columns — we project only the 11 fields needed for
+  /// rendering and reconciliation. Upsert-only (no wipe). A CN typically
+  /// stays forever in DUA's ledger history; if DUA ever deletes one, stale
+  /// rows here are inert because PDF display is gated on a matching
+  /// customer_advances row (ADV sync handles the "live" unallocated state).
+  Future<void> syncCreditNotesFromDrive() async {
+    if (_isCreditNoteSyncing) return;
+    _isCreditNoteSyncing = true;
+    try {
+      await _ensureFolderIds();
+      final headers = await GoogleDriveAuthService.instance.authHeaders();
+      if (headers.isEmpty) return;
+      if (dataUploadFolderId == null || dataUploadFolderId!.isEmpty) return;
+
+      final files = await _findFilesByPrefix(headers, dataUploadFolderId!, 'CRN');
+      if (files.isEmpty) { debugPrint('⚠️ CRN: No files found'); return; }
+
+      // acc_code → customer_id lookup (same pattern as OPNBIL/INV)
+      final customers = await _getCachedCustomers();
+      final Map<String, String> jaLookup = {};
+      final Map<String, String> maLookup = {};
+      for (final c in customers) {
+        if (c.accCodeJa != null && c.accCodeJa!.isNotEmpty) jaLookup[c.accCodeJa!] = c.id;
+        if (c.accCodeMa != null && c.accCodeMa!.isNotEmpty) maLookup[c.accCodeMa!] = c.id;
+      }
+
+      final dbClient = SupabaseService.instance.client;
+      int upserted = 0;
+      final allCnRows = <Map<String, dynamic>>[];
+
+      for (final file in files) {
+        final fileName = file['name'] ?? '';
+        final team = _teamFromSuffix(fileName);
+        final lookup = team == 'JA' ? jaLookup : maLookup;
+        debugPrint('📄 CRN: Processing $fileName as $team');
+
+        final csv = await _downloadFile(headers, file['id']!);
+        if (csv == null || csv.isEmpty) continue;
+
+        // 2026-04-21 — strip \r before parse. Windows-written CSVs use \r\n; with
+// eol='\n' the parser reads '\r' as part of the preceding field, which
+// confuses the quoted-field state machine when a field contains a comma
+// (e.g. multi-phone "7300957028, 7078734158"). After the first such row,
+// the parser eats every subsequent line as if still inside the quote.
+// Dropped 143 OPNBIL07 rows on 2026-04-21 until this fix landed.
+final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false).convert(csv.replaceAll('\r\n', '\n').replaceAll('\r', '\n'));
+        if (rows.isEmpty) continue;
+        final hdr = _parseHeaders(rows.first);
+
+        final acCodeI = hdr['ACCODE'] ?? -1;
+        final bookI = hdr['BOOK'] ?? -1;
+        final dateI = hdr['DATE'] ?? -1;
+        final billAmtI = hdr['BILLAMOUNT'] ?? -1;
+        final netAmtI = hdr['NETAMOUNT'] ?? -1;
+        final reasonI = hdr['REASON'] ?? -1;
+        final smanI = hdr['SMANNAME'] ?? -1;
+        final cnNoI = hdr['CRNOTENO'] ?? -1;
+        final rectVnoI = hdr['RECTVNO'] ?? -1;
+
+        if (acCodeI < 0 || cnNoI < 0) {
+          debugPrint('⚠️ CRN: $fileName missing ACCODE/CRNOTENO — skipping');
+          continue;
+        }
+
+        int parsed = 0, matched = 0;
+        for (int i = 1; i < rows.length; i++) {
+          final row = rows[i];
+          if (row.length <= acCodeI) continue;
+          parsed++;
+          final acCode = row[acCodeI].toString().trim();
+          final custId = lookup[acCode];
+          if (custId == null) continue;
+
+          final cnNo = int.tryParse(_col(row, cnNoI));
+          if (cnNo == null || cnNo == 0) continue;
+
+          allCnRows.add({
+            'customer_id': custId,
+            'team_id': team,
+            'acc_code': acCode,
+            'book': _col(row, bookI),
+            'cn_number': cnNo,
+            'cn_date': _parseDate(_col(row, dateI)),
+            'bill_amount': double.tryParse(_col(row, billAmtI)) ?? 0.0,
+            'net_amount': double.tryParse(_col(row, netAmtI)) ?? 0.0,
+            'reason': _col(row, reasonI),
+            'sman_name': _col(row, smanI),
+            'rectvno': rectVnoI >= 0 ? int.tryParse(_col(row, rectVnoI)) : null,
+          });
+          matched++;
+        }
+        debugPrint('📊 CRN: $fileName — $parsed rows parsed, $matched matched to customers');
+      }
+
+      final deduped = _dedup(allCnRows, ['customer_id', 'team_id', 'book', 'cn_number']);
+
+      // Batch upsert. Conflict on (team_id, customer_id, book, cn_number) per
+      // the unique index. Per-batch try/catch so a single row failure doesn't
+      // drop the rest of the sync (same resilience pattern as INV).
+      for (int i = 0; i < deduped.length; i += 50) {
+        final chunk = deduped.sublist(i, (i + 50).clamp(0, deduped.length));
+        try {
+          await dbClient.from('customer_credit_notes')
+              .upsert(chunk, onConflict: 'team_id,customer_id,book,cn_number');
+          upserted += chunk.length;
+        } catch (e) {
+          debugPrint('⚠️ CRN upsert batch ${i ~/ 50 + 1} failed: $e — continuing');
+        }
+      }
+      debugPrint('✅ CRN: Done — $upserted credit notes upserted (${allCnRows.length} raw, ${deduped.length} deduped)');
+    } catch (e) {
+      debugPrint('❌ CRN error: $e');
+    } finally {
+      _isCreditNoteSyncing = false;
+    }
+  }
+
+  // ─── ADV (Unallocated Advance Balances) SYNC ───────────────────────────────
+
+  bool _isAdvanceSyncing = false;
+
+  /// Sync unallocated-voucher amounts from ADV CSV.
+  ///
+  /// ADV is tiny (typically <20 rows per team) and represents CURRENT state:
+  /// when DUA applies an advance to a bill, the ADV row disappears. Therefore
+  /// this sync DOES wipe before insert — but gated on having ≥1 row to replace,
+  /// so a transient empty CSV doesn't destroy the table. Same protection pattern
+  /// as post-LY1 OPNBIL wipe gate.
+  ///
+  /// Keyed by (team_id, rectvno) — matches the unique index.
+  Future<void> syncAdvancesFromDrive() async {
+    if (_isAdvanceSyncing) return;
+    _isAdvanceSyncing = true;
+    try {
+      await _ensureFolderIds();
+      final headers = await GoogleDriveAuthService.instance.authHeaders();
+      if (headers.isEmpty) return;
+      if (dataUploadFolderId == null || dataUploadFolderId!.isEmpty) return;
+
+      final files = await _findFilesByPrefix(headers, dataUploadFolderId!, 'ADV');
+      if (files.isEmpty) { debugPrint('⚠️ ADV: No files found'); return; }
+
+      final customers = await _getCachedCustomers();
+      final Map<String, String> jaLookup = {};
+      final Map<String, String> maLookup = {};
+      for (final c in customers) {
+        if (c.accCodeJa != null && c.accCodeJa!.isNotEmpty) jaLookup[c.accCodeJa!] = c.id;
+        if (c.accCodeMa != null && c.accCodeMa!.isNotEmpty) maLookup[c.accCodeMa!] = c.id;
+      }
+
+      final dbClient = SupabaseService.instance.client;
+      final allAdvRows = <Map<String, dynamic>>[];
+      final teamsWithFile = <String>{};
+
+      for (final file in files) {
+        final fileName = file['name'] ?? '';
+        final team = _teamFromSuffix(fileName);
+        final lookup = team == 'JA' ? jaLookup : maLookup;
+        debugPrint('📄 ADV: Processing $fileName as $team');
+
+        final csv = await _downloadFile(headers, file['id']!);
+        if (csv == null || csv.isEmpty) {
+          debugPrint('⚠️ ADV: $fileName empty — skipping team $team (no wipe, no insert)');
+          continue;
+        }
+
+        // 2026-04-21 — strip \r before parse. Windows-written CSVs use \r\n; with
+// eol='\n' the parser reads '\r' as part of the preceding field, which
+// confuses the quoted-field state machine when a field contains a comma
+// (e.g. multi-phone "7300957028, 7078734158"). After the first such row,
+// the parser eats every subsequent line as if still inside the quote.
+// Dropped 143 OPNBIL07 rows on 2026-04-21 until this fix landed.
+final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false).convert(csv.replaceAll('\r\n', '\n').replaceAll('\r', '\n'));
+        if (rows.isEmpty) {
+          debugPrint('⚠️ ADV: $fileName parsed to 0 rows — skipping team $team');
+          continue;
+        }
+        teamsWithFile.add(team);
+        final hdr = _parseHeaders(rows.first);
+
+        final acCodeI = hdr['ACCODE'] ?? -1;
+        final rectVnoI = hdr['RECTVNO'] ?? -1;
+        final amtI = hdr['AMOUNT'] ?? -1;
+
+        if (acCodeI < 0 || rectVnoI < 0 || amtI < 0) {
+          debugPrint('⚠️ ADV: $fileName missing ACCODE/RECTVNO/AMOUNT columns — skipping');
+          continue;
+        }
+
+        int parsed = 0, matched = 0;
+        for (int i = 1; i < rows.length; i++) {
+          final row = rows[i];
+          if (row.length <= acCodeI) continue;
+          parsed++;
+          final acCode = row[acCodeI].toString().trim();
+          final custId = lookup[acCode];
+          if (custId == null) continue;
+
+          final rectVno = int.tryParse(_col(row, rectVnoI));
+          if (rectVno == null) continue;
+
+          final amount = double.tryParse(_col(row, amtI)) ?? 0.0;
+          if (amount == 0) continue; // no point storing zero advances
+
+          allAdvRows.add({
+            'customer_id': custId,
+            'team_id': team,
+            'acc_code': acCode,
+            'rectvno': rectVno,
+            'amount': amount,
+          });
+          matched++;
+        }
+        debugPrint('📊 ADV: $fileName — $parsed rows parsed, $matched matched to customers');
+      }
+
+      final deduped = _dedup(allAdvRows, ['team_id', 'rectvno']);
+      final teamsWithData = deduped.map((r) => r['team_id'] as String).toSet();
+      final teamsToWipe = teamsWithFile.intersection(teamsWithData);
+
+      // Wipe only teams that produced usable rows. A team with an empty or
+      // broken CSV keeps its previous advances — phantom/stale is safer than
+      // silently erasing a legit ₹71,170 advance on next bad sync.
+      for (final team in teamsToWipe) {
+        await dbClient.from('customer_advances').delete().eq('team_id', team);
+        debugPrint('🗑️ ADV: Cleared old customer_advances for team $team');
+      }
+      if (teamsWithFile.isNotEmpty && teamsToWipe.isEmpty) {
+        debugPrint('⚠️ ADV: file processed but 0 rows matched — skipping wipe to avoid data loss');
+      }
+
+      int upserted = 0;
+      for (int i = 0; i < deduped.length; i += 50) {
+        final chunk = deduped.sublist(i, (i + 50).clamp(0, deduped.length));
+        try {
+          await dbClient.from('customer_advances')
+              .upsert(chunk, onConflict: 'team_id,rectvno');
+          upserted += chunk.length;
+        } catch (e) {
+          debugPrint('⚠️ ADV upsert batch ${i ~/ 50 + 1} failed: $e — continuing');
+        }
+      }
+      debugPrint('✅ ADV: Done — $upserted advances upserted (${allAdvRows.length} raw, ${deduped.length} deduped)');
+    } catch (e) {
+      debugPrint('❌ ADV error: $e');
+    } finally {
+      _isAdvanceSyncing = false;
     }
   }
 
@@ -1904,9 +2280,7 @@ class DriveSyncService {
 
       final dbClient = SupabaseService.instance.client;
       int updated = 0;
-
-      // Track which teams we've reset so we only reset once per team
-      final teamsReset = <String>{};
+      int failedCustomers = 0;
 
       for (final file in files) {
         final fileName = file['name'] ?? '';
@@ -1915,21 +2289,23 @@ class DriveSyncService {
         final outCol = team == 'JA' ? 'outstanding_ja' : 'outstanding_ma';
         debugPrint('📄 BILLED_COLLECTED: Processing $fileName as $team');
 
-        // Reset all customers' outstanding to 0 for this team (once per team)
-        // Customers in the file will get their real balance; others stay at 0
-        if (!teamsReset.contains(team)) {
-          await dbClient.from('customer_team_profiles')
-              .update({outCol: 0})
-              .neq(outCol, 0);
-          teamsReset.add(team);
-          debugPrint('📊 BILLED_COLLECTED: Reset $outCol to 0 for all customers');
+        final csv = await _downloadFile(headers, file['id']!);
+        if (csv == null || csv.isEmpty) {
+          debugPrint('⚠️ BILLED_COLLECTED: $fileName empty/unreadable — skipping team $team entirely to avoid wiping outstandings');
+          continue;
         }
 
-        final csv = await _downloadFile(headers, file['id']!);
-        if (csv == null || csv.isEmpty) continue;
-
-        final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false).convert(csv);
-        if (rows.isEmpty) continue;
+        // 2026-04-21 — strip \r before parse. Windows-written CSVs use \r\n; with
+// eol='\n' the parser reads '\r' as part of the preceding field, which
+// confuses the quoted-field state machine when a field contains a comma
+// (e.g. multi-phone "7300957028, 7078734158"). After the first such row,
+// the parser eats every subsequent line as if still inside the quote.
+// Dropped 143 OPNBIL07 rows on 2026-04-21 until this fix landed.
+final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false).convert(csv.replaceAll('\r\n', '\n').replaceAll('\r', '\n'));
+        if (rows.isEmpty) {
+          debugPrint('⚠️ BILLED_COLLECTED: $fileName parsed to 0 rows — skipping team $team to avoid wiping outstandings');
+          continue;
+        }
         final hdr = _parseHeaders(rows.first);
 
         final acCodeI = hdr['ACCODE'] ?? -1;
@@ -1938,50 +2314,112 @@ class DriveSyncService {
         final currentYearBilledI = hdr['CURRENT_YEAR_BILLED'] ?? -1;
 
         if (acCodeI < 0 || closingI < 0) {
-          debugPrint('⚠️ BILLED_COLLECTED: $fileName missing ACCODE/CLOSING_BALANCE columns');
+          debugPrint('⚠️ BILLED_COLLECTED: $fileName missing ACCODE/CLOSING_BALANCE columns — skipping to avoid wiping outstandings');
           continue;
         }
 
         final crNotesCol = team == 'JA' ? 'credit_notes_ja' : 'credit_notes_ma';
         final yrBilledCol = team == 'JA' ? 'current_year_billed_ja' : 'current_year_billed_ma';
 
-        // Collect all updates first
-        final updates = <Map<String, dynamic>>[];
+        // Parse CSV into acc_code → values map
+        final csvValues = <String, ({double closing, double credit, double yrBilled})>{};
         for (int i = 1; i < rows.length; i++) {
           final row = rows[i];
           if (row.length <= acCodeI) continue;
           final acCode = row[acCodeI].toString().trim();
-          final custId = lookup[acCode];
-          if (custId == null) continue;
-
+          if (acCode.isEmpty) continue;
           final closingBalance = double.tryParse(_col(row, closingI)) ?? 0;
           final creditNotes = creditNotesI >= 0 ? (double.tryParse(_col(row, creditNotesI)) ?? 0) : 0.0;
           final currentYearBilled = currentYearBilledI >= 0 ? (double.tryParse(_col(row, currentYearBilledI)) ?? 0) : 0.0;
-          updates.add({
-            'customer_id': custId,
-            outCol: closingBalance,
-            crNotesCol: creditNotes,
-            yrBilledCol: currentYearBilled,
-          });
+          csvValues[acCode] = (closing: closingBalance, credit: creditNotes, yrBilled: currentYearBilled);
         }
-        debugPrint('📊 BILLED_COLLECTED: $fileName — ${updates.length} matched customers');
 
-        // Batch update: 20 concurrent requests at a time
-        for (int i = 0; i < updates.length; i += 10) {
-          final chunk = updates.sublist(i, (i + 10).clamp(0, updates.length));
+        // Build update list: every acc-code'd customer for this team.
+        //
+        // Customers IN the CSV → write all three columns (outstanding,
+        // credit_notes, current_year_billed) from the CSV.
+        //
+        // Customers with an acc_code for this team but ABSENT from the CSV
+        // → only zero `outstanding` (matches the committed reset-to-0
+        // semantic). `credit_notes` and `current_year_billed` are left
+        // untouched because they are YTD running totals used by
+        // pdf_service's ledger-discrepancy formula; a single CSV omission
+        // must not wipe a full year of history.
+        //
+        // Failed batches still retain the customer's PREVIOUS value for
+        // whatever columns the batch was writing — unlike the pre-fix
+        // reset-then-write flow which could permanently leave them at 0.
+        final inCsv = <Map<String, dynamic>>[];
+        final absent = <String>[]; // just customer_ids to zero outstanding on
+        for (final entry in lookup.entries) {
+          final acCode = entry.key;
+          final custId = entry.value;
+          final v = csvValues[acCode];
+          if (v != null) {
+            inCsv.add({
+              'customer_id': custId,
+              outCol: v.closing,
+              crNotesCol: v.credit,
+              yrBilledCol: v.yrBilled,
+            });
+          } else {
+            absent.add(custId);
+          }
+        }
+        debugPrint('📊 BILLED_COLLECTED: $fileName — ${csvValues.length} CSV rows, ${inCsv.length} full-write, ${absent.length} outstanding-only zero (credit_notes/current_year_billed preserved)');
+
+        // Phase 1: full-write batches for customers in CSV.
+        for (int i = 0; i < inCsv.length; i += 10) {
+          final chunk = inCsv.sublist(i, (i + 10).clamp(0, inCsv.length));
+          Future<void> runChunk() => Future.wait(chunk.map((u) =>
+            dbClient.from('customer_team_profiles')
+                .update({
+                  outCol: u[outCol],
+                  crNotesCol: u[crNotesCol],
+                  yrBilledCol: u[yrBilledCol],
+                })
+                .eq('customer_id', u['customer_id'])
+          ));
           try {
-            await Future.wait(chunk.map((u) =>
-              dbClient.from('customer_team_profiles')
-                  .update({
-                    outCol: u[outCol],
-                    crNotesCol: u[crNotesCol],
-                    yrBilledCol: u[yrBilledCol],
-                  })
-                  .eq('customer_id', u['customer_id'])
-            ));
+            await runChunk();
             updated += chunk.length;
           } catch (e) {
-            debugPrint('⚠️ Sync batch ${i ~/ 10 + 1} failed: $e — continuing');
+            debugPrint('⚠️ BILLED_COLLECTED full-batch ${i ~/ 10 + 1} ($team) failed: $e — retrying once');
+            try {
+              await runChunk();
+              updated += chunk.length;
+              debugPrint('✅ BILLED_COLLECTED full-batch ${i ~/ 10 + 1} ($team) retry succeeded');
+            } catch (retryErr) {
+              failedCustomers += chunk.length;
+              debugPrint('❌ BILLED_COLLECTED full-batch ${i ~/ 10 + 1} ($team) retry FAILED: $retryErr — ${chunk.length} customers retain previous value');
+            }
+          }
+        }
+
+        // Phase 2: outstanding-only zero for customers absent from CSV.
+        // Skips the write entirely for rows already at 0 — saves round-trips
+        // and avoids needless invalidations.
+        for (int i = 0; i < absent.length; i += 10) {
+          final chunk = absent.sublist(i, (i + 10).clamp(0, absent.length));
+          Future<void> runChunk() => Future.wait(chunk.map((custId) =>
+            dbClient.from('customer_team_profiles')
+                .update({outCol: 0})
+                .eq('customer_id', custId)
+                .neq(outCol, 0)
+          ));
+          try {
+            await runChunk();
+            updated += chunk.length;
+          } catch (e) {
+            debugPrint('⚠️ BILLED_COLLECTED zero-batch ${i ~/ 10 + 1} ($team) failed: $e — retrying once');
+            try {
+              await runChunk();
+              updated += chunk.length;
+              debugPrint('✅ BILLED_COLLECTED zero-batch ${i ~/ 10 + 1} ($team) retry succeeded');
+            } catch (retryErr) {
+              failedCustomers += chunk.length;
+              debugPrint('❌ BILLED_COLLECTED zero-batch ${i ~/ 10 + 1} ($team) retry FAILED: $retryErr — ${chunk.length} customers retain previous value');
+            }
           }
         }
       }
@@ -1989,7 +2427,11 @@ class DriveSyncService {
       if (updated > 0) {
         await SupabaseService.instance.invalidateCache('customers');
       }
-      debugPrint('✅ BILLED_COLLECTED: Done — $updated customers updated');
+      if (failedCustomers > 0) {
+        debugPrint('⚠️ BILLED_COLLECTED: Done — $updated updated, $failedCustomers customers SKIPPED due to batch failures (kept previous value). Re-run sync to retry.');
+      } else {
+        debugPrint('✅ BILLED_COLLECTED: Done — $updated customers updated');
+      }
     } catch (e) {
       debugPrint('❌ BILLED_COLLECTED error: $e');
     } finally {
@@ -2037,7 +2479,13 @@ class DriveSyncService {
         final csv = await _downloadFile(headers, file['id']!);
         if (csv == null || csv.isEmpty) continue;
 
-        final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false).convert(csv);
+        // 2026-04-21 — strip \r before parse. Windows-written CSVs use \r\n; with
+// eol='\n' the parser reads '\r' as part of the preceding field, which
+// confuses the quoted-field state machine when a field contains a comma
+// (e.g. multi-phone "7300957028, 7078734158"). After the first such row,
+// the parser eats every subsequent line as if still inside the quote.
+// Dropped 143 OPNBIL07 rows on 2026-04-21 until this fix landed.
+final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false).convert(csv.replaceAll('\r\n', '\n').replaceAll('\r', '\n'));
         if (rows.isEmpty) continue;
         final hdr = _parseHeaders(rows.first);
 
@@ -2051,7 +2499,10 @@ class DriveSyncService {
 
         if (acCodeI < 0 || dateI < 0) continue;
 
-        final batch = <Map<String, dynamic>>[];
+        // Parse the whole file into a single list FIRST. We only wipe the
+        // team's rows if we have ≥1 usable entry to replace them with,
+        // otherwise a bad lookup/parse could leave customer_receipts empty.
+        final fileRows = <Map<String, dynamic>>[];
         for (int i = 1; i < rows.length; i++) {
           final row = rows[i];
           if (row.length <= acCodeI) continue;
@@ -2063,7 +2514,7 @@ class DriveSyncService {
           final dateStr = _col(row, dateI);
           if (dateStr.isEmpty) continue;
 
-          batch.add({
+          fileRows.add({
             'customer_id': custId,
             'acc_code': acCode,
             'receipt_date': _parseDate(dateStr),
@@ -2074,16 +2525,20 @@ class DriveSyncService {
             'team_id': team,
             'synced_at': DateTime.now().toIso8601String(),
           });
-
-          if (batch.length >= 100) {
-            await dbClient.from('customer_receipts').upsert(batch, onConflict: 'receipt_no,receipt_date,team_id');
-            receiptsUpserted += batch.length;
-            batch.clear();
-          }
         }
-        if (batch.isNotEmpty) {
-          await dbClient.from('customer_receipts').upsert(batch, onConflict: 'receipt_no,receipt_date,team_id');
-          receiptsUpserted += batch.length;
+
+        if (fileRows.isEmpty) {
+          debugPrint('⚠️ RECT: $fileName had no matching rows — skipping wipe to avoid data loss');
+          continue;
+        }
+
+        await dbClient.from('customer_receipts').delete().eq('team_id', team);
+        debugPrint('🗑️ RECT: Cleared stale customer_receipts for team $team');
+
+        for (int i = 0; i < fileRows.length; i += 100) {
+          final chunk = fileRows.sublist(i, (i + 100).clamp(0, fileRows.length));
+          await dbClient.from('customer_receipts').upsert(chunk, onConflict: 'receipt_no,receipt_date,team_id');
+          receiptsUpserted += chunk.length;
         }
       }
       debugPrint('✅ RECT: Done — $receiptsUpserted receipts upserted');
@@ -2099,7 +2554,13 @@ class DriveSyncService {
         final csv = await _downloadFile(headers, file['id']!);
         if (csv == null || csv.isEmpty) continue;
 
-        final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false).convert(csv);
+        // 2026-04-21 — strip \r before parse. Windows-written CSVs use \r\n; with
+// eol='\n' the parser reads '\r' as part of the preceding field, which
+// confuses the quoted-field state machine when a field contains a comma
+// (e.g. multi-phone "7300957028, 7078734158"). After the first such row,
+// the parser eats every subsequent line as if still inside the quote.
+// Dropped 143 OPNBIL07 rows on 2026-04-21 until this fix landed.
+final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false).convert(csv.replaceAll('\r\n', '\n').replaceAll('\r', '\n'));
         if (rows.isEmpty) continue;
         final hdr = _parseHeaders(rows.first);
 
@@ -2115,14 +2576,15 @@ class DriveSyncService {
 
         if (rectvnoI < 0 || invoiceI < 0) continue;
 
-        final batch = <Map<String, dynamic>>[];
+        // Parse the whole file first — only wipe if ≥1 row survives.
+        final fileRows = <Map<String, dynamic>>[];
         for (int i = 1; i < rows.length; i++) {
           final row = rows[i];
           if (row.length <= invoiceI) continue;
           final invoiceNo = _col(row, invoiceI);
           if (invoiceNo.isEmpty) continue;
 
-          batch.add({
+          fileRows.add({
             'receipt_date': _parseDate(_col(row, dateI)),
             'receipt_no': _col(row, rectvnoI),
             'invoice_no': invoiceNo,
@@ -2135,16 +2597,20 @@ class DriveSyncService {
             'team_id': team,
             'synced_at': DateTime.now().toIso8601String(),
           });
-
-          if (batch.length >= 100) {
-            await dbClient.from('customer_receipt_bills').upsert(batch, onConflict: 'receipt_no,invoice_no,receipt_date,team_id');
-            billsUpserted += batch.length;
-            batch.clear();
-          }
         }
-        if (batch.isNotEmpty) {
-          await dbClient.from('customer_receipt_bills').upsert(batch, onConflict: 'receipt_no,invoice_no,receipt_date,team_id');
-          billsUpserted += batch.length;
+
+        if (fileRows.isEmpty) {
+          debugPrint('⚠️ RCTBIL: $fileName had no usable rows — skipping wipe to avoid data loss');
+          continue;
+        }
+
+        await dbClient.from('customer_receipt_bills').delete().eq('team_id', team);
+        debugPrint('🗑️ RCTBIL: Cleared stale customer_receipt_bills for team $team');
+
+        for (int i = 0; i < fileRows.length; i += 100) {
+          final chunk = fileRows.sublist(i, (i + 100).clamp(0, fileRows.length));
+          await dbClient.from('customer_receipt_bills').upsert(chunk, onConflict: 'receipt_no,invoice_no,receipt_date,team_id');
+          billsUpserted += chunk.length;
         }
       }
       debugPrint('✅ RCTBIL: Done — $billsUpserted receipt bills upserted');
@@ -2248,7 +2714,13 @@ class DriveSyncService {
         final csv = await _downloadFile(headers, file['id']!);
         if (csv == null || csv.isEmpty) continue;
 
-        final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false).convert(csv);
+        // 2026-04-21 — strip \r before parse. Windows-written CSVs use \r\n; with
+// eol='\n' the parser reads '\r' as part of the preceding field, which
+// confuses the quoted-field state machine when a field contains a comma
+// (e.g. multi-phone "7300957028, 7078734158"). After the first such row,
+// the parser eats every subsequent line as if still inside the quote.
+// Dropped 143 OPNBIL07 rows on 2026-04-21 until this fix landed.
+final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false).convert(csv.replaceAll('\r\n', '\n').replaceAll('\r', '\n'));
         if (rows.isEmpty) continue;
         final hdr = _parseHeaders(rows.first);
 
@@ -2334,8 +2806,22 @@ class DriveSyncService {
         debugPrint('📊 BilledItems: $fileName — ${rows.length - 1} rows parsed');
       }
 
-      // De-dup and batch upsert
+      // De-dup first so we can gate the wipe on rows-to-insert
       final deduped = _dedup(allItemRows, ['invoice_no', 'item_name', 'bill_date', 'team_id']);
+
+      // Delete stale rows before fresh insert — bills deleted in the local
+      // billing software disappear from the next ITTR CSV, but a pure upsert
+      // never removes them. Only wipe teams that produced ≥1 usable row so
+      // a parse-failure or empty-match scenario can't empty the Billed tab.
+      final teamsWithData = deduped.map((r) => r['team_id'] as String).toSet();
+      for (final team in teamsWithData) {
+        await dbClient.from('customer_billed_items').delete().eq('team_id', team);
+        debugPrint('🗑️ BilledItems: Cleared old customer_billed_items for team $team');
+      }
+      if (allItemRows.isEmpty) {
+        debugPrint('⚠️ BilledItems: no rows parsed — skipping wipe to avoid data loss');
+      }
+
       for (int i = 0; i < deduped.length; i += 50) {
         final chunk = deduped.sublist(i, (i + 50).clamp(0, deduped.length));
         await dbClient.from('customer_billed_items').upsert(chunk, onConflict: 'invoice_no,item_name,bill_date,team_id');
@@ -2388,38 +2874,11 @@ class DriveSyncService {
     return [];
   }
 
-  /// Normalize name for comparison: lowercase, strip dots, collapse spaces/dashes.
-  String _normalizeName(String name) {
-    return name
-        .toLowerCase()
-        .replaceAll('.', '')        // P.R. → PR
-        .replaceAll(RegExp(r'-\s*$'), '')  // trailing dash "SUNIL UNCLE -" → "SUNIL UNCLE"
-        .replaceAll('-', ' ')       // G-MART → G MART
-        .replaceAll(RegExp(r'\s+'), ' ')  // collapse multiple spaces
-        .trim();
-  }
-
-  /// Levenshtein-based name similarity (0.0 to 1.0).
-  /// Normalizes names first (strips dots, dashes, extra spaces).
-  double _nameSimilarity(String a, String b) {
-    final s1 = _normalizeName(a);
-    final s2 = _normalizeName(b);
-    if (s1 == s2) return 1.0;
-    if (s1.isEmpty || s2.isEmpty) return 0.0;
-    final maxLen = s1.length > s2.length ? s1.length : s2.length;
-    // Levenshtein distance
-    final prev = List<int>.generate(s2.length + 1, (i) => i);
-    final curr = List<int>.filled(s2.length + 1, 0);
-    for (int i = 1; i <= s1.length; i++) {
-      curr[0] = i;
-      for (int j = 1; j <= s2.length; j++) {
-        final cost = s1[i - 1] == s2[j - 1] ? 0 : 1;
-        curr[j] = [curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost].reduce((a, b) => a < b ? a : b);
-      }
-      for (int j = 0; j <= s2.length; j++) prev[j] = curr[j];
-    }
-    return 1.0 - (prev[s2.length] / maxLen);
-  }
+  // 2026-04-21 — _normalizeName() and _nameSimilarity() removed per user
+  // directive: "NO NAME NORMALIZER EVEN FOR CUSTOMER". Matching is now strict
+  // on exact name (lowercase+trim) OR GSTIN OR acc_code. If ACMAST's ACNAME
+  // drifts slightly from products.name / customers.name, admin links manually
+  // via Data Changes review instead of relying on fuzzy auto-match.
 
   /// Determine team from filename suffix: <10 (07,08,09) = JA, >=10 (11,12,13) = MA.
   /// Determine team from filename suffix.
@@ -2694,6 +3153,68 @@ class DriveSyncService {
     } catch (e) {
       debugPrint('_downloadFile error: $e');
       return null;
+    }
+  }
+
+  // ─── sync_metadata.csv SYNC (2026-04-21) ───────────────────────────────────
+  //
+  // Pulls the single-row sync_metadata.csv the Windows export script writes
+  // after every `dua_export_all.py` run. Stores `last_dua_export` in Hive so
+  // the admin Settings tab can show "DUA exported: X hours ago" alongside
+  // the existing "Last synced" (app→Supabase) timestamp.
+  //
+  // Never blocks or fails other syncs — silent no-op if the file doesn't
+  // exist yet (older export scripts). Safe to add without migration.
+
+  bool _isMetadataSyncing = false;
+
+  Future<void> syncDuaMetadataFromDrive() async {
+    if (_isMetadataSyncing) return;
+    _isMetadataSyncing = true;
+    try {
+      await _ensureFolderIds();
+      final headers = await GoogleDriveAuthService.instance.authHeaders();
+      if (headers.isEmpty) return;
+      if (dataUploadFolderId == null || dataUploadFolderId!.isEmpty) return;
+
+      final files = await _findFilesByPrefix(headers, dataUploadFolderId!, 'sync_metadata');
+      if (files.isEmpty) {
+        debugPrint('ℹ️ sync_metadata: not found in Drive — skipping (older script)');
+        return;
+      }
+
+      final csv = await _downloadFile(headers, files.first['id']!);
+      if (csv == null || csv.isEmpty) return;
+      // 2026-04-21 — strip \r before parse. Windows-written CSVs use \r\n; with
+// eol='\n' the parser reads '\r' as part of the preceding field, which
+// confuses the quoted-field state machine when a field contains a comma
+// (e.g. multi-phone "7300957028, 7078734158"). After the first such row,
+// the parser eats every subsequent line as if still inside the quote.
+// Dropped 143 OPNBIL07 rows on 2026-04-21 until this fix landed.
+final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false).convert(csv.replaceAll('\r\n', '\n').replaceAll('\r', '\n'));
+      if (rows.length < 2) return;
+
+      // Expected layout: key,value header + key=value body.
+      final meta = <String, String>{};
+      for (int i = 1; i < rows.length; i++) {
+        final row = rows[i];
+        if (row.length < 2) continue;
+        final k = row[0].toString().trim();
+        final v = row[1].toString().trim();
+        if (k.isNotEmpty) meta[k] = v;
+      }
+
+      final lastRunIst = meta['last_run_ist'] ?? '';
+      final box = await Hive.openBox('app_settings');
+      if (lastRunIst.isNotEmpty) {
+        await box.put('last_dua_export', lastRunIst);
+      }
+      await box.put('dua_sync_metadata', meta);
+      debugPrint('✅ sync_metadata: last_dua_export=$lastRunIst, keys=${meta.length}');
+    } catch (e) {
+      debugPrint('⚠️ sync_metadata error: $e');
+    } finally {
+      _isMetadataSyncing = false;
     }
   }
 }

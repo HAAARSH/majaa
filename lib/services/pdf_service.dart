@@ -499,10 +499,17 @@ class PdfService {
     required List<Map<String, dynamic>> allBills,
     required String teamId,
     List<String>? beatNames,
+    // Unallocated CN/receipt balances. Optional for backward compat — if
+    // omitted, the PDF renders without the advance lines (same behavior as
+    // before the Phase B changes).
+    List<Map<String, dynamic>>? advances,
+    List<Map<String, dynamic>>? creditNotes,
     // Cross-team: optional second team report on a new page
     String? crossTeamId,
     List<Map<String, dynamic>>? crossTeamBills,
     List<String>? crossTeamBeatNames,
+    List<Map<String, dynamic>>? crossTeamAdvances,
+    List<Map<String, dynamic>>? crossTeamCreditNotes,
   }) async {
     final pdf = pw.Document();
     final regular = await regularFont;
@@ -510,25 +517,68 @@ class PdfService {
     final baseTheme = pw.ThemeData.withFont(base: regular, bold: bold);
 
     // Add primary team pages
-    _addOutstandingPages(pdf, baseTheme, customers, allBills, teamId, beatNames);
+    final primaryAdded =
+        _addOutstandingPages(pdf, baseTheme, customers, allBills, teamId, beatNames,
+            advances: advances, creditNotes: creditNotes);
 
     // Add cross-team pages on new page if provided
+    bool crossAdded = false;
     if (crossTeamId != null && crossTeamBills != null) {
-      _addOutstandingPages(pdf, baseTheme, customers, crossTeamBills, crossTeamId, crossTeamBeatNames);
+      crossAdded = _addOutstandingPages(pdf, baseTheme, customers, crossTeamBills, crossTeamId, crossTeamBeatNames,
+          advances: crossTeamAdvances, creditNotes: crossTeamCreditNotes);
+    }
+
+    // If no team produced any pages, a 0-page PDF is corrupt on every reader
+    // (share preview, WhatsApp, Drive) — users see "can't open". Render a
+    // visible fallback so the file is always valid.
+    if (!primaryAdded && !crossAdded) {
+      final today = DateFormat('dd.MM.yyyy').format(DateTime.now());
+      final teamName = teamId == 'JA' ? 'JAGANNATH ASSOCIATES' : 'MADHAV ASSOCIATES';
+      pdf.addPage(pw.Page(
+        theme: baseTheme,
+        pageFormat: PdfPageFormat.a4,
+        build: (context) => pw.Column(
+          crossAxisAlignment: pw.CrossAxisAlignment.start,
+          children: [
+            pw.Text(teamName,
+                style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 13, color: primaryColor)),
+            pw.Text('CUSTOMER OUTSTANDING  PRINTED ON $today',
+                style: const pw.TextStyle(fontSize: 9)),
+            if (beatNames != null && beatNames.isNotEmpty)
+              pw.Padding(
+                padding: const pw.EdgeInsets.only(top: 2),
+                child: pw.Text('BEATS: ${beatNames.join(' | ')}',
+                    style: pw.TextStyle(fontSize: 9, fontWeight: pw.FontWeight.bold, color: primaryColor)),
+              ),
+            pw.Divider(color: primaryColor, thickness: 1.5),
+            pw.SizedBox(height: 40),
+            pw.Center(
+              child: pw.Text('No outstanding bills for the selected beats.',
+                  style: pw.TextStyle(fontSize: 12, fontWeight: pw.FontWeight.bold)),
+            ),
+          ],
+        ),
+      ));
     }
 
     return await pdf.save();
   }
 
   /// Helper: adds one team's outstanding report as MultiPage(s) to the document.
-  static void _addOutstandingPages(
+  /// Returns true if at least one page was added (i.e. byBeat wasn't empty),
+  /// false if no data was found for this team. The caller uses the return
+  /// value to decide whether to render a fallback page so the final PDF is
+  /// never 0-page (which readers treat as corrupt).
+  static bool _addOutstandingPages(
     pw.Document pdf,
     pw.ThemeData baseTheme,
     List<CustomerModel> customers,
     List<Map<String, dynamic>> allBills,
     String teamId,
-    List<String>? beatNames,
-  ) {
+    List<String>? beatNames, {
+    List<Map<String, dynamic>>? advances,
+    List<Map<String, dynamic>>? creditNotes,
+  }) {
     final today = DateFormat('dd.MM.yyyy').format(DateTime.now());
     final teamName = teamId == 'JA' ? 'JAGANNATH ASSOCIATES' : 'MADHAV ASSOCIATES';
     final fs = pw.TextStyle(fontSize: 8);
@@ -545,20 +595,50 @@ class PdfService {
       billsByCustomer[custId]!.add(bill);
     }
 
-    // Filter customers: include if outstanding > 0 OR has any pending bills
+    // Advances per customer, and CN metadata lookup by rectvno so we can
+    // label CN-origin advances with "CR NOTE-{cn_number}" and their CN date.
+    // Receipt-origin advances (no matching CN) fall back to plain "ADVANCE".
+    final Map<String, List<Map<String, dynamic>>> advancesByCustomer = {};
+    if (advances != null) {
+      for (final a in advances) {
+        final custId = a['customer_id'] as String? ?? '';
+        final amt = (a['amount'] as num?)?.toDouble() ?? 0;
+        if (custId.isEmpty || amt == 0) continue;
+        advancesByCustomer.putIfAbsent(custId, () => []).add(a);
+      }
+    }
+    final Map<int, Map<String, dynamic>> cnByRectvno = {};
+    if (creditNotes != null) {
+      for (final cn in creditNotes) {
+        final vno = cn['rectvno'];
+        if (vno is int) cnByRectvno[vno] = cn;
+      }
+    }
+
+    // Include a customer only when they have an actual pending bill or
+    // an unallocated advance. DUA's native AREAWISE OUTSTANDING print is a
+    // pure OPNBIL scan — a customer whose closing balance is carried by
+    // pure ledger entries (opening balance offset by bank-reconciliation
+    // JVs, etc.) doesn't appear there and shouldn't appear here either.
+    //
+    // Historical behaviour also included `outstanding > 0` from the
+    // BILLED_COLLECTED snapshot. Removed 2026-04-21 after confirming this
+    // was the source of "phantom" customers (BANWARI / DEHRA / REKHI /
+    // VARDAAN on HANUMAN CHOWK summed to 129,320 of inflated total — all
+    // cleared by 04-30 JVs the snapshot pre-dated).
     final Map<String, List<CustomerModel>> byBeat = {};
     for (final c in customers) {
       final beat = c.beatNameForTeam(teamId);
       if (beat.isEmpty) continue;
       if (beatNames != null && !beatNames.contains(beat)) continue;
-      final outstanding = c.outstandingForTeam(teamId);
       final hasPendingBills = billsByCustomer.containsKey(c.id);
-      if (outstanding <= 0 && !hasPendingBills) continue;
+      final hasAdvances = advancesByCustomer.containsKey(c.id);
+      if (!hasPendingBills && !hasAdvances) continue;
       byBeat.putIfAbsent(beat, () => []);
       byBeat[beat]!.add(c);
     }
 
-    if (byBeat.isEmpty) return; // Skip if no data for this team
+    if (byBeat.isEmpty) return false; // Skip if no data for this team
 
     final sortedBeats = byBeat.keys.toList()..sort();
     for (final beat in sortedBeats) {
@@ -662,20 +742,55 @@ class PdfService {
                     ]),
                   ));
                 }
-              } else {
-                final balance = customer.outstandingForTeam(teamId);
-                custBalance = balance;
-                custBill = balance;
+              }
+              // No "(no bill details)" placeholder — the new inclusion rule
+              // (line ~620) guarantees this customer has at least pending
+              // bills OR advances. If bills is empty here, it means the
+              // customer reached inclusion via advances alone; those are
+              // rendered by the advance loop below with negative balance,
+              // which is the correct presentation.
+
+              // Render unallocated advances (CN-origin or receipt-origin) under
+              // this customer's bills. Each row reduces custBalance by its
+              // amount and adds to custRecd, so the TOTAL row naturally lands
+              // on DUA's printed ledger balance. Label is "CR NOTE-N" when we
+              // can cross-reference a credit note by rectvno; otherwise plain
+              // "ADVANCE" (receipt-origin overpayment). Date + sman come from
+              // the CN when matched — receipt-origin advances show blank.
+              for (final adv in (advancesByCustomer[customer.id] ?? const [])) {
+                final rectvno = adv['rectvno'] is int ? adv['rectvno'] as int : null;
+                final amount = (adv['amount'] as num?)?.toDouble() ?? 0.0;
+                if (amount == 0) continue;
+                final matchedCn = rectvno != null ? cnByRectvno[rectvno] : null;
+
+                String label = 'ADVANCE';
+                String dateStr = '';
+                String smanStr = '';
+                if (matchedCn != null) {
+                  final cnNum = matchedCn['cn_number'];
+                  label = cnNum != null ? 'CR NOTE-$cnNum' : 'CR NOTE';
+                  final cnDate = matchedCn['cn_date'] as String? ?? '';
+                  if (cnDate.isNotEmpty) {
+                    try {
+                      dateStr = DateFormat('dd.MM.yy').format(DateTime.parse(cnDate));
+                    } catch (_) {}
+                  }
+                  smanStr = (matchedCn['sman_name'] as String? ?? '').trim();
+                }
+
+                custRecd += amount;
+                custBalance -= amount;
+
                 content.add(pw.Padding(
                   padding: const pw.EdgeInsets.only(left: 8),
                   child: pw.Row(children: [
-                    pw.SizedBox(width: 120, child: pw.Text('(no bill details)', style: const pw.TextStyle(fontSize: 7.5, color: PdfColors.grey))),
-                    pw.SizedBox(width: 52, child: pw.Text('', style: fs)),
-                    pw.SizedBox(width: 44, child: pw.Text('', style: fs)),
+                    pw.SizedBox(width: 120, child: pw.Text(smanStr, style: fs)),
+                    pw.SizedBox(width: 52, child: pw.Text(label, style: fs)),
+                    pw.SizedBox(width: 44, child: pw.Text(dateStr, style: fs)),
                     pw.SizedBox(width: 22, child: pw.Text('', style: fs)),
-                    pw.SizedBox(width: 44, child: pw.Text('${balance.toStringAsFixed(0)}', style: fs, textAlign: pw.TextAlign.right)),
-                    pw.SizedBox(width: 38, child: pw.Text('0', style: fs, textAlign: pw.TextAlign.right)),
-                    pw.SizedBox(width: 44, child: pw.Text('${balance.toStringAsFixed(0)}', style: fs, textAlign: pw.TextAlign.right)),
+                    pw.SizedBox(width: 44, child: pw.Text('', style: fs)),
+                    pw.SizedBox(width: 38, child: pw.Text(amount.toStringAsFixed(0), style: fs, textAlign: pw.TextAlign.right)),
+                    pw.SizedBox(width: 44, child: pw.Text('-${amount.toStringAsFixed(0)}', style: fs, textAlign: pw.TextAlign.right)),
                     pw.Expanded(child: pw.Text('', style: fs)),
                     pw.Expanded(child: pw.Text('', style: fs)),
                     pw.Expanded(child: pw.Text('', style: fs)),
@@ -765,6 +880,7 @@ class PdfService {
         },
       ),
     );
+    return true;
   }
 
   /// Generate outstanding PDF file and return path.
@@ -773,13 +889,19 @@ class PdfService {
     required List<Map<String, dynamic>> allBills,
     required String teamId,
     List<String>? beatNames,
+    List<Map<String, dynamic>>? advances,
+    List<Map<String, dynamic>>? creditNotes,
     String? crossTeamId,
     List<Map<String, dynamic>>? crossTeamBills,
     List<String>? crossTeamBeatNames,
+    List<Map<String, dynamic>>? crossTeamAdvances,
+    List<Map<String, dynamic>>? crossTeamCreditNotes,
   }) async {
     final bytes = await generateOutstandingReportBytes(
       customers: customers, allBills: allBills, teamId: teamId, beatNames: beatNames,
+      advances: advances, creditNotes: creditNotes,
       crossTeamId: crossTeamId, crossTeamBills: crossTeamBills, crossTeamBeatNames: crossTeamBeatNames,
+      crossTeamAdvances: crossTeamAdvances, crossTeamCreditNotes: crossTeamCreditNotes,
     );
     final filename = 'MAJAA_Outstanding_${DateFormat('dd-MM-yyyy').format(DateTime.now())}.pdf';
     if (kIsWeb) {
@@ -798,13 +920,19 @@ class PdfService {
     required List<Map<String, dynamic>> allBills,
     required String teamId,
     List<String>? beatNames,
+    List<Map<String, dynamic>>? advances,
+    List<Map<String, dynamic>>? creditNotes,
     String? crossTeamId,
     List<Map<String, dynamic>>? crossTeamBills,
     List<String>? crossTeamBeatNames,
+    List<Map<String, dynamic>>? crossTeamAdvances,
+    List<Map<String, dynamic>>? crossTeamCreditNotes,
   }) async {
     final bytes = await generateOutstandingReportBytes(
       customers: customers, allBills: allBills, teamId: teamId, beatNames: beatNames,
+      advances: advances, creditNotes: creditNotes,
       crossTeamId: crossTeamId, crossTeamBills: crossTeamBills, crossTeamBeatNames: crossTeamBeatNames,
+      crossTeamAdvances: crossTeamAdvances, crossTeamCreditNotes: crossTeamCreditNotes,
     );
     await Printing.layoutPdf(onLayout: (_) async => Uint8List.fromList(bytes));
   }
@@ -867,9 +995,8 @@ class PdfService {
       final beat = c.beatNameForTeam(teamId);
       if (beat.isEmpty) continue;
       if (beatNames != null && !beatNames.contains(beat)) continue;
-      final outstanding = c.outstandingForTeam(teamId);
       final hasPendingBills = billsByCustomer.containsKey(c.id);
-      if (outstanding <= 0 && !hasPendingBills) continue;
+      if (!hasPendingBills) continue;
       byBeat.putIfAbsent(beat, () => []);
       byBeat[beat]!.add(c);
     }
