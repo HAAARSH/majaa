@@ -47,7 +47,11 @@ class _SmartImportTabState extends State<SmartImportTab> {
   Uint8List? _pickedBytes;
   String? _pickedFileName;
   String? _pickedMime;       // 'application/pdf' | 'image/jpeg' | 'image/png'
-  String? _pickedInputType;  // 'pdf' | 'image_screenshot'
+  String? _pickedInputType;  // 'pdf' | 'image_screenshot' | 'image_handwritten'
+
+  /// Text-path classification — null until the paste box has non-empty text.
+  /// Admin can override via the dropdown next to the paste box.
+  String? _textInputType;
 
   bool _loading = true;
   bool _parsing = false;
@@ -197,13 +201,18 @@ class _SmartImportTabState extends State<SmartImportTab> {
         return;
       }
 
+      // Resolve the effective input type for text. Admin may have overridden
+      // via the dropdown; otherwise we classify heuristically.
+      final effectiveTextType = _textInputType ??
+          SmartImportService.classifyTextInput(raw);
+
       final draft = hasFile
           ? await SmartImportService.instance.parseFromBytes(
               bytes: _pickedBytes!,
               mimeType: _pickedMime!,
               inputType: _pickedInputType!,
             )
-          : await SmartImportService.instance.parseBrandSoftwareText(raw);
+          : await SmartImportService.instance.parseText(raw, effectiveTextType);
       if (draft == null) {
         if (!mounted) return;
         setState(() => _parsing = false);
@@ -225,6 +234,7 @@ class _SmartImportTabState extends State<SmartImportTab> {
       );
 
       // Resolve each product line.
+      final isHandwritten = _pickedInputType == 'image_handwritten';
       final lines = <_ReviewLine>[];
       for (final dl in draft.lines) {
         final rp = await svc.resolveProduct(
@@ -238,7 +248,9 @@ class _SmartImportTabState extends State<SmartImportTab> {
           resolved: rp,
           chosen: rp.match,
           qty: dl.quantity,
-          confirmed: rp.match != null && rp.confidence >= 0.85,
+          // Handwritten: NEVER pre-check. Admin must confirm every line.
+          // Other input types: pre-check only on strong matches.
+          confirmed: !isHandwritten && rp.match != null && rp.confidence >= 0.85,
         ));
       }
 
@@ -628,21 +640,59 @@ class _SmartImportTabState extends State<SmartImportTab> {
   }
 
   Widget _buildPasteBox() {
-    return TextField(
-      controller: _pasteCtl,
-      maxLines: 10,
-      decoration: _fieldDecoration(
-        hint: 'Paste brand-software text (GUBB, SCO, etc.) — or use the upload buttons below.',
-      ),
+    final text = _pasteCtl.text;
+    final hasText = text.trim().isNotEmpty;
+    final detected = hasText
+        ? (_textInputType ?? SmartImportService.classifyTextInput(text))
+        : null;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        TextField(
+          controller: _pasteCtl,
+          maxLines: 10,
+          decoration: _fieldDecoration(
+            hint: 'Paste brand-software text, WhatsApp message — or use the upload buttons below.',
+          ),
+          onChanged: (_) => setState(() {/* trigger classifier chip rebuild */}),
+        ),
+        if (hasText)
+          Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: Row(
+              children: [
+                Icon(Icons.auto_awesome_rounded, size: 14, color: Colors.black54),
+                const SizedBox(width: 6),
+                Text('Type:',
+                    style: GoogleFonts.manrope(fontSize: 11, color: Colors.black54, fontWeight: FontWeight.w600)),
+                const SizedBox(width: 8),
+                DropdownButton<String>(
+                  isDense: true,
+                  value: detected,
+                  items: const [
+                    DropdownMenuItem(value: 'brand_software_text', child: Text('Brand software (GUBB/SCO)')),
+                    DropdownMenuItem(value: 'whatsapp_text', child: Text('WhatsApp / casual')),
+                  ],
+                  onChanged: (v) => setState(() => _textInputType = v),
+                ),
+                const SizedBox(width: 6),
+                if (_textInputType == null)
+                  Text('(auto)',
+                      style: GoogleFonts.manrope(fontSize: 10, color: Colors.black38)),
+              ],
+            ),
+          ),
+      ],
     );
   }
 
   Widget _buildPickedFileCard() {
     final sizeKb = ((_pickedBytes?.length ?? 0) / 1024).toStringAsFixed(1);
-    final icon = _pickedInputType == 'pdf'
-        ? Icons.picture_as_pdf_rounded
-        : Icons.image_rounded;
-    final accent = _pickedInputType == 'pdf' ? Colors.red.shade700 : Colors.teal.shade700;
+    final isPdf = _pickedInputType == 'pdf';
+    final isImage = !isPdf;
+    final isHandwritten = _pickedInputType == 'image_handwritten';
+    final icon = isPdf ? Icons.picture_as_pdf_rounded : Icons.image_rounded;
+    final accent = isPdf ? Colors.red.shade700 : Colors.teal.shade700;
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
@@ -650,26 +700,56 @@ class _SmartImportTabState extends State<SmartImportTab> {
         borderRadius: BorderRadius.circular(10),
         border: Border.all(color: accent.withValues(alpha: 0.4)),
       ),
-      child: Row(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Icon(icon, color: accent),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
+          Row(
+            children: [
+              Icon(icon, color: accent),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(_pickedFileName ?? '—',
+                        style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.w700)),
+                    Text('$sizeKb KB · $_pickedMime',
+                        style: GoogleFonts.manrope(fontSize: 11, color: Colors.black54)),
+                  ],
+                ),
+              ),
+              IconButton(
+                icon: const Icon(Icons.close_rounded, size: 20),
+                tooltip: 'Remove file',
+                onPressed: _clearPickedFile,
+              ),
+            ],
+          ),
+          if (isImage) ...[
+            const SizedBox(height: 8),
+            // Handwritten toggle — only meaningful for images. When ON, the
+            // parser switches to the handwritten prompt AND review pre-checks
+            // are disabled so admin must confirm every line.
+            Row(
               children: [
-                Text(_pickedFileName ?? '—',
-                    style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.w700)),
-                Text('$sizeKb KB · $_pickedMime',
-                    style: GoogleFonts.manrope(fontSize: 11, color: Colors.black54)),
+                Checkbox(
+                  value: isHandwritten,
+                  onChanged: (v) => setState(() {
+                    _pickedInputType = (v ?? false) ? 'image_handwritten' : 'image_screenshot';
+                  }),
+                ),
+                Text('Handwritten photo',
+                    style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w600)),
+                const SizedBox(width: 6),
+                Tooltip(
+                  message:
+                      'Tick when the image is a hand-written order slip (not a spreadsheet screenshot). '
+                      'Uses a stricter prompt and requires you to confirm every line on review.',
+                  child: Icon(Icons.help_outline_rounded, size: 14, color: Colors.black45),
+                ),
               ],
             ),
-          ),
-          IconButton(
-            icon: const Icon(Icons.close_rounded, size: 20),
-            tooltip: 'Remove file',
-            onPressed: _clearPickedFile,
-          ),
+          ],
         ],
       ),
     );
@@ -734,6 +814,27 @@ class _SmartImportTabState extends State<SmartImportTab> {
             decoration: _fieldDecoration(hint: 'Admin notes'),
           ),
           const SizedBox(height: 16),
+          if (_pickedInputType == 'image_handwritten')
+            Container(
+              padding: const EdgeInsets.all(12),
+              margin: const EdgeInsets.only(bottom: 12),
+              decoration: BoxDecoration(
+                color: Colors.orange.shade50,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.orange.shade400),
+              ),
+              child: Row(children: [
+                Icon(Icons.edit_note_rounded, size: 20, color: Colors.orange.shade900),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    'Handwritten input — please verify and tick every line before saving. '
+                    'Accuracy on handwriting is typically 50-60%.',
+                    style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700, color: Colors.orange.shade900, height: 1.3),
+                  ),
+                ),
+              ]),
+            ),
           if (unresolved > 0)
             Container(
               padding: const EdgeInsets.all(10),

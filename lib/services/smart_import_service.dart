@@ -499,6 +499,117 @@ class SmartImportService {
   static const String _geminiEndpoint =
       'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent';
 
+  /// Heuristic classifier for text inputs.
+  ///
+  /// Returns 'brand_software_text' when the paste looks like structured
+  /// brand-software output (GUBB/SCO etc. — many lines, explicit column
+  /// labels, numeric columns). Otherwise 'whatsapp_text' (short, casual,
+  /// often Hinglish).
+  ///
+  /// Admin can override via the UI dropdown if the guess is wrong.
+  static String classifyTextInput(String raw) {
+    final text = raw.toLowerCase();
+    const brandMarkers = [
+      'order qty',
+      'order value',
+      'total order value',
+      'beat name',
+      'beat :',
+      'scheme qty',
+      'scheme %',
+    ];
+    var hits = 0;
+    for (final m in brandMarkers) {
+      if (text.contains(m)) hits++;
+    }
+    if (hits >= 2) return 'brand_software_text';
+
+    final lines = raw.split('\n').where((l) => l.trim().isNotEmpty).toList();
+    // Long, multi-line structured pastes are almost always brand-software.
+    if (lines.length >= 15) return 'brand_software_text';
+
+    return 'whatsapp_text';
+  }
+
+  static const String _whatsappPrompt = r'''
+You are a parsing assistant for a wholesale distributor's order system.
+The input is a casual WhatsApp message from a retailer. It is usually
+1-5 lines in mixed English / Hindi / Hinglish. Common patterns:
+  - "S.D store (9897477269) omkar road / Hakka noodles - 6pc / Origano - 2ladi"
+  - "Send 10 maggi + 5 dal to apollo pharma tomorrow"
+  - "Aaj 20 box kurkure bhej dena"
+
+OUTPUT FORMAT — STRICT JSON, NO PROSE, NO MARKDOWN FENCES:
+{
+  "customer": {
+    "name_as_written": "best guess from message, or empty string",
+    "phone_if_present": "10-digit phone if visible, or null"
+  },
+  "delivery_date_hint": "today | tomorrow | aaj | kal | DD/MM/YYYY | null",
+  "notes": "greetings, thank-yous, payment remarks not tied to items",
+  "line_items": [
+    {
+      "name_as_written": "exact product nickname from message",
+      "ean_code": null,
+      "quantity": 6,
+      "unit_hint": "pc | pcs | ladi | box | ctn | kg | ml | null",
+      "confidence": 0.75
+    }
+  ],
+  "overall_parse_confidence": 0.7
+}
+
+RULES:
+- Numbers right next to a product name / abbreviation are the quantity.
+- "ladi" / "strip" = unit_hint 'ladi'. Do NOT multiply — our system
+  resolves the strip size later.
+- "box" / "ctn" = unit_hint 'box'.
+- "kg", "gm", "ml", "ltr" = weight/volume hints; emit as unit_hint.
+- Phone in parentheses / brackets / "ph:" prefix goes into phone_if_present.
+- Emojis, "thanks", "please", "kal bhej dena" → notes, NOT a line item.
+- If quantity is ambiguous (e.g. "thoda" / "some" / "kuch"), SKIP the
+  line — do not invent a number.
+- If the message is a question or complaint with no order, return an
+  empty line_items list and set overall_parse_confidence low.
+- JSON only.
+''';
+
+  static const String _handwrittenPrompt = r'''
+You are a parsing assistant for a wholesale distributor's order system.
+The input is a PHOTO of a handwritten order slip. Handwriting is often
+rushed, slanted, and may contain smudges or strikethroughs.
+
+OUTPUT FORMAT — STRICT JSON, NO PROSE, NO MARKDOWN FENCES:
+{
+  "customer": {
+    "name_as_written": "shop name from the header if visible, else empty",
+    "phone_if_present": "10-digit phone if visible, else null"
+  },
+  "delivery_date_hint": "string or null",
+  "notes": "anything not a line item",
+  "line_items": [
+    {
+      "name_as_written": "exact text as written; use ? for illegible characters",
+      "ean_code": null,
+      "quantity": 5,
+      "unit_hint": "pc | pcs | ladi | box | null",
+      "confidence": 0.55
+    }
+  ],
+  "overall_parse_confidence": 0.55
+}
+
+RULES:
+- If a character is illegible, use '?' in name_as_written and DROP the
+  line's confidence to 0.3-0.5.
+- Rows with a strikethrough are CANCELLED — SKIP them entirely.
+- If a quantity digit is ambiguous (e.g. could be 1 or 7, or 3 or 8),
+  emit the most likely integer AND set confidence ≤ 0.6.
+- Do NOT invent items that aren't physically on the page.
+- Do NOT hallucinate quantities for lines without a clear number.
+- JSON only.
+''';
+
   static const String _brandSoftwarePrompt = r'''
 You are a parsing assistant for a wholesale distributor's order system.
 Your job is to extract structured order data from a customer order pasted
@@ -536,21 +647,29 @@ RULES:
 - JSON only. No commentary.
 ''';
 
-  /// Parse brand-software text (GUBB-style) into a structured draft.
+  /// Parse a text paste into a structured draft. [inputType] picks the
+  /// prompt: 'brand_software_text' (GUBB/SCO structured) or 'whatsapp_text'
+  /// (casual mixed-language). Anything else falls back to whatsapp_text.
+  ///
   /// Returns null if Gemini is unreachable / API key missing / response
   /// unparseable. The caller surfaces an admin-facing error.
-  Future<SmartImportDraft?> parseBrandSoftwareText(String rawText) async {
+  Future<SmartImportDraft?> parseText(String rawText, String inputType) async {
     final key = await _getGeminiKey();
     if (key.isEmpty) {
       debugPrint('[SmartImport] GEMINI_API_KEY missing');
       return null;
     }
+    final prompt = switch (inputType) {
+      'brand_software_text' => _brandSoftwarePrompt,
+      'whatsapp_text' => _whatsappPrompt,
+      _ => _whatsappPrompt,
+    };
 
     final body = jsonEncode({
       'contents': [
         {
           'parts': [
-            {'text': _brandSoftwarePrompt},
+            {'text': prompt},
             {'text': 'INPUT:\n$rawText'},
           ],
         },
@@ -718,6 +837,7 @@ RULES:
     final prompt = switch (inputType) {
       'pdf' => _pdfPrompt,
       'image_screenshot' => _screenshotPrompt,
+      'image_handwritten' => _handwrittenPrompt,
       _ => _screenshotPrompt,
     };
 
@@ -806,6 +926,62 @@ RULES:
       debugPrint('[SmartImport] Gemini file parse failed: $e');
       return null;
     }
+  }
+
+  // ─── ALIAS ADMIN (list + delete) ─────────────────────────────────────
+
+  /// List product aliases for the team. Joined with products for display of
+  /// the matched product name; admin UI shows one row per alias.
+  /// [search] filters by alias_text substring (case-insensitive).
+  Future<List<Map<String, dynamic>>> listProductAliases({
+    required String teamId,
+    String? search,
+  }) async {
+    try {
+      var q = _client
+          .from('product_alias_learning')
+          .select('id, customer_id, alias_text, matched_product_id, '
+              'confidence_score, last_used_at, created_at, '
+              'products(name, sku), customers(name)')
+          .eq('team_id', teamId);
+      if (search != null && search.trim().isNotEmpty) {
+        q = q.ilike('alias_text', '%${search.trim().toLowerCase()}%');
+      }
+      final resp = await q.order('last_used_at', ascending: false).limit(200);
+      return (resp as List).map((r) => Map<String, dynamic>.from(r)).toList();
+    } catch (e) {
+      debugPrint('[SmartImport] listProductAliases failed: $e');
+      return [];
+    }
+  }
+
+  Future<List<Map<String, dynamic>>> listCustomerAliases({
+    required String teamId,
+    String? search,
+  }) async {
+    try {
+      var q = _client
+          .from('customer_alias_learning')
+          .select('id, alias_text, matched_customer_id, confidence_score, '
+              'last_used_at, created_at, customers(name, phone)')
+          .eq('team_id', teamId);
+      if (search != null && search.trim().isNotEmpty) {
+        q = q.ilike('alias_text', '%${search.trim().toLowerCase()}%');
+      }
+      final resp = await q.order('last_used_at', ascending: false).limit(200);
+      return (resp as List).map((r) => Map<String, dynamic>.from(r)).toList();
+    } catch (e) {
+      debugPrint('[SmartImport] listCustomerAliases failed: $e');
+      return [];
+    }
+  }
+
+  Future<void> deleteProductAlias(String id) async {
+    await _client.from('product_alias_learning').delete().eq('id', id);
+  }
+
+  Future<void> deleteCustomerAlias(String id) async {
+    await _client.from('customer_alias_learning').delete().eq('id', id);
   }
 
   // ─── HELPERS ─────────────────────────────────────────────────────────
