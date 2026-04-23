@@ -80,9 +80,11 @@ class _AdminCustomersTabState extends State<AdminCustomersTab> {
     setState(() {
       _displayLimit = 200;
       _filtered = _customers.where((c) {
-        // Team filter
-        if (_teamFilter == 'JA' && !c.belongsToTeam('JA')) return false;
-        if (_teamFilter == 'MA' && !c.belongsToTeam('MA')) return false;
+        // Team filter — tolerant: customer counts as "in team X" if EITHER
+        // the team flag is set OR a beat is assigned for that team. Mirrors
+        // the rep-side view so admin sees the same customers the reps see.
+        if (_teamFilter == 'JA' && !(c.belongsToTeam('JA') || c.beatIdForTeam('JA') != null)) return false;
+        if (_teamFilter == 'MA' && !(c.belongsToTeam('MA') || c.beatIdForTeam('MA') != null)) return false;
         if (_teamFilter == 'Unassigned') {
           final hasTeam = c.belongsToTeam('JA') || c.belongsToTeam('MA');
           final hasBeat = c.beatIdForTeam('JA') != null || c.beatIdForTeam('MA') != null;
@@ -912,13 +914,19 @@ class _BeatInfoRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final jaBeat = customer.belongsToTeam('JA') ? customer.beatNameForTeam('JA') : '';
-    final maBeat = customer.belongsToTeam('MA') ? customer.beatNameForTeam('MA') : '';
+    // Show beat info if EITHER team flag is set OR a beat is assigned.
+    // Some customers have beat_id_* filled from ACMAST sync but team_*
+    // flag not flipped (stale data or RLS-blocked upsert). Without this
+    // fallback, reps see the customer on their beat but admin couldn't.
+    final inJa = customer.belongsToTeam('JA') || customer.beatIdForTeam('JA') != null;
+    final inMa = customer.belongsToTeam('MA') || customer.beatIdForTeam('MA') != null;
+    final jaBeat = inJa ? customer.beatNameForTeam('JA') : '';
+    final maBeat = inMa ? customer.beatNameForTeam('MA') : '';
     final parts = <String>[];
-    if (customer.belongsToTeam('JA')) {
+    if (inJa) {
       parts.add('JA: ${jaBeat.isNotEmpty ? jaBeat : 'Unassigned'}');
     }
-    if (customer.belongsToTeam('MA')) {
+    if (inMa) {
       parts.add('MA: ${maBeat.isNotEmpty ? maBeat : 'Unassigned'}');
     }
     if (parts.isEmpty) parts.add('No team assigned');

@@ -409,19 +409,7 @@ class PdfService {
                     3: pw.Alignment.centerRight,
                     4: pw.Alignment.centerRight,
                   },
-                  data: items.map((item) {
-                    final product = item['products'] ?? {};
-                    final price = item['unit_price'] ?? item['price_per_unit'] ?? 0.0;
-                    final mrp = item['mrp'] ?? product['mrp'] ?? 0.0;
-                    final total = item['line_total'] ?? item['total_price'] ?? 0.0;
-                    return [
-                      product['name'] ?? item['product_name'] ?? 'Unknown Item',
-                      item['quantity'].toString(),
-                      mrp > 0 ? 'Rs. ${mrp.toStringAsFixed(2)}' : '-',
-                      'Rs. ${price.toStringAsFixed(2)}',
-                      'Rs. ${total.toStringAsFixed(2)}',
-                    ];
-                  }).toList(),
+                  data: _invoiceRows(items),
                 )
               else
                 pw.Text('No items found in this order.', style: const pw.TextStyle(color: PdfColors.red)),
@@ -490,6 +478,38 @@ class PdfService {
       bytes: await pdf.save(),
       filename: 'MAJAA_Invoice_$orderId.pdf',
     );
+  }
+
+  /// Flattens order_items into table rows. A line with `free_qty > 0`
+  /// expands to two rows: the paid line + a "FREE: N × item (SCHEME)"
+  /// zero-rate line, matching DUA's printed invoice layout.
+  static List<List<String>> _invoiceRows(List<dynamic> items) {
+    final rows = <List<String>>[];
+    for (final item in items) {
+      final product = item['products'] ?? {};
+      final name = product['name'] ?? item['product_name'] ?? 'Unknown Item';
+      final price = item['unit_price'] ?? item['price_per_unit'] ?? 0.0;
+      final mrp = item['mrp'] ?? product['mrp'] ?? 0.0;
+      final total = item['line_total'] ?? item['total_price'] ?? 0.0;
+      rows.add([
+        name.toString(),
+        item['quantity'].toString(),
+        mrp > 0 ? 'Rs. ${mrp.toStringAsFixed(2)}' : '-',
+        'Rs. ${price.toStringAsFixed(2)}',
+        'Rs. ${total.toStringAsFixed(2)}',
+      ]);
+      final freeQty = (item['free_qty'] as num?)?.toInt() ?? 0;
+      if (freeQty > 0) {
+        rows.add([
+          '   ↳ FREE: $name (SCHEME)',
+          freeQty.toString(),
+          '-',
+          'Rs. 0.00',
+          'Rs. 0.00',
+        ]);
+      }
+    }
+    return rows;
   }
 
   // ─── OUTSTANDING REPORT (Areawise — exact billing software format) ──────────

@@ -49,6 +49,7 @@ class _AdminBeatOrdersTabState extends State<AdminBeatOrdersTab> {
         offset: 0,
         forceRefresh: true,
       );
+      if (!mounted) return;
       final pending = orders.where((o) => o.status.toLowerCase() == 'pending').toList();
       final beatSet = pending.map((o) => o.beat).where((b) => b.isNotEmpty).toSet().toList()..sort();
       setState(() {
@@ -62,6 +63,7 @@ class _AdminBeatOrdersTabState extends State<AdminBeatOrdersTab> {
         _applyBeatFilter();
       });
     } catch (e) {
+      if (!mounted) return;
       setState(() { _error = e.toString(); _loading = false; });
     }
   }
@@ -127,7 +129,11 @@ class _AdminBeatOrdersTabState extends State<AdminBeatOrdersTab> {
                   onPressed: () async {
                     Navigator.pop(ctx);
                     try {
-                      await _service.updateOrderStatus(order.id, s, isSuperAdmin: _isSuperAdmin);
+                      await _service.updateOrderStatus(
+                        order.id, s,
+                        isSuperAdmin: _isSuperAdmin,
+                        teamId: _selectedTeamFilter,
+                      );
                       setState(() {
                         final idx = _allPendingOrders.indexWhere((o) => o.id == order.id);
                         if (idx != -1) {
@@ -411,10 +417,31 @@ class _AdminBeatOrdersTabState extends State<AdminBeatOrdersTab> {
     int success = 0;
     for (final id in ids) {
       try {
-        await _service.updateOrderStatus(id, newStatus, isSuperAdmin: _isSuperAdmin);
+        // Pass _selectedTeamFilter so the update's team_id filter matches
+        // the team whose orders the admin is viewing. Without this, admin
+        // logged in as JA but bulk-updating MA via filter chip would see
+        // the .eq('team_id', 'JA') check reject every MA row silently.
+        await _service.updateOrderStatus(
+          id, newStatus,
+          isSuperAdmin: _isSuperAdmin,
+          teamId: _selectedTeamFilter,
+        );
         success++;
       } catch (_) {}
     }
+    // After the bulk loop: wipe ALL order-related caches for the affected
+    // team so dashboards, analytics, and customer history reflect the bulk
+    // change immediately. updateOrderStatus only clears `recent_orders`
+    // per-call, which leaves analytics + per-customer order history stale
+    // (painful on web where IndexedDB survives page refreshes).
+    try {
+      await _service.invalidateAllOrderCaches(teamId: _selectedTeamFilter);
+      if (_selectedTeamFilter != AuthService.currentTeam) {
+        // Admin may have been viewing MA orders while authed as JA — clear
+        // JA side too so their own dashboards don't stick on old numbers.
+        await _service.invalidateAllOrderCaches(teamId: AuthService.currentTeam);
+      }
+    } catch (_) {}
     setState(() {
       if (newStatus.toLowerCase() != 'pending') {
         _allPendingOrders.removeWhere((o) => ids.contains(o.id));

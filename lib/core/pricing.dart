@@ -109,9 +109,18 @@ class CsdsRule {
 class CsdsPricing {
   CsdsPricing._();
 
-  /// Master on/off switch. When false, [priceFor] returns a breakdown with
-  /// no discount applied (just baseRate × qty). Flip to true per-team after
-  /// smoke-testing. Default false — safer for production.
+  /// Hard kill-switch. When true, [priceFor] short-circuits to the no-rule
+  /// path regardless of [enabled] or per-team SharedPreferences flags.
+  /// Settings toggles are disabled in the UI and show a banner.
+  ///
+  /// Currently ON (2026-04-22) — user paused CSDS rollout to tackle
+  /// open questions (COMPANY semantics, D2/D4, display-path mismatch).
+  /// Flip back to false when ready to resume. See
+  /// `reference_csds_working.md` for the re-enable checklist.
+  static const bool kForcedOff = true;
+
+  /// Per-team feature flag, loaded from SharedPreferences at order-save.
+  /// Ignored when [kForcedOff] is true.
   static bool enabled = false;
 
   /// In-memory cache of rules keyed by team. Populated on first load; refresh
@@ -169,6 +178,66 @@ class CsdsPricing {
     return best;
   }
 
+  /// Pure-math breakdown computation — no Supabase, no flag. Exposed so
+  /// unit tests can verify the cascade against known-good DUA numbers.
+  /// Pass rule=null for the "no discount" path; pass a rule to apply the
+  /// cascade. [ignoreFlag] skips the enabled-check so tests don't have to
+  /// toggle global state.
+  static CsdsPriceBreakdown computeBreakdown({
+    required double baseRate,
+    required int qty,
+    required double taxPercent,
+    CsdsRule? rule,
+  }) {
+    if (qty <= 0 || baseRate <= 0) {
+      return CsdsPriceBreakdown(
+        baseRate: baseRate,
+        rule: null,
+        paidQty: qty < 0 ? 0 : qty,
+        freeQty: 0,
+        taxable: 0,
+        netRate: baseRate,
+        tax: 0,
+        lineTotal: 0,
+      );
+    }
+    final d1 = rule?.discPer ?? 0;
+    final d3 = rule?.discPer3 ?? 0;
+    final d5 = rule?.discPer5 ?? 0;
+    final sch = rule?.schemePer ?? 0;
+    // Multiplicative cascade (verified against Y206 ITTR real lines).
+    final taxable = baseRate *
+        qty *
+        (1 - d1 / 100.0) *
+        (1 - d3 / 100.0) *
+        (1 - d5 / 100.0);
+    final netRate = taxable / qty;
+    final vat = rule?.vatPerOverride ?? taxPercent;
+    final tax = taxable * vat / 100.0;
+    final freeQty = (qty * sch / 100.0).round();
+    return CsdsPriceBreakdown(
+      baseRate: baseRate,
+      rule: rule,
+      paidQty: qty,
+      freeQty: freeQty,
+      taxable: taxable,
+      netRate: netRate,
+      tax: tax,
+      lineTotal: taxable + tax,
+    );
+  }
+
+  /// Expose rule-matching as a pure function too — tests pass a list of
+  /// rules directly instead of hitting Supabase.
+  static CsdsRule? pickRule(
+    List<CsdsRule> rules, {
+    required String customerId,
+    required String company,
+    String itemGroup = '',
+  }) =>
+      _pickRule(rules,
+          customerId: customerId, company: company, itemGroup: itemGroup);
+
   /// Compute final price for one order line.
   ///
   /// [baseRate] = pre-discount per-unit rate (from `products.unit_price` or
@@ -189,20 +258,10 @@ class CsdsPricing {
     String? teamId,
   }) async {
     final t = teamId ?? AuthService.currentTeam;
-    // Feature flag — bypass cascade entirely.
-    if (!enabled || qty <= 0 || baseRate <= 0) {
-      final taxable = baseRate * qty;
-      final tax = taxable * taxPercent / 100.0;
-      return CsdsPriceBreakdown(
-        baseRate: baseRate,
-        rule: null,
-        paidQty: qty,
-        freeQty: 0,
-        taxable: taxable,
-        netRate: baseRate,
-        tax: tax,
-        lineTotal: taxable + tax,
-      );
+    // Hard kill-switch OR per-team feature flag — bypass cascade entirely.
+    if (kForcedOff || !enabled || qty <= 0 || baseRate <= 0) {
+      return computeBreakdown(
+          baseRate: baseRate, qty: qty, taxPercent: taxPercent, rule: null);
     }
     final rules = await _rulesFor(t);
     final rule = _pickRule(
@@ -211,29 +270,11 @@ class CsdsPricing {
       company: company,
       itemGroup: itemGroup,
     );
-    final d1 = rule?.discPer ?? 0;
-    final d3 = rule?.discPer3 ?? 0;
-    final d5 = rule?.discPer5 ?? 0;
-    final sch = rule?.schemePer ?? 0;
-    // Multiplicative cascade (verified against Y206 ITTR real lines).
-    final taxable = baseRate *
-        qty *
-        (1 - d1 / 100.0) *
-        (1 - d3 / 100.0) *
-        (1 - d5 / 100.0);
-    final netRate = qty > 0 ? taxable / qty : baseRate;
-    final vat = rule?.vatPerOverride ?? taxPercent;
-    final tax = taxable * vat / 100.0;
-    final freeQty = (qty * sch / 100.0).round();
-    return CsdsPriceBreakdown(
+    return computeBreakdown(
       baseRate: baseRate,
+      qty: qty,
+      taxPercent: taxPercent,
       rule: rule,
-      paidQty: qty,
-      freeQty: freeQty,
-      taxable: taxable,
-      netRate: netRate,
-      tax: tax,
-      lineTotal: taxable + tax,
     );
   }
 }

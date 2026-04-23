@@ -102,15 +102,20 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
       setState(() {
         if (_isMergedView) {
           // Merged multi-beat mode: show customers from all today's beats
-          // Each beat may be a different team, so check per-beat team
+          // Each beat may be a different team, so check per-beat team.
+          // Include ordering-beat overrides — same OR semantics as the
+          // single-beat branch below, otherwise a customer whose admin-set
+          // order-beat points at one of today's beats gets skipped.
           final seenIds = <String>{};
           final merged = <CustomerModel>[];
           for (final b in _beats) {
             if (_activeBeatFilter != null && b.id != _activeBeatFilter) continue;
             for (final c in customers) {
               if (seenIds.contains(c.id)) continue;
-              final bid = c.beatIdForTeam(b.teamId);
-              if (bid == b.id) {
+              final primary = c.beatIdForTeam(b.teamId);
+              final orderOverride = c.orderBeatIdOverrideForTeam(b.teamId);
+              if (primary == b.id ||
+                  (orderOverride != null && orderOverride == b.id)) {
                 merged.add(c);
                 seenIds.add(c.id);
               }
@@ -258,10 +263,16 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
 
     // In merged view, set team context based on customer's beat
     if (_isMergedView) {
-      // Collect all distinct teams this customer belongs to across today's beats
+      // Collect all distinct teams this customer belongs to across today's beats.
+      // Match either the primary (ACMAST) beat OR the manual ordering-beat
+      // override — same OR semantics as the list filter above. Without the
+      // override check, override-only customers (primary elsewhere, override
+      // on today's beat) silently fail to open when tapped.
       final customerTeams = <String>[];
       for (final b in _beats) {
-        if (customer.beatIdForTeam(b.teamId) == b.id && !customerTeams.contains(b.teamId)) {
+        final matches = customer.beatIdForTeam(b.teamId) == b.id ||
+            customer.orderBeatIdOverrideForTeam(b.teamId) == b.id;
+        if (matches && !customerTeams.contains(b.teamId)) {
           customerTeams.add(b.teamId);
         }
       }
@@ -621,12 +632,15 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
                                 children: [
                                   Icon(Icons.star_rounded, size: 12, color: Colors.amber.shade800),
                                   const SizedBox(width: 3),
-                                  Text(
-                                    _brandLabel,
-                                    style: GoogleFonts.manrope(
-                                      fontSize: 10,
-                                      fontWeight: FontWeight.w700,
-                                      color: Colors.amber.shade900,
+                                  Flexible(
+                                    child: Text(
+                                      _brandLabel,
+                                      style: GoogleFonts.manrope(
+                                        fontSize: 10,
+                                        fontWeight: FontWeight.w700,
+                                        color: Colors.amber.shade900,
+                                      ),
+                                      overflow: TextOverflow.ellipsis,
                                     ),
                                   ),
                                 ],

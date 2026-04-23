@@ -4,8 +4,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:fluttertoast/fluttertoast.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../../core/pricing.dart';
 import '../../services/supabase_service.dart';
 import '../../services/auth_service.dart';
 import '../../services/cart_service.dart';
@@ -209,26 +211,87 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
     double totalGst = 0;
     int totalUnits = 0;
 
-    final List<Map<String, dynamic>> itemsJson = cartItems.map((item) {
-        final lineTotal = item.product.unitPrice * item.quantity;
-        final gst = (lineTotal * item.product.gstRate * 100).round() / 100;
+    // Load the per-team CSDS flag once and flip the global switch so every
+    // priceFor() in this submission uses the same setting. Default OFF (safe);
+    // admin enables per team from Settings once smoke-tested.
+    final prefs = await SharedPreferences.getInstance();
+    CsdsPricing.enabled =
+        prefs.getBool('csds_enabled_${AuthService.currentTeam}') ?? false;
 
-        subtotal += lineTotal;
-        totalGst += gst;
-        totalUnits += item.quantity;
+    // Build line items. When CsdsPricing.enabled is true we route each line
+    // through priceFor() so the customer's DUA-synced discount cascade is
+    // applied. When OFF the breakdown still returns a valid result (just
+    // rate × qty + GST), so the same code path handles both modes.
+    // Track the worst/best outcome across lines for the order-level audit
+    // flag so admin can answer "why did this order come out this way?"
+    // without re-running the cascade.
+    bool anyRuleMatched = false;
+    bool anyScheme = false;
+    bool anyMissingBrand = false;
+    final List<Map<String, dynamic>> itemsJson = [];
+    for (final item in cartItems) {
+      final product = item.product;
+      // Fetch latest product to get ITEM-enriched fields (item_group,
+      // vat_per, maybe company). Cart's Product model is a snapshot at
+      // add-time so pricing decisions need fresh values.
+      final fresh = CsdsPricing.enabled
+          ? await SupabaseService.instance.getProductById(product.id)
+          : null;
+      // CSDS.COMPANY field = brand name. products.category is the
+      // authoritative brand (populated at product creation or from ITMRP
+      // stock sync). fresh.company (ITEM master) is same data but only
+      // present after an ITEM sync has run — use as fallback only so the
+      // CsdsPricing path works before ITEM sync lands.
+      final brand = (fresh?.category.isNotEmpty ?? false)
+          ? fresh!.category
+          : (fresh?.company ?? product.category);
+      final itemGroup = fresh?.itemGroup ?? '';
+      final taxPercent = fresh != null && fresh.totalTaxPercent > 0
+          ? fresh.totalTaxPercent
+          : product.gstRate * 100;
 
-        return {
-          'order_id': _orderNumber,
-          'product_id': item.product.id,
-          'product_name': item.product.name,
-          'sku': item.product.sku,
-          'quantity': item.quantity,
-          'unit_price': item.product.unitPrice,
-          'mrp': item.product.mrp,
-          'line_total': lineTotal,
-          'gst_rate': item.product.gstRate,
-        };
-      }).toList();
+      final breakdown = await CsdsPricing.priceFor(
+        baseRate: product.unitPrice,
+        qty: item.quantity,
+        taxPercent: taxPercent,
+        customerId: _selectedCustomer!.id,
+        company: brand,
+        itemGroup: itemGroup,
+      );
+
+      if (CsdsPricing.enabled) {
+        if (brand.isEmpty) {
+          anyMissingBrand = true;
+        } else if (breakdown.rule != null) {
+          anyRuleMatched = true;
+          if (breakdown.freeQty > 0) anyScheme = true;
+        }
+      }
+
+      final lineTotal = breakdown.taxable;
+      final gst = (breakdown.tax * 100).round() / 100;
+
+      subtotal += lineTotal;
+      totalGst += gst;
+      totalUnits += item.quantity;
+
+      itemsJson.add({
+        'order_id': _orderNumber,
+        'product_id': product.id,
+        'product_name': product.name,
+        'sku': product.sku,
+        'quantity': item.quantity,
+        'unit_price': breakdown.netRate, // discount-applied per-unit rate
+        'mrp': product.mrp,
+        'line_total': lineTotal,
+        'gst_rate': taxPercent / 100.0,
+        // Discount/scheme metadata — null when no CSDS rule matched.
+        if (breakdown.rule != null) 'csds_disc_per': breakdown.rule!.discPer,
+        if (breakdown.rule != null) 'csds_disc_per_3': breakdown.rule!.discPer3,
+        if (breakdown.rule != null) 'csds_disc_per_5': breakdown.rule!.discPer5,
+        if (breakdown.freeQty > 0) 'free_qty': breakdown.freeQty,
+      });
+    }
 
     final grandTotal = subtotal + totalGst;
 
@@ -237,6 +300,20 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
       if (_isEditing) {
         await SupabaseService.instance.deleteOrder(_orderNumber);
         CartService.instance.editingOrderId = null;
+      }
+
+      // Summarise the cascade outcome for admin drilldown.
+      String csdsStatus;
+      if (!CsdsPricing.enabled) {
+        csdsStatus = 'flag_off';
+      } else if (anyScheme) {
+        csdsStatus = 'scheme_matched';
+      } else if (anyRuleMatched) {
+        csdsStatus = 'rule_matched';
+      } else if (anyMissingBrand) {
+        csdsStatus = 'no_brand';
+      } else {
+        csdsStatus = 'no_rule';
       }
 
       await SupabaseService.instance.createOrder(
@@ -253,6 +330,7 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
         notes: _notesController.text,
         items: itemsJson,
         isOutOfBeat: CartService.instance.isOutOfBeat,
+        csdsStatus: csdsStatus,
       );
 
       await SupabaseService.instance.updateCustomerLastOrder(
@@ -649,6 +727,12 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
                       totalUnits: totalUnits,
                       totalLines: cartItems.length,
                     ),
+                    // Hint appears only when the CSDS flag is ON for this
+                    // team. The preview here multiplies raw unit_price ×
+                    // qty; the saved order runs through CsdsPricing and
+                    // can come out lower. Warn so the rep doesn't quote a
+                    // pre-discount number.
+                    const _CsdsPreSaveHint(),
                     const SizedBox(height: 32),
                   ],
                 ),
@@ -682,5 +766,53 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
         },
       ),
     ));
+  }
+}
+
+/// Shows "CSDS applies on Save" under the totals card only when the flag
+/// is ON for the current team. Silently hides when OFF so the hint never
+/// distracts reps on teams that aren't using the cascade yet.
+class _CsdsPreSaveHint extends StatefulWidget {
+  const _CsdsPreSaveHint();
+
+  @override
+  State<_CsdsPreSaveHint> createState() => _CsdsPreSaveHintState();
+}
+
+class _CsdsPreSaveHintState extends State<_CsdsPreSaveHint> {
+  bool? _on;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    setState(() =>
+        _on = prefs.getBool('csds_enabled_${AuthService.currentTeam}') ?? false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_on != true) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(top: 6),
+      child: Row(children: [
+        Icon(Icons.info_outline_rounded, size: 12, color: AppTheme.onSurfaceVariant),
+        const SizedBox(width: 6),
+        Expanded(
+          child: Text(
+            'Pre-discount. CSDS cascade applies on Save — final invoice may be lower.',
+            style: GoogleFonts.manrope(
+                fontSize: 11,
+                color: AppTheme.onSurfaceVariant,
+                fontStyle: FontStyle.italic),
+          ),
+        ),
+      ]),
+    );
   }
 }

@@ -99,6 +99,7 @@ class DriveSyncService {
         'OPUBL (Prior-Year Opening Bills)': syncOpeningBillsFromDrive,
         'LEDGER (Transactions)': syncLedgerFromDrive,
         'CSDS (Customer Discount Schemes)': syncCustomerDiscountSchemesFromDrive,
+        'ITEM (Item Master)': syncItemMasterFromDrive,
         'ITBNO (Item Batches)': syncItemBatchesFromDrive,
         'IBOOK (Bill Books)': syncBillBooksFromDrive,
         'BILLED_COLLECTED (Outstanding)': syncBilledCollectedFromDrive,
@@ -905,6 +906,9 @@ class DriveSyncService {
       //    - Safety: rate must not exceed MRP (prevents billing loss)
       //    - Company: from the row with highest stock
       final Map<String, Map<String, dynamic>> mergedRows = {};
+      // Surface any ITMRP rows where RATE > MRP (we cap silently for safety
+      // but surface to admin so the DUA typo gets fixed at source).
+      final List<Map<String, dynamic>> mrpCapWarnings = [];
       for (final entry in allRows.entries) {
         final rows = entry.value;
         // Total stock = sum of ALL rows (including different MRPs)
@@ -918,7 +922,20 @@ class DriveSyncService {
         // If rate is 0/negative, don't include it — preserve existing DB price
         double? finalRate;
         if (pickedRate > 0) {
-          finalRate = (pickedMrp > 0 && pickedRate > pickedMrp) ? pickedMrp : pickedRate;
+          final rateExceedsMrp = pickedMrp > 0 && pickedRate > pickedMrp;
+          finalRate = rateExceedsMrp ? pickedMrp : pickedRate;
+          if (rateExceedsMrp) {
+            mrpCapWarnings.add({
+              'itemName': picked['itemName'],
+              'company': picked['company'],
+              'mrp': pickedMrp,
+              'rate': pickedRate,
+              'capped_to': pickedMrp,
+              'qty': picked['qty'],
+            });
+            debugPrint('⚠️ StockSync MRP-CAP: "${picked['itemName']}" [${picked['company']}] '
+                'DUA rate=$pickedRate > MRP=$pickedMrp — capped to MRP');
+          }
         }
         if (rows.length > 1) {
           debugPrint('📊 StockSync merge "${picked['itemName']}": ${rows.length} rows, '
@@ -1031,6 +1048,15 @@ class DriveSyncService {
         await SupabaseService.instance.invalidateCache('products');
       }
 
+      // Persist stock-sync timestamp so the dashboard can warn when the
+      // rep's `unit_price` values are getting stale vs fresh CSDS rules.
+      try {
+        final box = Hive.isBoxOpen('app_settings')
+            ? Hive.box('app_settings')
+            : await Hive.openBox('app_settings');
+        await box.put('last_itmrp_sync', DateTime.now().toIso8601String());
+      } catch (_) {}
+
       // Pending changes kept in lastStockSyncResult (in-memory), not Hive
 
       final result = StockSyncResult(
@@ -1042,11 +1068,13 @@ class DriveSyncService {
         newProducts: newProducts,
         priceChanges: priceChanges,
         mrpUpdated: mrpUpdated,
+        mrpCapWarnings: mrpCapWarnings,
       );
       lastStockSyncResult = result;
       debugPrint('✅ StockSync: Done — ${result.matched} matched, $updated updated, '
           '$mrpUpdated MRP updated, ${unmatched.length} unmatched, '
-          '${newProducts.length} new products, ${priceChanges.length} price changes pending');
+          '${newProducts.length} new products, ${priceChanges.length} price changes pending, '
+          '${mrpCapWarnings.length} MRP-cap warnings');
       return result;
     } catch (e) {
       debugPrint('❌ StockSync error: $e');
@@ -2891,17 +2919,33 @@ final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false).conv
   /// Determine team from filename suffix.
   /// JA files: 07, 08, 09 (single-digit range, < 10)
   /// MA files: 11, 12, 13 (double-digit range, >= 10)
+  ///
+  /// Returns a known team or logs loudly + defaults to JA. Previously this
+  /// silently defaulted on unparseable filenames, which would misroute every
+  /// row of a renamed DUA export into one team. The loud log lets admins
+  /// catch it the first time a new naming scheme lands.
   String _teamFromSuffix(String filename) {
-    // Extract the numeric suffix just before the file extension
-    // e.g. BILLED_COLLECTED207.csv → 207 → last 2 digits → 07
-    // ITMRP07.csv → 07, ITTR11.csv → 11
-    final noExt = filename.split('.').first; // remove .csv
+    final noExt = filename.split('.').first;
     final match = RegExp(r'(\d+)$').firstMatch(noExt);
-    if (match == null) return 'JA';
+    if (match == null) {
+      debugPrint('⚠️ teamFromSuffix: "$filename" has no numeric suffix — defaulting to JA. '
+          'Rename the file or map the new suffix before trusting this team split.');
+      return 'JA';
+    }
     final suffix = match.group(1)!;
-    // Take last 2 digits as the team suffix (07, 08, 09 = JA; 11, 12, 13 = MA)
-    final teamDigits = suffix.length > 2 ? suffix.substring(suffix.length - 2) : suffix;
-    final n = int.tryParse(teamDigits) ?? 7;
+    final teamDigits =
+        suffix.length > 2 ? suffix.substring(suffix.length - 2) : suffix;
+    final n = int.tryParse(teamDigits);
+    if (n == null) {
+      debugPrint('⚠️ teamFromSuffix: "$filename" has non-numeric suffix "$teamDigits" — defaulting to JA.');
+      return 'JA';
+    }
+    // Accept known year-code ranges; anything else is flagged but still mapped
+    // by range to avoid blowing up production sync.
+    if (n >= 7 && n <= 9) return 'JA';
+    if (n >= 11 && n <= 13) return 'MA';
+    debugPrint('⚠️ teamFromSuffix: "$filename" suffix $n outside known JA (07–09) or MA (11–13) ranges. '
+        'Mapping by < 10 rule but this likely means a new FY — update the range.');
     return n < 10 ? 'JA' : 'MA';
   }
 
@@ -3388,9 +3432,14 @@ final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false).conv
 
   bool _isCsdsSyncing = false;
 
+  /// Set on each successful CSDS sync so admin can see skipped acc_codes.
+  /// Resets to null at the start of the next sync. Empty list = no skips.
+  List<String>? lastCsdsSkippedAccCodes;
+
   Future<void> syncCustomerDiscountSchemesFromDrive() async {
     if (_isCsdsSyncing) return;
     _isCsdsSyncing = true;
+    final skippedAccCodes = <String>{};
     try {
       await _ensureFolderIds();
       final headers = await GoogleDriveAuthService.instance.authHeaders();
@@ -3443,15 +3492,25 @@ final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false).conv
           if (row.length <= acCodeI) continue;
           final acCode = row[acCodeI].toString().trim();
           final custId = lookup[acCode];
-          if (custId == null) { skippedAcc++; continue; }
+          if (custId == null) {
+            skippedAcc++;
+            if (acCode.isNotEmpty) skippedAccCodes.add('$team/$acCode');
+            continue;
+          }
 
           final schemePer = double.tryParse(_col(row, schemeI)) ?? 0;
           final disc1 = double.tryParse(_col(row, disc1I)) ?? 0;
           final disc3 = double.tryParse(_col(row, disc3I)) ?? 0;
           final disc5 = double.tryParse(_col(row, disc5I)) ?? 0;
           final vatOverride = double.tryParse(_col(row, vatI));
-          // Skip all-zero rules
-          if (schemePer == 0 && disc1 == 0 && disc3 == 0 && disc5 == 0 && vatOverride == null) continue;
+          final itemGroup = _col(row, itemGroupI);
+          // Skip all-zero rules — but only when item_group is empty.
+          // An explicit item-group row with all-zero is a legitimate OVERRIDE
+          // (e.g. "10% on GOYAL company-wide, EXCEPT LAFZ group = 0%"). If we
+          // dropped that zero row, the company-wide 10% rule would wrongly
+          // apply to LAFZ on the order screen.
+          if (schemePer == 0 && disc1 == 0 && disc3 == 0 && disc5 == 0 &&
+              vatOverride == null && itemGroup.isEmpty) continue;
 
           allRows.add({
             'customer_id': custId,
@@ -3494,12 +3553,156 @@ final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false).conv
         }
       }
       debugPrint('✅ CSDS: Done — $upserted rules upserted (${allRows.length} raw, ${deduped.length} deduped${failedBatches > 0 ? ", $failedBatches failed" : ""})');
+      if (skippedAccCodes.isNotEmpty) {
+        debugPrint('⚠️ CSDS: ${skippedAccCodes.length} distinct unmatched acc_codes — see Bill Verification → Data Changes');
+      }
+      lastCsdsSkippedAccCodes = skippedAccCodes.toList()..sort();
       // Invalidate in-memory rule cache so next priceFor() call re-fetches.
       CsdsPricing.invalidateCache();
     } catch (e) {
       debugPrint('❌ CSDS error: $e');
     } finally {
       _isCsdsSyncing = false;
+    }
+  }
+
+  // ─── ITEM (Master) SYNC ─────────────────────────────────────────────────────
+  //
+  // Enrich products with company, item_group, HSN, pack qty, tax rates.
+  // Source: ITEM07/11.csv (dua_export_all.py). Match by
+  // lower(trim(name)) against products.name. Never deletes; only updates
+  // metadata on matching rows. Invalidates CsdsPricing cache on success
+  // so the next priceFor() call uses fresh rule data (CSDS sync does too,
+  // but this path is also the one that first populates company/item_group
+  // on the matching product rows).
+  //
+  // Blocker for CsdsPricing.priceFor() item-group matching — without
+  // company/item_group filled in on products, only company-wide (or no-op)
+  // rules apply.
+
+  bool _isItemMasterSyncing = false;
+
+  Future<void> syncItemMasterFromDrive() async {
+    if (_isItemMasterSyncing) return;
+    _isItemMasterSyncing = true;
+    try {
+      await _ensureFolderIds();
+      final headers = await GoogleDriveAuthService.instance.authHeaders();
+      if (headers.isEmpty) return;
+      if (dataUploadFolderId == null || dataUploadFolderId!.isEmpty) return;
+
+      final files = await _findFilesByPrefix(headers, dataUploadFolderId!, 'ITEM');
+      if (files.isEmpty) { debugPrint('⚠️ ITEM: No files found'); return; }
+
+      final dbClient = SupabaseService.instance.client;
+
+      // Pull current product name/id/team index once — match is by
+      // lower(trim(name)) scoped to team. Cheaper than per-row fetch.
+      final allProdRows = await dbClient.from('products').select('id, name, team_id');
+      final Map<String, String> productIdByKey = {}; // "JA|lower(name)" → id
+      for (final r in (allProdRows as List)) {
+        final id = r['id'] as String?;
+        final name = (r['name'] as String? ?? '').toLowerCase().trim();
+        final team = r['team_id'] as String? ?? 'JA';
+        if (id != null && name.isNotEmpty) {
+          productIdByKey['$team|$name'] = id;
+        }
+      }
+
+      int totalUpdated = 0, totalSkippedUnmatched = 0, totalRows = 0;
+
+      for (final file in files) {
+        final fileName = file['name'] ?? '';
+        final team = _teamFromSuffix(fileName);
+        debugPrint('📄 ITEM: Processing $fileName as $team');
+
+        final csv = await _downloadFile(headers, file['id']!);
+        if (csv == null || csv.isEmpty) continue;
+        final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false)
+            .convert(csv.replaceAll('\r\n', '\n').replaceAll('\r', '\n'));
+        if (rows.isEmpty) continue;
+        final hdr = _parseHeaders(rows.first);
+
+        final itemNameI = hdr['ITEMNAME'] ?? -1;
+        final companyI = hdr['COMPANY'] ?? -1;
+        final itemGroupI = hdr['ITEMGROUP'] ?? -1;
+        final hsnI = hdr['HSN'] ?? hdr['HSNCODE'] ?? -1;
+        final packqtyI = hdr['PACKQTY'] ?? -1;
+        final vatI = hdr['VATPER'] ?? -1;
+        final satI = hdr['SATPER'] ?? -1;
+        final cstI = hdr['CSTPER'] ?? -1;
+        final cessI = hdr['CESSPER'] ?? -1;
+        final taxOnMrpI = hdr['TAXONMRP'] ?? -1;
+
+        if (itemNameI < 0) {
+          debugPrint('⚠️ ITEM: $fileName missing ITEMNAME — skip');
+          continue;
+        }
+
+        // Batch updates per product_id. Supabase has no multi-row update-by-id
+        // primitive, so we batch .update().eq() calls but stream them in groups
+        // to cap concurrency.
+        final List<Future<void>> pending = [];
+        int fileUpdated = 0, fileUnmatched = 0;
+
+        for (int i = 1; i < rows.length; i++) {
+          final row = rows[i];
+          if (row.length <= itemNameI) continue;
+          totalRows++;
+          final itemName = row[itemNameI].toString().trim();
+          if (itemName.isEmpty) continue;
+          final key = '$team|${itemName.toLowerCase()}';
+          final productId = productIdByKey[key];
+          if (productId == null) {
+            fileUnmatched++;
+            continue;
+          }
+
+          final update = <String, dynamic>{
+            'company': _col(row, companyI),
+            'item_group': _col(row, itemGroupI),
+            'hsn': _col(row, hsnI),
+          };
+          final pq = int.tryParse(_col(row, packqtyI));
+          if (pq != null) update['packqty'] = pq;
+          final vat = double.tryParse(_col(row, vatI));
+          if (vat != null) update['vat_per'] = vat;
+          final sat = double.tryParse(_col(row, satI));
+          if (sat != null) update['sat_per'] = sat;
+          final cst = double.tryParse(_col(row, cstI));
+          if (cst != null) update['cst_per'] = cst;
+          final cess = double.tryParse(_col(row, cessI));
+          if (cess != null) update['cess_per'] = cess;
+          final tom = _col(row, taxOnMrpI);
+          if (tom.isNotEmpty) update['tax_on_mrp'] = tom;
+
+          pending.add(
+            dbClient.from('products').update(update).eq('id', productId).then((_) {
+              fileUpdated++;
+            }).catchError((e) {
+              debugPrint('⚠️ ITEM update failed for $itemName ($productId): $e');
+            }),
+          );
+
+          // Cap concurrency at 25.
+          if (pending.length >= 25) {
+            await Future.wait(pending);
+            pending.clear();
+          }
+        }
+        if (pending.isNotEmpty) await Future.wait(pending);
+
+        debugPrint('📊 ITEM: $fileName — $fileUpdated updated, $fileUnmatched unmatched');
+        totalUpdated += fileUpdated;
+        totalSkippedUnmatched += fileUnmatched;
+      }
+
+      debugPrint('✅ ITEM: Done — $totalUpdated products enriched ($totalRows CSV rows, $totalSkippedUnmatched unmatched by name)');
+      CsdsPricing.invalidateCache();
+    } catch (e) {
+      debugPrint('❌ ITEM error: $e');
+    } finally {
+      _isItemMasterSyncing = false;
     }
   }
 
@@ -3777,6 +3980,11 @@ class StockSyncResult {
   /// MRP changes detected (auto-applied)
   final int mrpUpdated;
 
+  /// Rows where ITMRP RATE > MRP — capped silently, but surfaced here so
+  /// admin can chase the DUA-side typo. Each entry:
+  /// { itemName, company, mrp, rate, capped_to, qty }
+  final List<Map<String, dynamic>> mrpCapWarnings;
+
   StockSyncResult({
     this.matched = 0,
     this.unmatched = 0,
@@ -3787,12 +3995,14 @@ class StockSyncResult {
     this.newProducts = const [],
     this.priceChanges = const [],
     this.mrpUpdated = 0,
+    this.mrpCapWarnings = const [],
   });
 
   bool get hasError => error != null;
 
   /// Whether there are pending changes needing admin review in Data Changes tab
-  bool get hasPendingChanges => newProducts.isNotEmpty || priceChanges.isNotEmpty;
+  bool get hasPendingChanges =>
+      newProducts.isNotEmpty || priceChanges.isNotEmpty || mrpCapWarnings.isNotEmpty;
 }
 
 /// Result of a bill sync operation.

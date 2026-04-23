@@ -195,6 +195,44 @@ class SupabaseService {
     }
   }
 
+  /// Invalidate EVERY order-related cache key for a given team.
+  ///
+  /// The granular `invalidateCache('recent_orders')` only clears one key.
+  /// Bulk operations like "update 20 orders' status" must also wipe:
+  ///   - `recent_orders_{team}`               (orders tab list)
+  ///   - `analytics*_{team}`                  (dashboard KPIs + sales-by-beat charts)
+  ///   - `customer_orders_{customerId}_{team}` (customer detail history, 60-min TTL)
+  ///
+  /// Without this, admin performs a bulk action and the dashboard keeps
+  /// showing the pre-update totals until the TTL expires or the app
+  /// restarts — painful on web where IndexedDB persists across refreshes.
+  ///
+  /// Pass [teamId] when the affected team differs from the signed-in team
+  /// (e.g. admin is on JA but bulk-updating MA orders via the team filter).
+  Future<void> invalidateAllOrderCaches({String? teamId}) async {
+    final team = teamId ?? AuthService.currentTeam;
+    final boxName = 'cache_$team';
+    if (!Hive.isBoxOpen(boxName)) return;
+    final box = Hive.box(boxName);
+    // Snapshot the keys first — deleting while iterating breaks the Iterator.
+    final keysToDelete = <dynamic>[];
+    for (final k in box.keys) {
+      final ks = k.toString();
+      if (ks.startsWith('recent_orders_') ||
+          ks.startsWith('analytics_') ||
+          ks.startsWith('analytics_my_') ||
+          ks.startsWith('customer_orders_')) {
+        keysToDelete.add(k);
+      }
+    }
+    for (final k in keysToDelete) {
+      await box.delete(k);
+    }
+    if (keysToDelete.isNotEmpty) {
+      debugPrint('[invalidateAllOrderCaches] team=$team, cleared ${keysToDelete.length} cache key(s)');
+    }
+  }
+
   /// Full data refresh for sales/delivery reps.
   /// Clears all local cached data. On re-fetch, only last 60 days of
   /// orders/collections are loaded from Supabase (older data stays in DB
@@ -483,7 +521,10 @@ class SupabaseService {
       final now = DateTime.now();
       final startOfMonth = DateTime(now.year, now.month, 1).toIso8601String();
       final endOfMonth = DateTime(now.year, now.month + 1, 0, 23, 59, 59).toIso8601String();
-      final userId = client.auth.currentUser?.id;
+      final authUid = client.auth.currentUser?.id;
+      // Resolve auth.uid → app_users.id so "old" users (whose auth.uid ≠
+      // app_users.id) still match rows written with the resolved id.
+      final userId = authUid == null ? null : await _resolveAppUserId(authUid);
       final bool brandScoped = allowedBrands != null && allowedBrands.isNotEmpty;
 
       // Cache key must distinguish brand scope + team scope so different
@@ -567,8 +608,13 @@ class SupabaseService {
     required double vat, required double grandTotal, required int itemCount,
     required int totalUnits, required String notes, required List<Map<String, dynamic>> items,
     bool isOutOfBeat = false,
+    String? csdsStatus,
   }) async {
-    final userId = client.auth.currentUser?.id;
+    final authUid = client.auth.currentUser?.id;
+    // Resolve to app_users.id so "old" users' orders are attributed correctly.
+    // Without this, getOrdersByDate's .eq('user_id', authUid) would return
+    // nothing for the rep who placed the order.
+    final userId = authUid == null ? null : await _resolveAppUserId(authUid);
 
     // 1. Insert the main order
     await client.from('orders').upsert({
@@ -588,6 +634,7 @@ class SupabaseService {
       'notes': notes.isEmpty ? null : notes,
       'team_id': AuthService.currentTeam, // Blueprint Filter
       'is_out_of_beat': isOutOfBeat,
+      if (csdsStatus != null) 'csds_status': csdsStatus,
     });
 
     // 2. Insert the line items
@@ -619,7 +666,8 @@ class SupabaseService {
       return;
     }
 
-    final uid = client.auth.currentUser?.id;
+    final authUid = client.auth.currentUser?.id;
+    final uid = authUid == null ? null : await _resolveAppUserId(authUid);
     String repName = client.auth.currentUser?.email ?? 'Offline Rep';
     if (uid != null) {
       final ur = await client.from('app_users').select('full_name').eq('id', uid).maybeSingle();
@@ -687,12 +735,14 @@ class SupabaseService {
     // A bare "HH:MM:SS" string causes "invalid input syntax for type timestamp with time zone"
     // when the column type is timestamptz (Supabase default).
     final visitTime = now.toIso8601String();
+    final authUid = client.auth.currentUser?.id;
+    final userId = authUid == null ? null : await _resolveAppUserId(authUid);
     await client.from('visit_logs').insert({
       'customer_id': customerId,
       'beat_id': beatId,
       'reason': reason,
       'rep_email': client.auth.currentUser?.email ?? '',
-      'user_id': client.auth.currentUser?.id,
+      'user_id': userId,
       'visit_date': visitDate,
       'visit_time': visitTime,
       'notes': notes ?? '',
@@ -774,7 +824,8 @@ class SupabaseService {
     final teamId = AuthService.currentTeam;
 
     // Resolve rep name for collected_by
-    final userId = client.auth.currentUser?.id;
+    final authUid = client.auth.currentUser?.id;
+    final userId = authUid == null ? null : await _resolveAppUserId(authUid);
     String repName = client.auth.currentUser?.email ?? '';
     if (userId != null) {
       final userRow = await client.from('app_users').select('full_name').eq('id', userId).maybeSingle();
@@ -1338,6 +1389,23 @@ class SupabaseService {
     return List<Map<String, dynamic>>.from(data);
   }
 
+  /// Get unallocated advance balances (customer_advances) for a team.
+  /// Includes both CN-origin and receipt-origin advances — rendering code
+  /// distinguishes by cross-referencing rectvno against customer_credit_notes.
+  Future<List<Map<String, dynamic>>> getCustomerAdvancesForTeam({String? teamId}) async {
+    final data = await client.from('customer_advances').select()
+        .eq('team_id', teamId ?? AuthService.currentTeam);
+    return List<Map<String, dynamic>>.from(data);
+  }
+
+  /// Get per-row credit notes for a team. Used to label ADV lines in the
+  /// Outstanding PDF ("CR NOTE-23" vs generic "ADVANCE").
+  Future<List<Map<String, dynamic>>> getCustomerCreditNotesForTeam({String? teamId}) async {
+    final data = await client.from('customer_credit_notes').select()
+        .eq('team_id', teamId ?? AuthService.currentTeam);
+    return List<Map<String, dynamic>>.from(data);
+  }
+
   /// Get receipts for a customer from customer_receipts table (RECT data).
   Future<List<Map<String, dynamic>>> getCustomerReceipts(String customerId, {bool repOnly = false, String? teamId}) async {
     var query = client.from('customer_receipts').select()
@@ -1399,10 +1467,33 @@ class SupabaseService {
   }
 
   Future<void> deleteCustomer(String id) async {
-    // Delete team profile first (FK dependency), then customer
+    // Cascade delete every row that references this customer. Children first
+    // (to satisfy FKs), then the profile, then the customer row itself.
+    // Previously only customer_team_profiles + customers were removed, leaving
+    // orphans in 7 other tables that broke exports, re-sync, and outstanding
+    // calculations when the same acc_code was re-linked later.
+    final childTables = [
+      'orders',
+      'collections',
+      'visit_logs',
+      'customer_billed_items',
+      'customer_receipt_bills',
+      'customer_receipts',
+      'customer_bills',
+    ];
+    for (final table in childTables) {
+      try {
+        await client.from(table).delete().eq('customer_id', id);
+      } catch (e) {
+        debugPrint('⚠️ deleteCustomer: cascade delete from $table failed for $id: $e');
+        rethrow;
+      }
+    }
     await client.from('customer_team_profiles').delete().eq('customer_id', id);
     await client.from('customers').delete().eq('id', id);
     await invalidateCache('customers');
+    await invalidateCache('orders');
+    debugPrint('🗑️ deleteCustomer: removed $id and cascaded ${childTables.length} child tables');
   }
 
   Future<void> updateCustomerLastOrder(String customerId, double orderValue) async {
@@ -1420,13 +1511,20 @@ class SupabaseService {
   // ─── 📦 ORDER MANAGEMENT ───
 
   /// Throws if the order is older than 3 days, unless isSuperAdmin is true.
-  Future<void> _assertEditWindow(String orderId, {bool isSuperAdmin = false}) async {
+  ///
+  /// [teamId] lets the caller specify which team the order belongs to —
+  /// needed when an admin is authenticated as one team but editing orders
+  /// from another via the team filter chip. Defaults to
+  /// `AuthService.currentTeam` when omitted (existing single-team callers
+  /// are unaffected).
+  Future<void> _assertEditWindow(String orderId, {bool isSuperAdmin = false, String? teamId}) async {
     if (isSuperAdmin) return;
+    final team = teamId ?? AuthService.currentTeam;
     final response = await client
         .from('orders')
         .select('order_date')
         .eq('id', orderId)
-        .eq('team_id', AuthService.currentTeam)
+        .eq('team_id', team)
         .maybeSingle();
     if (response == null) throw Exception('Order not found');
     final orderDate = DateTime.parse(response['order_date'] as String);
@@ -1453,12 +1551,17 @@ class SupabaseService {
     'Partially Delivered': ['Delivered', 'Cancelled'],
   };
 
-  Future<void> updateOrderStatus(String orderId, String newStatus, {bool isSuperAdmin = false}) async {
-    await _assertEditWindow(orderId, isSuperAdmin: isSuperAdmin);
+  /// Update order status. Pass [teamId] when the order belongs to a team
+  /// other than the signed-in team (admin bulk-editing via team filter).
+  /// Prior bug: hard-coded `AuthService.currentTeam` in the `.eq` filter
+  /// caused MA bulk updates to silently no-op when admin was logged in as JA.
+  Future<void> updateOrderStatus(String orderId, String newStatus, {bool isSuperAdmin = false, String? teamId}) async {
+    final team = teamId ?? AuthService.currentTeam;
+    await _assertEditWindow(orderId, isSuperAdmin: isSuperAdmin, teamId: team);
 
     // Validate status transition unless super admin
     if (!isSuperAdmin) {
-      final current = await client.from('orders').select('status').eq('id', orderId).eq('team_id', AuthService.currentTeam).maybeSingle();
+      final current = await client.from('orders').select('status').eq('id', orderId).eq('team_id', team).maybeSingle();
       if (current == null) throw Exception('Order not found');
       final currentStatus = current['status'] as String? ?? 'Pending';
       final allowed = _validStatusTransitions[currentStatus] ?? [];
@@ -1467,19 +1570,21 @@ class SupabaseService {
       }
     }
 
-    await client.from('orders').update({'status': newStatus}).eq('id', orderId).eq('team_id', AuthService.currentTeam);
+    await client.from('orders').update({'status': newStatus}).eq('id', orderId).eq('team_id', team);
     await invalidateCache('recent_orders');
   }
 
-  Future<void> deleteOrder(String orderId, {bool isSuperAdmin = false}) async {
-    await _assertEditWindow(orderId, isSuperAdmin: isSuperAdmin);
-    await client.from('orders').delete().eq('id', orderId).eq('team_id', AuthService.currentTeam);
+  Future<void> deleteOrder(String orderId, {bool isSuperAdmin = false, String? teamId}) async {
+    final team = teamId ?? AuthService.currentTeam;
+    await _assertEditWindow(orderId, isSuperAdmin: isSuperAdmin, teamId: team);
+    await client.from('orders').delete().eq('id', orderId).eq('team_id', team);
     await invalidateCache('recent_orders');
   }
 
   Future<List<Map<String, dynamic>>> getOrdersByDate(String dateString, {List<String>? teamIds}) async {
     try {
-      final userId = client.auth.currentUser?.id;
+      final authUid = client.auth.currentUser?.id;
+      final userId = authUid == null ? null : await _resolveAppUserId(authUid);
       final nextDay = DateTime.parse(dateString).add(const Duration(days: 1));
       final nextDayString = nextDay.toIso8601String().substring(0, 10);
 
@@ -2178,7 +2283,8 @@ class SupabaseService {
   }) async {
     if (allocations.isEmpty) return;
 
-    final uid = client.auth.currentUser?.id;
+    final authUid = client.auth.currentUser?.id;
+    final uid = authUid == null ? null : await _resolveAppUserId(authUid);
     String rName = client.auth.currentUser?.email ?? 'Offline Rep';
     if (uid != null) {
       final ur = await client
@@ -2239,21 +2345,22 @@ class SupabaseService {
 
       // Decrement — don't overwrite. Protects against two reps settling
       // concurrently on the same customer.
+      // customer_team_profiles is a single row per customer (no team_id
+      // column — team lives in column names outstanding_ja / outstanding_ma).
+      // Filtering by .eq('team_id', team) used to blow up as PostgREST 42703.
       final totalPaid = allocations.fold<double>(0, (s, a) => s + a.amount);
       final outCol = team == 'JA' ? 'outstanding_ja' : 'outstanding_ma';
       final profile = await client
           .from('customer_team_profiles')
           .select(outCol)
           .eq('customer_id', customerId)
-          .eq('team_id', team)
           .maybeSingle();
       final current = (profile?[outCol] as num?)?.toDouble() ?? 0;
       final next = (current - totalPaid).clamp(0, double.infinity).toDouble();
       await client
           .from('customer_team_profiles')
           .update({outCol: next})
-          .eq('customer_id', customerId)
-          .eq('team_id', team);
+          .eq('customer_id', customerId);
     } catch (e) {
       // Best-effort rollback of the collection rows we just wrote.
       for (final billNo in insertedBillKeys) {
@@ -2539,5 +2646,112 @@ class SupabaseService {
         .eq('is_active', true)
         .order('sort_order');
     return (response as List).map((e) => e['name'] as String).toList();
+  }
+
+  /// Read per-customer brand→billing-team routing (customer_brand_routing).
+  /// Returns customerId → 'JA' | 'MA'. Empty map means no customer has a
+  /// remembered decision yet — defaults apply.
+  Future<Map<String, String>> getBrandRouting({
+    required String brandName,
+    Iterable<String>? customerIds,
+  }) async {
+    try {
+      var q = client.from('customer_brand_routing')
+          .select('customer_id, billing_team_id')
+          .eq('brand_name', brandName);
+      if (customerIds != null && customerIds.isNotEmpty) {
+        q = q.inFilter('customer_id', customerIds.toList());
+      }
+      final rows = await q;
+      final out = <String, String>{};
+      for (final r in rows as List) {
+        final m = Map<String, dynamic>.from(r as Map);
+        final cid = m['customer_id'] as String?;
+        final team = m['billing_team_id'] as String?;
+        if (cid != null && team != null) out[cid] = team;
+      }
+      return out;
+    } catch (e) {
+      debugPrint('getBrandRouting error: $e');
+      return const {};
+    }
+  }
+
+  /// Upsert a set of per-customer routing decisions. Used when the admin
+  /// ticks "Remember these choices" on the Organic India picker.
+  /// Skips entries with blank customer ids. Throws on DB failure so the
+  /// caller can surface the problem — the export flow catches and toasts.
+  Future<void> upsertBrandRouting({
+    required String brandName,
+    required Map<String, String> decisions,
+  }) async {
+    if (decisions.isEmpty) return;
+    final payload = decisions.entries
+        .where((e) => e.key.isNotEmpty)
+        .map((e) => {
+              'customer_id': e.key,
+              'brand_name': brandName,
+              'billing_team_id': e.value,
+              'set_by_user_id': client.auth.currentUser?.id,
+              'set_at': DateTime.now().toUtc().toIso8601String(),
+            })
+        .toList();
+    if (payload.isEmpty) return;
+    await client
+        .from('customer_brand_routing')
+        .upsert(payload, onConflict: 'customer_id,brand_name');
+  }
+
+  /// Phase A.4 of ORDERS_EXPORT_OVERHAUL — calls the server-side RPC that:
+  /// (1) appends written line-item ids to each order's exported_line_item_ids,
+  /// (2) detects fully-exported orders, (3) optionally flips them to
+  /// Delivered, and (4) writes the audit row. Returns the batch UUID.
+  ///
+  /// Call this even on "cancel" with [markDelivered] = false so the line-item
+  /// tracking is persisted — future exports need the cumulative state.
+  Future<String?> finalizeExportBatch({
+    required List<String> orderIds,
+    required List<String> lineItemIdsWritten,
+    required bool markDelivered,
+    required Map<String, dynamic> batchMetadata,
+  }) async {
+    try {
+      final result = await client.rpc('finalize_export_batch', params: {
+        'p_order_ids': orderIds,
+        'p_line_item_ids_written': lineItemIdsWritten,
+        'p_mark_delivered': markDelivered,
+        'p_batch_metadata': batchMetadata,
+      });
+      return result?.toString();
+    } catch (e) {
+      debugPrint('finalizeExportBatch error: $e');
+      rethrow; // let caller decide whether to toast
+    }
+  }
+
+  /// Super-admin-only rollback of a previous export batch. Restores the
+  /// captured previous_statuses on orders and removes this batch's
+  /// line-item ids from each order's exported_line_item_ids array.
+  /// RPC raises on non-super_admin callers.
+  Future<void> undoExportBatch(String batchId) async {
+    await client.rpc('undo_export_batch', params: {'p_batch_id': batchId});
+  }
+
+  /// Recent export_batches rows, newest first. For the "Recent Exports" UI.
+  /// RLS restricts visibility to admin / super_admin.
+  Future<List<Map<String, dynamic>>> getRecentExportBatches({int limit = 20}) async {
+    try {
+      final rows = await client
+          .from('export_batches')
+          .select()
+          .order('exported_at', ascending: false)
+          .limit(limit);
+      return (rows as List)
+          .map((r) => Map<String, dynamic>.from(r as Map))
+          .toList();
+    } catch (e) {
+      debugPrint('getRecentExportBatches error: $e');
+      return [];
+    }
   }
 }

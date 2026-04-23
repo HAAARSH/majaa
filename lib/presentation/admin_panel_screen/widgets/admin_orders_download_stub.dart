@@ -21,6 +21,29 @@ Future<void> triggerCsvDownload(String csvContent, String filename) async {
   }
 }
 
+// Dual-team export: bundles both team CSVs into ONE share sheet so admin
+// picks a save destination once. Writing individual files then calling
+// triggerCsvDownload twice opens the share sheet twice and confuses reps.
+Future<void> triggerMultiCsvDownload(List<MapEntry<String, String>> files) async {
+  try {
+    final directory = await getTemporaryDirectory();
+    final xFiles = <XFile>[];
+    for (final entry in files) {
+      final file = File('${directory.path}/${entry.key}');
+      await file.writeAsString(entry.value);
+      xFiles.add(XFile(file.path, mimeType: 'application/vnd.ms-excel'));
+    }
+    await SharePlus.instance.share(
+      ShareParams(
+        files: xFiles,
+        text: 'Order Export: ${files.map((e) => e.key).join(', ')}',
+      ),
+    );
+  } catch (e) {
+    debugPrint('Error sharing CSVs: $e');
+  }
+}
+
 void triggerPdfDownload(Uint8List pdfBytes, String filename) {
   // On mobile/desktop, PDF is shared via Printing.sharePdf — handled in admin_orders_tab.dart
 }

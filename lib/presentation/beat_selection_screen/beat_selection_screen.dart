@@ -1933,19 +1933,29 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen>
       );
       final allCustomers = await SupabaseService.instance.getCustomers();
       final allBills = await SupabaseService.instance.getCustomerBillsForTeam();
+      final advances = await SupabaseService.instance.getCustomerAdvancesForTeam();
+      final creditNotes = await SupabaseService.instance.getCustomerCreditNotesForTeam();
 
-      // Fetch cross-team bills if cross-team beats detected
+      // Fetch cross-team bills + advances + CNs if cross-team beats detected
       List<Map<String, dynamic>>? crossBills;
+      List<Map<String, dynamic>>? crossAdvances;
+      List<Map<String, dynamic>>? crossCreditNotes;
       if (crossTeamId != null && crossBeatNames.isNotEmpty) {
         crossBills = await SupabaseService.instance.getCustomerBillsForTeam(teamId: crossTeamId);
+        crossAdvances = await SupabaseService.instance.getCustomerAdvancesForTeam(teamId: crossTeamId);
+        crossCreditNotes = await SupabaseService.instance.getCustomerCreditNotesForTeam(teamId: crossTeamId);
       }
 
       final filePath = await PdfService.generateOutstandingReportFile(
         customers: allCustomers, allBills: allBills, teamId: AuthService.currentTeam,
         beatNames: primaryBeatNames,
+        advances: advances,
+        creditNotes: creditNotes,
         crossTeamId: crossTeamId,
         crossTeamBills: crossBills,
         crossTeamBeatNames: crossBeatNames,
+        crossTeamAdvances: crossAdvances,
+        crossTeamCreditNotes: crossCreditNotes,
       );
       await SharePlus.instance.share(
         ShareParams(
@@ -2011,19 +2021,29 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen>
       }
       final allCustomers = await SupabaseService.instance.getCustomers();
       final allBills = await SupabaseService.instance.getCustomerBillsForTeam();
+      final advances = await SupabaseService.instance.getCustomerAdvancesForTeam();
+      final creditNotes = await SupabaseService.instance.getCustomerCreditNotesForTeam();
 
-      // Fetch cross-team bills if cross-team beats detected
+      // Fetch cross-team bills + advances + CNs if cross-team beats detected
       List<Map<String, dynamic>>? crossBills;
+      List<Map<String, dynamic>>? crossAdvances;
+      List<Map<String, dynamic>>? crossCreditNotes;
       if (crossTeamId != null && crossBeatNames.isNotEmpty) {
         crossBills = await SupabaseService.instance.getCustomerBillsForTeam(teamId: crossTeamId);
+        crossAdvances = await SupabaseService.instance.getCustomerAdvancesForTeam(teamId: crossTeamId);
+        crossCreditNotes = await SupabaseService.instance.getCustomerCreditNotesForTeam(teamId: crossTeamId);
       }
 
       final pdfBytes = await PdfService.generateOutstandingReportBytes(
         customers: allCustomers, allBills: allBills, teamId: AuthService.currentTeam,
         beatNames: primaryBeatNames,
+        advances: advances,
+        creditNotes: creditNotes,
         crossTeamId: crossTeamId,
         crossTeamBills: crossBills,
         crossTeamBeatNames: crossBeatNames,
+        crossTeamAdvances: crossAdvances,
+        crossTeamCreditNotes: crossCreditNotes,
       );
 
       if (isWeb) {

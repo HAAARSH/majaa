@@ -3,6 +3,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:hive_flutter/hive_flutter.dart';
 import 'package:intl/intl.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:csv/csv.dart';
@@ -337,6 +338,11 @@ class _AdminDashboardTabState extends State<AdminDashboardTab>
               // ── Header ────────────────────────────────────────
               _buildHeader(),
               const SizedBox(height: 12),
+
+              // Warn when ITMRP hasn't synced in >24h. Matters because
+              // CsdsPricing multiplies stale rates by fresh rules = wrong
+              // invoice. Banner hides itself when fresh or never-synced.
+              const _StaleItmrpBanner(),
 
               // Team scope picker — cross-team view by default.
               TeamFilterChips(
@@ -1218,6 +1224,76 @@ class _ChartToggleBtn extends StatelessWidget {
             size: 16,
             color: active ? Colors.grey.shade700 : Colors.grey.shade400),
       ),
+    );
+  }
+}
+
+/// Red banner that appears on the admin dashboard when the ITMRP stock
+/// sync is older than 24h. Shown silently — self-hides when fresh or
+/// when no sync has ever run. Matters because CsdsPricing multiplies
+/// products.unit_price (from ITMRP) by fresh CSDS rules; stale rate ×
+/// fresh discount = wrong invoice.
+class _StaleItmrpBanner extends StatefulWidget {
+  const _StaleItmrpBanner();
+
+  @override
+  State<_StaleItmrpBanner> createState() => _StaleItmrpBannerState();
+}
+
+class _StaleItmrpBannerState extends State<_StaleItmrpBanner> {
+  DateTime? _lastSync;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    try {
+      final box = Hive.isBoxOpen('app_settings')
+          ? Hive.box('app_settings')
+          : await Hive.openBox('app_settings');
+      final ts = box.get('last_itmrp_sync') as String?;
+      if (ts == null || !mounted) return;
+      setState(() => _lastSync = DateTime.tryParse(ts));
+    } catch (_) {}
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_lastSync == null) return const SizedBox.shrink();
+    final age = DateTime.now().difference(_lastSync!);
+    if (age.inHours < 24) return const SizedBox.shrink();
+    final hours = age.inHours;
+    final days = (hours / 24).floor();
+    final label = days > 0 ? '${days}d ${hours % 24}h ago' : '${hours}h ago';
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.red.shade50,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.red.shade200),
+      ),
+      child: Row(children: [
+        Icon(Icons.warning_amber_rounded, size: 20, color: Colors.red.shade700),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('Stale stock data — ITMRP synced $label',
+                  style: GoogleFonts.manrope(
+                      fontSize: 13, fontWeight: FontWeight.w800, color: Colors.red.shade900)),
+              Text(
+                "Rep prices come from ITMRP.RATE. Run Sync in Settings before relying on CSDS cascade numbers.",
+                style: GoogleFonts.manrope(fontSize: 11, color: Colors.red.shade700),
+              ),
+            ],
+          ),
+        ),
+      ]),
     );
   }
 }

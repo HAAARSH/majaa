@@ -438,7 +438,7 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
     final phonePresent = c.phone.isNotEmpty && c.phone != 'No Phone';
 
     return DefaultTabController(
-      length: _isBrandRep ? 2 : 5,
+      length: _isBrandRep ? 2 : 6,
       child: Scaffold(
         backgroundColor: AppTheme.background,
         appBar: AppBar(
@@ -474,6 +474,7 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
                   if (!_isBrandRep) const Tab(text: 'Billed'),
                   const Tab(text: 'Outstanding'),
                   if (!_isBrandRep) const Tab(text: 'Collections'),
+                  if (!_isBrandRep) const Tab(text: 'Statement'),
                   const Tab(text: 'Info'),
                 ],
               ),
@@ -485,6 +486,7 @@ class _CustomerDetailScreenState extends State<CustomerDetailScreen> {
                   if (!_isBrandRep) _buildBilledTab(),
                   _buildOutstandingTab(),
                   if (!_isBrandRep) _buildCollectionsTab(),
+                  if (!_isBrandRep) _StatementOfAccountTab(customer: c),
                   _buildInfoTab(c),
                 ],
               ),
@@ -2678,4 +2680,214 @@ class _UpiQrDialog extends StatelessWidget {
       ),
     );
   }
+}
+
+/// Statement of Account — chronological customer_ledger view for one
+/// customer. Debit/Credit columns and a running balance so reps can
+/// explain any "why do I owe X" question without opening DUA. Read-only;
+/// rows are synced from LEDGER CSV (drive_sync_service).
+class _StatementOfAccountTab extends StatefulWidget {
+  final CustomerModel customer;
+  const _StatementOfAccountTab({required this.customer});
+
+  @override
+  State<_StatementOfAccountTab> createState() => _StatementOfAccountTabState();
+}
+
+class _StatementOfAccountTabState extends State<_StatementOfAccountTab> {
+  bool _loading = true;
+  String? _error;
+  List<Map<String, dynamic>> _rows = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final client = SupabaseService.instance.client;
+      final data = await client
+          .from('customer_ledger')
+          .select('entry_date, book, bill_no, type, amount, narration, sno')
+          .eq('customer_id', widget.customer.id)
+          .eq('team_id', AuthService.currentTeam)
+          .order('entry_date')
+          .order('sno', nullsFirst: true);
+      if (!mounted) return;
+      setState(() {
+        _rows = List<Map<String, dynamic>>.from(data);
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = e.toString();
+        _loading = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading) return const Center(child: CircularProgressIndicator());
+    if (_error != null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            const Icon(Icons.error_outline_rounded, color: Colors.red, size: 36),
+            const SizedBox(height: 8),
+            Text('Failed to load statement', style: GoogleFonts.manrope(fontWeight: FontWeight.w700)),
+            const SizedBox(height: 4),
+            Text(_error!,
+                textAlign: TextAlign.center,
+                style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
+            const SizedBox(height: 12),
+            FilledButton.icon(
+              icon: const Icon(Icons.refresh_rounded, size: 16),
+              label: const Text('Retry'),
+              onPressed: _load,
+            ),
+          ]),
+        ),
+      );
+    }
+
+    if (_rows.isEmpty) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Text(
+            'No ledger entries yet.\nSync LEDGER to populate.',
+            textAlign: TextAlign.center,
+            style: GoogleFonts.manrope(fontSize: 13, color: AppTheme.onSurfaceVariant),
+          ),
+        ),
+      );
+    }
+
+    // Running balance. Ledger convention: type='D' (debit, customer owes
+    // more) → +amount; type='C' (credit, customer paid / CN) → −amount.
+    double running = 0;
+    double totalDebit = 0;
+    double totalCredit = 0;
+    final display = <Map<String, dynamic>>[];
+    for (final r in _rows) {
+      final type = (r['type'] as String? ?? '').toUpperCase();
+      final amt = (r['amount'] as num?)?.toDouble() ?? 0;
+      if (type == 'D') {
+        running += amt;
+        totalDebit += amt;
+      } else if (type == 'C') {
+        running -= amt;
+        totalCredit += amt;
+      }
+      display.add({...r, '_running': running});
+    }
+
+    return Column(children: [
+      Container(
+        padding: const EdgeInsets.all(12),
+        color: AppTheme.surfaceVariant,
+        child: Row(children: [
+          _summaryCell('Entries', '${display.length}', AppTheme.primary),
+          _summaryCell('Debit', '₹${_fmt(totalDebit)}', Colors.red),
+          _summaryCell('Credit', '₹${_fmt(totalCredit)}', Colors.green),
+          _summaryCell('Closing', '₹${_fmt(running)}',
+              running > 0 ? Colors.red : Colors.green),
+          IconButton(
+            icon: const Icon(Icons.refresh_rounded, size: 18),
+            onPressed: _load,
+            tooltip: 'Refresh',
+          ),
+        ]),
+      ),
+      Expanded(
+        child: SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: ConstrainedBox(
+            constraints: BoxConstraints(minWidth: MediaQuery.of(context).size.width),
+            child: DataTable(
+              headingRowColor: WidgetStatePropertyAll(AppTheme.surfaceVariant),
+              columnSpacing: 12,
+              horizontalMargin: 12,
+              columns: [
+                DataColumn(label: Text('Date', style: _h)),
+                DataColumn(label: Text('Narration', style: _h)),
+                DataColumn(label: Text('Debit', style: _h), numeric: true),
+                DataColumn(label: Text('Credit', style: _h), numeric: true),
+                DataColumn(label: Text('Balance', style: _h), numeric: true),
+              ],
+              rows: display.map((r) {
+                final date = r['entry_date'] as String? ?? '';
+                final type = (r['type'] as String? ?? '').toUpperCase();
+                final amt = (r['amount'] as num?)?.toDouble() ?? 0;
+                final bal = r['_running'] as double;
+                final book = r['book'] as String? ?? '';
+                final billNo = r['bill_no'] as String? ?? '';
+                final narr = r['narration'] as String? ?? '';
+                final ref = [book, billNo].where((s) => s.isNotEmpty).join('-');
+                final narrFull = [
+                  if (ref.isNotEmpty) ref,
+                  narr,
+                ].where((s) => s.isNotEmpty).join(' • ');
+                String fmtDate = date;
+                try {
+                  final d = DateTime.parse(date);
+                  fmtDate = DateFormat('dd.MM.yy').format(d);
+                } catch (_) {}
+                return DataRow(cells: [
+                  DataCell(Text(fmtDate,
+                      style: GoogleFonts.manrope(fontSize: 11, fontWeight: FontWeight.w600))),
+                  DataCell(SizedBox(
+                    width: 260,
+                    child: Text(narrFull,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: GoogleFonts.manrope(fontSize: 11)),
+                  )),
+                  DataCell(Text(type == 'D' ? _fmt(amt) : '',
+                      style: GoogleFonts.manrope(fontSize: 11, color: Colors.red.shade700))),
+                  DataCell(Text(type == 'C' ? _fmt(amt) : '',
+                      style: GoogleFonts.manrope(fontSize: 11, color: Colors.green.shade700))),
+                  DataCell(Text(_fmt(bal),
+                      style: GoogleFonts.manrope(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w700,
+                          color: bal > 0 ? Colors.red.shade800 : Colors.green.shade800))),
+                ]);
+              }).toList(),
+            ),
+          ),
+        ),
+      ),
+    ]);
+  }
+
+  Widget _summaryCell(String label, String value, Color color) {
+    return Expanded(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(label,
+              style: GoogleFonts.manrope(
+                  fontSize: 10, color: AppTheme.onSurfaceVariant, fontWeight: FontWeight.w600)),
+          const SizedBox(height: 2),
+          Text(value,
+              style: GoogleFonts.manrope(fontSize: 14, fontWeight: FontWeight.w800, color: color)),
+        ],
+      ),
+    );
+  }
+
+  String _fmt(double v) => v.toStringAsFixed(0);
+
+  TextStyle get _h => GoogleFonts.manrope(
+      fontSize: 11, fontWeight: FontWeight.w700, color: AppTheme.onSurfaceVariant);
 }

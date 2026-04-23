@@ -20,8 +20,13 @@ class EmptyStateWidget extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    // Some hosts (admin-panel tabs inside tight layouts, narrow dialogs)
+    // give this widget less than ~90px of height. The 88-px icon + title +
+    // description + optional button needs ~160-200 px. Wrap the content in
+    // a SingleChildScrollView so small containers just scroll instead of
+    // triggering a yellow-striped overflow error.
     return Center(
-      child: Padding(
+      child: SingleChildScrollView(
         padding: const EdgeInsets.all(32),
         child: Column(
           mainAxisSize: MainAxisSize.min,

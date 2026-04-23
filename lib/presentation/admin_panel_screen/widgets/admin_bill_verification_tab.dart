@@ -48,6 +48,13 @@ class _AdminBillVerificationTabState extends State<AdminBillVerificationTab> wit
   // Stock sync pending changes (new products + price changes from ITMRP)
   List<Map<String, dynamic>> _pendingNewProducts = [];
   List<Map<String, dynamic>> _pendingPriceChanges = [];
+  // MRP-cap warnings — RATE > MRP in ITMRP, capped at sync but surfaced here.
+  List<Map<String, dynamic>> _mrpCapWarnings = [];
+  // CSDS unmatched acc_codes — DUA has discount rules for these customers
+  // but we couldn't find them in customers.acc_code_{team}. Silent drop
+  // until now; admin fixes the mismatch (usually a newly-added customer in
+  // DUA whose ACMAST sync hasn't run yet, or a renamed acc_code).
+  List<String> _csdsSkippedAccCodes = [];
 
   // Customer sync pending changes (new + changed from ACMAST)
   List<Map<String, dynamic>> _pendingNewCustomers = [];
@@ -125,7 +132,12 @@ class _AdminBillVerificationTabState extends State<AdminBillVerificationTab> wit
       setState(() {
         _pendingNewProducts = List<Map<String, dynamic>>.from(result.newProducts);
         _pendingPriceChanges = List<Map<String, dynamic>>.from(result.priceChanges);
+        _mrpCapWarnings = List<Map<String, dynamic>>.from(result.mrpCapWarnings);
       });
+    }
+    final csdsSkips = DriveSyncService.instance.lastCsdsSkippedAccCodes;
+    if (csdsSkips != null && mounted) {
+      setState(() => _csdsSkippedAccCodes = List<String>.from(csdsSkips));
     }
   }
 
@@ -473,7 +485,7 @@ class _AdminBillVerificationTabState extends State<AdminBillVerificationTab> wit
               Tab(text: 'Returned (${_returnedOrders.length})'),
               const Tab(text: 'Upload PDF'),
               const Tab(text: 'Upload CSV'),
-              Tab(text: 'Data Changes (${_dataChanges.length + _pendingNewProducts.length + _pendingPriceChanges.length + _pendingNewCustomers.length + _pendingChangedCustomers.length + _accCodeMismatches.length})'),
+              Tab(text: 'Data Changes (${_dataChanges.length + _pendingNewProducts.length + _pendingPriceChanges.length + _mrpCapWarnings.length + _csdsSkippedAccCodes.length + _pendingNewCustomers.length + _pendingChangedCustomers.length + _accCodeMismatches.length})'),
               Tab(text: 'Item Match (${_unmatchedItems.length})'),
               Tab(text: 'Customers (${_unmatchedCustomers.length})'),
             ],
@@ -896,9 +908,9 @@ class _AdminBillVerificationTabState extends State<AdminBillVerificationTab> wit
   // ─── DATA CHANGES TAB ────────────────────────────────────────
 
   Widget _buildDataChangesTab() {
-    final hasStockChanges = _pendingNewProducts.isNotEmpty || _pendingPriceChanges.isNotEmpty;
+    final hasStockChanges = _pendingNewProducts.isNotEmpty || _pendingPriceChanges.isNotEmpty || _mrpCapWarnings.isNotEmpty;
     final hasCustomerChanges = _pendingNewCustomers.isNotEmpty || _pendingChangedCustomers.isNotEmpty;
-    final totalChanges = _dataChanges.length + _pendingNewProducts.length + _pendingPriceChanges.length + _pendingNewCustomers.length + _pendingChangedCustomers.length + _accCodeMismatches.length;
+    final totalChanges = _dataChanges.length + _pendingNewProducts.length + _pendingPriceChanges.length + _mrpCapWarnings.length + _csdsSkippedAccCodes.length + _pendingNewCustomers.length + _pendingChangedCustomers.length + _accCodeMismatches.length;
 
     if (totalChanges == 0) {
       return Center(child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
@@ -955,6 +967,22 @@ class _AdminBillVerificationTabState extends State<AdminBillVerificationTab> wit
               _buildSectionHeader('Price Changes from ITMRP', Icons.price_change_rounded, Colors.deepPurple, _pendingPriceChanges.length),
               const SizedBox(height: 6),
               ...List.generate(_pendingPriceChanges.length, (i) => _buildPriceChangeCard(i)),
+              const SizedBox(height: 16),
+            ],
+
+            // ── Stock Sync: MRP-cap warnings (RATE > MRP in DUA) ──
+            if (_mrpCapWarnings.isNotEmpty) ...[
+              _buildSectionHeader('MRP-Cap Warnings (Fix in DUA)', Icons.report_rounded, Colors.red.shade700, _mrpCapWarnings.length),
+              const SizedBox(height: 6),
+              ...List.generate(_mrpCapWarnings.length, (i) => _buildMrpCapCard(i)),
+              const SizedBox(height: 16),
+            ],
+
+            // ── CSDS: unmatched acc_codes (rules dropped at sync) ──
+            if (_csdsSkippedAccCodes.isNotEmpty) ...[
+              _buildSectionHeader('CSDS Rules for Unknown Customers', Icons.person_off_rounded, Colors.orange.shade800, _csdsSkippedAccCodes.length),
+              const SizedBox(height: 6),
+              _buildCsdsSkippedCard(),
               const SizedBox(height: 16),
             ],
 
@@ -1156,6 +1184,128 @@ class _AdminBillVerificationTabState extends State<AdminBillVerificationTab> wit
             label: Text('Update Price', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w600)),
             style: FilledButton.styleFrom(backgroundColor: Colors.deepPurple, padding: const EdgeInsets.symmetric(vertical: 8)),
           )),
+        ]),
+      ]),
+    );
+  }
+
+  // ── MRP-Cap Warning Card (RATE > MRP in DUA) ─────────────
+  Widget _buildMrpCapCard(int index) {
+    final item = _mrpCapWarnings[index];
+    final name = item['itemName'] as String? ?? '';
+    final company = item['company'] as String? ?? '';
+    final mrp = (item['mrp'] as num?)?.toDouble() ?? 0;
+    final rate = (item['rate'] as num?)?.toDouble() ?? 0;
+    final cappedTo = (item['capped_to'] as num?)?.toDouble() ?? 0;
+    final qty = item['qty'] as int? ?? 0;
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.red.shade50,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.red.shade200),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Icon(Icons.report_rounded, size: 18, color: Colors.red.shade700),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(name,
+                style: GoogleFonts.manrope(fontWeight: FontWeight.w700, fontSize: 13),
+                overflow: TextOverflow.ellipsis),
+          ),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+            decoration: BoxDecoration(color: Colors.red.shade700, borderRadius: BorderRadius.circular(6)),
+            child: Text('MRP CAP',
+                style: GoogleFonts.manrope(fontSize: 9, fontWeight: FontWeight.w800, color: Colors.white)),
+          ),
+        ]),
+        const SizedBox(height: 6),
+        Text(company,
+            style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
+        const SizedBox(height: 6),
+        Text(
+          'DUA rate ₹${rate.toStringAsFixed(2)} is ABOVE MRP ₹${mrp.toStringAsFixed(2)}. '
+          'Capped to ₹${cappedTo.toStringAsFixed(2)} on this sync to avoid over-MRP billing. '
+          'Fix the RATE in DUA at source.',
+          style: GoogleFonts.manrope(fontSize: 11, color: Colors.red.shade800, fontWeight: FontWeight.w600),
+        ),
+        const SizedBox(height: 4),
+        Text('Qty on hand: $qty',
+            style: GoogleFonts.manrope(fontSize: 10, color: AppTheme.onSurfaceVariant)),
+        const SizedBox(height: 8),
+        Row(children: [
+          Expanded(
+            child: OutlinedButton.icon(
+              onPressed: () {
+                setState(() => _mrpCapWarnings.removeAt(index));
+              },
+              icon: const Icon(Icons.visibility_off_rounded, size: 14),
+              label: Text('Dismiss',
+                  style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w600)),
+              style: OutlinedButton.styleFrom(
+                  foregroundColor: Colors.grey, padding: const EdgeInsets.symmetric(vertical: 8)),
+            ),
+          ),
+        ]),
+      ]),
+    );
+  }
+
+  // ── CSDS Skipped-AccCode Card ───────────────────────────────
+  Widget _buildCsdsSkippedCard() {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.orange.shade50,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.orange.shade200),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Icon(Icons.person_off_rounded, size: 18, color: Colors.orange.shade800),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text('${_csdsSkippedAccCodes.length} CSDS rules dropped',
+                style: GoogleFonts.manrope(fontWeight: FontWeight.w700, fontSize: 13)),
+          ),
+        ]),
+        const SizedBox(height: 6),
+        Text(
+          'DUA has discount rules keyed to these acc_codes, but they don\'t match any customer in Supabase. Common causes: a new DUA customer whose ACMAST sync hasn\'t pulled through, or a renamed acc_code. Run ACMAST sync first, then re-run CSDS.',
+          style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant),
+        ),
+        const SizedBox(height: 8),
+        Container(
+          constraints: const BoxConstraints(maxHeight: 140),
+          padding: const EdgeInsets.all(8),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(6),
+            border: Border.all(color: Colors.orange.shade100),
+          ),
+          child: SingleChildScrollView(
+            child: Text(
+              _csdsSkippedAccCodes.join('\n'),
+              style: GoogleFonts.robotoMono(fontSize: 10, color: Colors.orange.shade900),
+            ),
+          ),
+        ),
+        const SizedBox(height: 8),
+        Row(children: [
+          Expanded(
+            child: OutlinedButton.icon(
+              onPressed: () => setState(() => _csdsSkippedAccCodes = []),
+              icon: const Icon(Icons.close_rounded, size: 14),
+              label: Text('Dismiss',
+                  style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w600)),
+              style: OutlinedButton.styleFrom(
+                  foregroundColor: Colors.grey, padding: const EdgeInsets.symmetric(vertical: 8)),
+            ),
+          ),
         ]),
       ]),
     );

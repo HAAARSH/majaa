@@ -26,6 +26,12 @@ class OrderModel {
   final String source; // 'app' = sales rep order, 'office' = auto-created from ITTR
   final String? userId;
   final bool isOutOfBeat;
+  // Phase A of ORDERS_EXPORT_OVERHAUL: order_items.id (as TEXT) for each
+  // line item that has been written into an export CSV. When this array's
+  // cardinality equals lineItems.length (and both sides match), the order
+  // is "fully exported" and becomes eligible for auto-Delivered.
+  // Only written server-side via the finalize_export_batch RPC.
+  final List<String> exportedLineItemIds;
 
   const OrderModel({
     required this.id, this.customerId, required this.customerName, required this.beat,
@@ -36,6 +42,7 @@ class OrderModel {
     this.billPhotoUrl, this.verifiedByDelivery = false, this.verifiedByOffice = false,
     this.billVerified = false, this.preliminaryBillNo, this.preliminaryAmount,
     this.source = 'app', this.userId, this.isOutOfBeat = false,
+    this.exportedLineItemIds = const [],
   });
 
   factory OrderModel.fromJson(Map<String, dynamic> json) => OrderModel(
@@ -65,6 +72,10 @@ class OrderModel {
     source: json['source'] as String? ?? 'app',
     userId: json['user_id'] as String?,
     isOutOfBeat: json['is_out_of_beat'] as bool? ?? false,
+    exportedLineItemIds: (json['exported_line_item_ids'] as List?)
+            ?.map((e) => e.toString())
+            .toList() ??
+        const [],
   );
 
   OrderModel copyWithStatus(String newStatus) => OrderModel(
@@ -77,6 +88,7 @@ class OrderModel {
     verifiedByOffice: verifiedByOffice, billVerified: billVerified,
     preliminaryBillNo: preliminaryBillNo, preliminaryAmount: preliminaryAmount,
     source: source, userId: userId, isOutOfBeat: isOutOfBeat,
+    exportedLineItemIds: exportedLineItemIds,
   );
 
   bool get isOfficeBill => source == 'office';

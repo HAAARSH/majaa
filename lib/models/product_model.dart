@@ -31,6 +31,18 @@ class ProductModel {
 
   final String? subcategoryId;
 
+  // ITEM master enrichment (synced from ITEM07/11.csv).
+  // Needed for CsdsPricing.priceFor() item-group rule match + per-item tax.
+  final String? company;       // e.g. "GOYAL", "MAHAWAR"
+  final String? itemGroup;     // e.g. "LAFZ", "COLOR" — empty string = company-wide
+  final String? hsn;
+  final int? packqty;
+  final double? vatPer;
+  final double? satPer;
+  final double? cstPer;
+  final double? cessPer;
+  final String? taxOnMrp;      // 'Y' / 'N'
+
   const ProductModel({
     required this.id, required this.name, required this.sku, required this.category,
     required this.brand, required this.unitPrice, this.mrp = 0, required this.packSize,
@@ -38,6 +50,8 @@ class ProductModel {
     required this.semanticLabel, this.gstRate = 0.18, this.unit = 'pcs',
     this.stepSize = 1, required this.teamId, this.subcategoryId,
     this.billingName, this.printName,
+    this.company, this.itemGroup, this.hsn, this.packqty,
+    this.vatPer, this.satPer, this.cstPer, this.cessPer, this.taxOnMrp,
   });
 
   factory ProductModel.fromJson(Map<String, dynamic> json) => ProductModel(
@@ -60,6 +74,15 @@ class ProductModel {
     subcategoryId: json['subcategory_id'] as String?,
     billingName: json['billing_name'] as String?,
     printName: json['print_name'] as String?,
+    company: json['company'] as String?,
+    itemGroup: json['item_group'] as String?,
+    hsn: json['hsn'] as String?,
+    packqty: json['packqty'] as int?,
+    vatPer: (json['vat_per'] as num?)?.toDouble(),
+    satPer: (json['sat_per'] as num?)?.toDouble(),
+    cstPer: (json['cst_per'] as num?)?.toDouble(),
+    cessPer: (json['cess_per'] as num?)?.toDouble(),
+    taxOnMrp: json['tax_on_mrp'] as String?,
   );
 
   Map<String, dynamic> toJson() => {
@@ -70,7 +93,22 @@ class ProductModel {
     'subcategory_id': subcategoryId,
     'billing_name': billingName,
     'print_name': printName,
+    'company': company,
+    'item_group': itemGroup,
+    'hsn': hsn,
+    'packqty': packqty,
+    'vat_per': vatPer,
+    'sat_per': satPer,
+    'cst_per': cstPer,
+    'cess_per': cessPer,
+    'tax_on_mrp': taxOnMrp,
   };
+
+  /// Total tax rate from ITEM master (%). Sum of VATPER + SATPER + CESSPER.
+  /// Used by CsdsPricing when applying the cascade. Falls back to 0 when
+  /// ITEM sync hasn't populated the columns yet.
+  double get totalTaxPercent =>
+      (vatPer ?? 0) + (satPer ?? 0) + (cessPer ?? 0);
 }
 
 class ProductCategoryModel {

@@ -24,7 +24,16 @@ class ProductListItemWidget extends StatelessWidget {
       product.status != ProductStatus.discontinued;
 
   Future<void> _promptQuantity(BuildContext context, int current) async {
-    final controller = TextEditingController(text: current.toString());
+    final initialText = current.toString();
+    // Pre-select the existing qty so the first keystroke replaces it. Without
+    // this, tapping and typing "5" on an existing "1" produces "15" — and the
+    // rep can't type "0" or any fresh value without deleting first.
+    final controller = TextEditingController.fromValue(
+      TextEditingValue(
+        text: initialText,
+        selection: TextSelection(baseOffset: 0, extentOffset: initialText.length),
+      ),
+    );
     final result = await showDialog<int>(
       context: context,
       builder: (ctx) => StatefulBuilder(

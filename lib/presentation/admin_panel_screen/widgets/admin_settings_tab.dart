@@ -192,6 +192,7 @@ class _AdminSettingsTabState extends State<AdminSettingsTab> {
       await runStep('Opening Bills (OPUBL)', DriveSyncService.instance.syncOpeningBillsFromDrive);
       await runStep('Ledger (LEDGER)', DriveSyncService.instance.syncLedgerFromDrive);
       await runStep('Discount Schemes (CSDS)', DriveSyncService.instance.syncCustomerDiscountSchemesFromDrive);
+      await runStep('Item Master (ITEM)', DriveSyncService.instance.syncItemMasterFromDrive);
       await runStep('Item Batches (ITBNO)', DriveSyncService.instance.syncItemBatchesFromDrive);
       await runStep('Bill Books (IBOOK)', DriveSyncService.instance.syncBillBooksFromDrive);
       await runStep('Outstanding (BILLED_COLLECTED)', DriveSyncService.instance.syncBilledCollectedFromDrive);
@@ -937,3 +938,4 @@ class _SyncSummaryPanelState extends State<_SyncSummaryPanel> {
     );
   }
 }
+

@@ -274,6 +274,33 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
     // exported separately when the admin switches to the other team.
     Set<String>? teamProductIds,
     Set<String>? teamProductSkus,
+    // Phase C: Organic India per-customer routing override. When a customer
+    // has a remembered/picked decision in [organicIndiaRouting], their OI
+    // line items are routed to that team's CSV regardless of the product's
+    // home team. Customers with no decision fall back to the default
+    // product-catalog match (so OI products still go to their home team).
+    Set<String>? organicIndiaKeys,
+    Map<String, String>? organicIndiaRouting,
+    String? csvTeamId,
+    // Phase D: per-user role. brand_rep orders merge per-customer into a
+    // single invoice; sales_rep orders stay one-invoice-per-order. If this
+    // map is null or missing an entry, the order is treated as sales_rep
+    // (safe default — never merges).
+    Map<String, String>? userRoleMap,
+    // Phase D guard: customer → acc_code lookup for the CSV's team. When
+    // provided, orders for customers with NO acc_code in [csvTeamId] are
+    // skipped — their invoice would land in a billing system that doesn't
+    // recognize the customer. Without this, a JA-only customer's brand_rep
+    // orders could produce a merged MA invoice that DUA Clipper can't match.
+    Map<String, String>? customerAccCodeForCsvTeam,
+    // Phase E: mutable sink the builder appends to for each order_items.id
+    // that lands in this CSV (including every source id of a merged
+    // brand_rep row). Ids are captured here at build time and persisted
+    // server-side via the finalize_export_batch RPC after download.
+    List<String>? writtenLineItemIdsSink,
+    // Phase E: mutable sink for the order ids that had at least one line
+    // written. Needed as the RPC's p_order_ids parameter.
+    Set<String>? writtenOrderIdsSink,
   }) {
     final buffer = StringBuffer();
     const t = '\t';
@@ -285,31 +312,94 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
     const months = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
     final dateStr = '="${exportDate.day.toString().padLeft(2, '0')}-${months[exportDate.month - 1]}-${exportDate.year}"';
     final bool scoped = teamProductIds != null && teamProductIds.isNotEmpty;
-    bool itemBelongsToTeam(OrderItemModel item) {
+    final bool oiRoutingActive = organicIndiaKeys != null &&
+        organicIndiaKeys.isNotEmpty &&
+        organicIndiaRouting != null &&
+        csvTeamId != null;
+
+    bool itemBelongsToTeam(OrderItemModel item, String? customerId) {
       if (!scoped) return true;
+      // Phase C: if this line is Organic India AND the customer has a
+      // remembered/picked routing decision, that decision overrides the
+      // product's home team. Customers with no decision fall through to
+      // the default product-catalog match so OI still goes to its home team.
+      if (oiRoutingActive) {
+        final isOi = (item.productId != null &&
+                organicIndiaKeys.contains(item.productId)) ||
+            (item.sku.isNotEmpty && organicIndiaKeys.contains(item.sku));
+        if (isOi && customerId != null && organicIndiaRouting.containsKey(customerId)) {
+          return organicIndiaRouting[customerId] == csvTeamId;
+        }
+      }
       if (teamProductIds.contains(item.productId)) return true;
       if (teamProductSkus != null && item.sku.isNotEmpty && teamProductSkus.contains(item.sku)) return true;
       return false;
     }
-    int invoiceCounter = invoiceStartNum ?? 0;
+
+    // Phase D guard: customer must have an acc_code for the CSV's team.
+    // A missing or blank acc_code means this team's billing software does
+    // not know the customer — writing an invoice row for them would either
+    // fail the import or silently create a ghost customer in DUA Clipper.
+    // Applied at order level (not item level) so partial orders don't
+    // leak through.
+    bool customerInvoiceableHere(OrderModel o) {
+      if (customerAccCodeForCsvTeam == null) return true; // guard inactive
+      final cid = o.customerId;
+      if (cid == null || cid.isEmpty) return true; // can't verify → keep
+      final code = customerAccCodeForCsvTeam[cid];
+      return code != null && code.trim().isNotEmpty;
+    }
+
+    List<OrderItemModel> eligibleItemsOf(OrderModel o) {
+      if (!customerInvoiceableHere(o)) return const [];
+      return scoped
+          ? o.lineItems.where((i) => itemBelongsToTeam(i, o.customerId)).toList()
+          : o.lineItems.toList();
+    }
+
+    String cleanNotes(String? raw) =>
+        (raw ?? '').replaceAll(RegExp(r'[\r\n\t]+'), ' ').trim();
+
+    // ── Phase D: split orders by the ROLE of the rep who booked them ──
+    // brand_rep orders merge per-customer. sales_rep orders (and anything
+    // without a known role) keep one-invoice-per-order.
+    final salesRepOrders = <OrderModel>[];
+    final brandRepOrders = <OrderModel>[];
     for (final o in orders) {
-      // Skip entire order if scoped and no line items belong to the team.
-      final eligibleItems = scoped
-          ? o.lineItems.where(itemBelongsToTeam).toList()
-          : o.lineItems;
-      if (scoped && o.lineItems.isNotEmpty && eligibleItems.isEmpty) continue;
+      final uid = o.userId;
+      final role = (uid != null && userRoleMap != null) ? userRoleMap[uid] : null;
+      if (role == 'brand_rep') {
+        brandRepOrders.add(o);
+      } else {
+        salesRepOrders.add(o);
+      }
+    }
+
+    // Stable invoice order: sales_rep first (by date then id), then
+    // brand_rep groups (by customer_name).
+    salesRepOrders.sort((a, b) {
+      final d = a.orderDate.compareTo(b.orderDate);
+      return d != 0 ? d : a.id.compareTo(b.id);
+    });
+
+    int invoiceCounter = invoiceStartNum ?? 0;
+
+    // ── Part 1: sales_rep orders — one invoice per order (legacy path) ─
+    for (final o in salesRepOrders) {
+      final eligibleItems = eligibleItemsOf(o);
+      if (scoped && eligibleItems.isEmpty) continue;
 
       final invoiceNo = (invoicePrefix != null && invoiceStartNum != null)
           ? '$invoicePrefix${invoiceCounter++}'
           : '';
       final repName = (o.userId != null ? userNameMap[o.userId] : null) ?? '';
-      // Sanitize notes: replace newlines and tabs to prevent breaking rows
-      final notes = (o.notes ?? '').replaceAll(RegExp(r'[\r\n\t]+'), ' ').trim();
+      final notes = cleanNotes(o.notes);
 
       if (eligibleItems.isEmpty) {
         buffer.writeln(
           '$invoiceNo$t${o.id}$t$dateStr$t${o.customerName}${t}0$t$repName$t${t}0.00${t}0.00${t}0.00${t}0.00${t}0.00$t$notes',
         );
+        writtenOrderIdsSink?.add(o.id);
       } else {
         for (final item in eligibleItems) {
           final mrp = item.mrp > 0 ? item.mrp : (productMrpMap[item.productId] ?? productMrpMap[item.sku] ?? 0.0);
@@ -320,52 +410,294 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
           buffer.writeln(
             '$invoiceNo$t${o.id}$t$dateStr$t${o.customerName}$t${item.quantity}$t$repName$t$itemName$t${mrp.toStringAsFixed(2)}$t${currentUnitPrice.toStringAsFixed(2)}${t}0.00${t}0.00$t${grossAmount.toStringAsFixed(2)}$t$notes',
           );
+          final iid = item.id;
+          if (iid != null && iid.isNotEmpty) writtenLineItemIdsSink?.add(iid);
         }
+        writtenOrderIdsSink?.add(o.id);
+      }
+    }
+
+    // ── Part 2: brand_rep orders grouped per-customer into ONE invoice ─
+    // Key: customer_id when present, else id-fallback so null-customer
+    // orders don't silently collapse together.
+    final brandRepByCustomer = <String, List<OrderModel>>{};
+    for (final o in brandRepOrders) {
+      final key = (o.customerId != null && o.customerId!.isNotEmpty)
+          ? o.customerId!
+          : '__noid_${o.id}';
+      brandRepByCustomer.putIfAbsent(key, () => []).add(o);
+    }
+    final brandRepGroups = brandRepByCustomer.values.toList()
+      ..sort((a, b) => a.first.customerName.compareTo(b.first.customerName));
+
+    for (final group in brandRepGroups) {
+      // Collect eligible items across every order in this customer's group.
+      final allItems = <OrderItemModel>[];
+      final orderIds = <String>[];
+      final noteParts = <String>[];
+      for (final o in group) {
+        final eligible = eligibleItemsOf(o);
+        if (eligible.isEmpty) continue;
+        allItems.addAll(eligible);
+        orderIds.add(o.id);
+        writtenOrderIdsSink?.add(o.id);
+        // Every source line-item id gets tracked even though they collapse
+        // into fewer rows post-combine — the RPC's fully-exported check
+        // counts ids, not rows.
+        for (final it in eligible) {
+          final iid = it.id;
+          if (iid != null && iid.isNotEmpty) writtenLineItemIdsSink?.add(iid);
+        }
+        final n = cleanNotes(o.notes);
+        if (n.isNotEmpty) noteParts.add(n);
+      }
+      if (allItems.isEmpty) continue;
+
+      // Combine identical lines within the group (same product, same
+      // order-time unit price). Different prices stay as separate rows so
+      // price-change history is preserved on the merged invoice.
+      final combined = _combineBrandRepLines(allItems);
+
+      final invoiceNo = (invoicePrefix != null && invoiceStartNum != null)
+          ? '$invoicePrefix${invoiceCounter++}'
+          : '';
+      final customerName = group.first.customerName;
+      final orderIdList = orderIds.join(',');
+      final notesStr = noteParts.join('; ');
+
+      for (final line in combined) {
+        final item = line.representative;
+        final mrp = item.mrp > 0
+            ? item.mrp
+            : (productMrpMap[item.productId] ?? productMrpMap[item.sku] ?? 0.0);
+        // Merged rows use the order-time unit price (the grouping key) so
+        // the invoice reflects what was booked, not what the master price
+        // is today. Sum of stored line_totals is the gross for the row.
+        final unitPrice = item.unitPrice;
+        final itemName = productBillingNameMap[item.productId] ??
+            productBillingNameMap[item.sku] ??
+            item.productName;
+        final grossAmount = line.lineTotalSum > 0
+            ? line.lineTotalSum
+            : line.quantitySum * unitPrice;
+        buffer.writeln(
+          '$invoiceNo$t$orderIdList$t$dateStr$t$customerName$t${line.quantitySum}${t}Brand Rep$t$itemName$t${mrp.toStringAsFixed(2)}$t${unitPrice.toStringAsFixed(2)}${t}0.00${t}0.00$t${grossAmount.toStringAsFixed(2)}$t$notesStr',
+        );
       }
     }
 
     return buffer.toString();
   }
 
-  Future<void> _downloadCsv() async {
-    if (_filteredOrders.isEmpty) {
-      Fluttertoast.showToast(msg: 'No orders to export');
-      return;
+  /// Phase D: combine line items within a brand_rep customer group.
+  /// Items sharing the SAME (product_id OR sku) AND SAME unit_price
+  /// collapse into one row with summed quantity and summed line_total.
+  /// Different prices for the same product stay as separate rows to
+  /// preserve price-change history on the merged invoice.
+  List<_MergedBrandRepLine> _combineBrandRepLines(List<OrderItemModel> items) {
+    final buckets = <String, _MergedBrandRepLine>{};
+    final order = <String>[]; // keep insertion order for stable output
+    for (final it in items) {
+      final productKey = (it.productId != null && it.productId!.isNotEmpty)
+          ? 'p:${it.productId}'
+          : (it.sku.isNotEmpty ? 's:${it.sku}' : 'n:${it.productName}');
+      // 4-decimal rounding so float-jitter doesn't split what should merge.
+      final priceKey = it.unitPrice.toStringAsFixed(4);
+      final key = '$productKey|$priceKey';
+      final existing = buckets[key];
+      if (existing == null) {
+        buckets[key] = _MergedBrandRepLine(
+          representative: it,
+          quantitySum: it.quantity,
+          lineTotalSum: it.lineTotal,
+        );
+        order.add(key);
+      } else {
+        existing.quantitySum += it.quantity;
+        existing.lineTotalSum += it.lineTotal;
+      }
     }
+    return [for (final k in order) buckets[k]!];
+  }
 
-    // Exports must include every order matching the current date-range/team,
-    // not just the paginated slice currently on screen.
-    final fullyLoaded = await _ensureAllOrdersLoaded();
-    if (!fullyLoaded || !mounted) return;
-
-    // Step 1: Ask which order status to export
+  // Dual-team export (Phase B of ORDERS_EXPORT_OVERHAUL_PLAN).
+  // One click → TWO files: JA{DD}{MM}.xls and MA{DD}{MM}.xls.
+  // The UI team filter (_selectedTeamFilter) is intentionally IGNORED here
+  // — admin always gets both teams' invoices. Line items are routed to a
+  // team's CSV by the product's home team (via teamProductIds). Organic
+  // India per-customer routing is deferred to Phase C.
+  Future<void> _downloadCsv() async {
+    // ─── Step 1: status picker (unchanged semantics) ─────────────────────
     String exportStatus = 'Pending';
     final statusResult = await showDialog<String?>(
       context: context,
-      builder: (ctx) {
-        return StatefulBuilder(
-          builder: (ctx, setDialogState) => AlertDialog(
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-            title: Text('Export Orders', style: GoogleFonts.manrope(fontWeight: FontWeight.w800)),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text('Select which orders to export',
-                    style: GoogleFonts.manrope(fontSize: 13, color: AppTheme.onSurfaceVariant)),
-                const SizedBox(height: 12),
-                DropdownButtonFormField<String>(
-                  value: exportStatus,
-                  decoration: InputDecoration(
-                    labelText: 'Order Status',
-                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
-                    contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                  ),
-                  items: ['Pending', 'All', 'Delivered'].map((s) => DropdownMenuItem(value: s, child: Text(s))).toList(),
-                  onChanged: (v) {
-                    if (v != null) setDialogState(() => exportStatus = v);
-                  },
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          title: Text('Export Orders', style: GoogleFonts.manrope(fontWeight: FontWeight.w800)),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text('Select which orders to export (both teams)',
+                  style: GoogleFonts.manrope(fontSize: 13, color: AppTheme.onSurfaceVariant)),
+              const SizedBox(height: 12),
+              DropdownButtonFormField<String>(
+                value: exportStatus,
+                decoration: InputDecoration(
+                  labelText: 'Order Status',
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+                  contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                 ),
-              ],
+                items: ['Pending', 'All', 'Delivered']
+                    .map((s) => DropdownMenuItem(value: s, child: Text(s)))
+                    .toList(),
+                onChanged: (v) {
+                  if (v != null) setDialogState(() => exportStatus = v);
+                },
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, null),
+              child: Text('Cancel', style: GoogleFonts.manrope(fontWeight: FontWeight.w600)),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, exportStatus),
+              child: Text('Next', style: GoogleFonts.manrope(fontWeight: FontWeight.w700)),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (statusResult == null) return;
+
+    // ─── Step 2: fetch BOTH teams' orders (bypassing the paginated _orders
+    //     list which is team-filtered for UI). ──────────────────────────
+    Fluttertoast.showToast(msg: 'Loading orders from both teams…');
+    List<OrderModel> jaOrders = const [];
+    List<OrderModel> maOrders = const [];
+    try {
+      final results = await Future.wait([
+        _service.getOrdersByDateRange(
+          startDate: _startDate, endDate: _endDate, teamId: 'JA', limit: 10000),
+        _service.getOrdersByDateRange(
+          startDate: _startDate, endDate: _endDate, teamId: 'MA', limit: 10000),
+      ]);
+      jaOrders = results[0];
+      maOrders = results[1];
+    } catch (e) {
+      Fluttertoast.showToast(msg: 'Failed to load orders: $e');
+      return;
+    }
+    if (!mounted) return;
+
+    final bothTeamsOrders = <OrderModel>[...jaOrders, ...maOrders];
+    final statusFilteredOrders = statusResult == 'All'
+        ? bothTeamsOrders
+        : bothTeamsOrders
+            .where((o) => o.status.toLowerCase() == statusResult.toLowerCase())
+            .toList();
+    if (statusFilteredOrders.isEmpty) {
+      Fluttertoast.showToast(msg: 'No $statusResult orders to export');
+      return;
+    }
+
+    // ─── Step 3: fetch BOTH teams' products and index them ──────────────
+    final productFetches = await Future.wait([
+      _service.getProducts(teamId: 'JA'),
+      _service.getProducts(teamId: 'MA'),
+    ]);
+    final jaProducts = _indexTeamProducts(productFetches[0]);
+    final maProducts = _indexTeamProducts(productFetches[1]);
+
+    // ─── Step 4: beat picker — unified beats across both teams with
+    //     JA/MA counts per beat. ───────────────────────────────────────
+    final jaBeatCount = <String, int>{};
+    final maBeatCount = <String, int>{};
+    for (final o in statusFilteredOrders) {
+      if (o.beat.isEmpty) continue;
+      if (o.teamId == 'JA') {
+        jaBeatCount[o.beat] = (jaBeatCount[o.beat] ?? 0) + 1;
+      } else {
+        maBeatCount[o.beat] = (maBeatCount[o.beat] ?? 0) + 1;
+      }
+    }
+    final beats = {...jaBeatCount.keys, ...maBeatCount.keys}.toList()..sort();
+    if (beats.isEmpty) {
+      Fluttertoast.showToast(msg: 'No beats found in $statusResult orders');
+      return;
+    }
+    final selectedBeats = <String>{...beats};
+    final beatResult = await showDialog<Set<String>?>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) {
+          final allSelected = selectedBeats.length == beats.length;
+          return AlertDialog(
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+            title: Text('Select Beats', style: GoogleFonts.manrope(fontWeight: FontWeight.w800)),
+            content: SizedBox(
+              width: double.maxFinite,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text('Select which beat orders to export',
+                      style: GoogleFonts.manrope(fontSize: 13, color: AppTheme.onSurfaceVariant)),
+                  const SizedBox(height: 12),
+                  CheckboxListTile(
+                    dense: true,
+                    title: Text('All Beats', style: GoogleFonts.manrope(fontWeight: FontWeight.w700)),
+                    value: allSelected,
+                    onChanged: (_) {
+                      setDialogState(() {
+                        if (allSelected) {
+                          selectedBeats.clear();
+                        } else {
+                          selectedBeats.addAll(beats);
+                        }
+                      });
+                    },
+                  ),
+                  const Divider(height: 1),
+                  ConstrainedBox(
+                    constraints: BoxConstraints(
+                      maxHeight: MediaQuery.of(ctx).size.height * 0.6,
+                    ),
+                    child: ListView.builder(
+                      shrinkWrap: true,
+                      itemCount: beats.length,
+                      itemBuilder: (_, i) {
+                        final beat = beats[i];
+                        final jaCount = jaBeatCount[beat] ?? 0;
+                        final maCount = maBeatCount[beat] ?? 0;
+                        final parts = <String>[];
+                        if (jaCount > 0) parts.add('$jaCount JA');
+                        if (maCount > 0) parts.add('$maCount MA');
+                        final totalOrders = jaCount + maCount;
+                        return CheckboxListTile(
+                          dense: true,
+                          title: Text(beat, style: GoogleFonts.manrope(fontSize: 13)),
+                          subtitle: Text(
+                            '$totalOrders order${totalOrders == 1 ? '' : 's'} · ${parts.join(' + ')}',
+                            style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant),
+                          ),
+                          value: selectedBeats.contains(beat),
+                          onChanged: (_) {
+                            setDialogState(() {
+                              if (selectedBeats.contains(beat)) {
+                                selectedBeats.remove(beat);
+                              } else {
+                                selectedBeats.add(beat);
+                              }
+                            });
+                          },
+                        );
+                      },
+                    ),
+                  ),
+                ],
+              ),
             ),
             actions: [
               TextButton(
@@ -373,214 +705,97 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
                 child: Text('Cancel', style: GoogleFonts.manrope(fontWeight: FontWeight.w600)),
               ),
               FilledButton(
-                onPressed: () => Navigator.pop(ctx, exportStatus),
-                child: Text('Next', style: GoogleFonts.manrope(fontWeight: FontWeight.w700)),
+                onPressed: selectedBeats.isEmpty ? null : () => Navigator.pop(ctx, selectedBeats),
+                child: Text('Next (${selectedBeats.length})', style: GoogleFonts.manrope(fontWeight: FontWeight.w700)),
               ),
             ],
-          ),
-        );
-      },
-    );
-    if (statusResult == null) return;
-
-    // Filter orders by selected status
-    final statusFilteredOrders = statusResult == 'All'
-        ? _filteredOrders
-        : _filteredOrders.where((o) => o.status.toLowerCase() == statusResult.toLowerCase()).toList();
-    if (statusFilteredOrders.isEmpty) {
-      Fluttertoast.showToast(msg: 'No $statusResult orders to export');
-      return;
-    }
-
-    // Pre-load selected team's products + cross-team orders BEFORE the beat
-    // picker so it can show a team-wise split per beat. (The final CSV build
-    // re-uses these same maps/sets further down.)
-    final products = await _service.getProducts(teamId: _selectedTeamFilter);
-    final mrpMap = <String, double>{};
-    final unitPriceMap = <String, double>{};
-    final billingNameMap = <String, String>{};
-    final teamProductIds = <String>{};
-    final teamProductSkus = <String>{};
-    for (final p in products) {
-      mrpMap[p.id] = p.mrp;
-      unitPriceMap[p.id] = p.unitPrice;
-      billingNameMap[p.id] = p.billingName ?? p.name;
-      teamProductIds.add(p.id);
-      if (p.sku.isNotEmpty) {
-        mrpMap[p.sku] = p.mrp;
-        unitPriceMap[p.sku] = p.unitPrice;
-        billingNameMap[p.sku] = p.billingName ?? p.name;
-        teamProductSkus.add(p.sku);
-      }
-    }
-
-    final otherTeam = _selectedTeamFilter == 'JA' ? 'MA' : 'JA';
-    List<OrderModel> crossTeamExtra = const [];
-    try {
-      final otherTeamOrders = await _service.getOrdersByDateRange(
-        startDate: _startDate,
-        endDate: _endDate,
-        teamId: otherTeam,
-        limit: 10000,
-      );
-      crossTeamExtra = otherTeamOrders.where((o) {
-        if (statusResult != 'All' && o.status.toLowerCase() != statusResult!.toLowerCase()) return false;
-        return o.lineItems.any((it) =>
-            teamProductIds.contains(it.productId) ||
-            (it.sku.isNotEmpty && teamProductSkus.contains(it.sku)));
-      }).toList();
-    } catch (e) {
-      debugPrint('[ExportCsv] Cross-team fetch failed: $e — continuing without it');
-    }
-
-    // Step 2: Ask which beats to export (multi-select).
-    // Beats come from BOTH same-team and cross-team orders so the admin can
-    // see team-wise counts per beat. A cross-team order's beat is the beat
-    // the OTHER team's rep was on when the order was booked.
-    final sameTeamBeatCount = <String, int>{};
-    final crossTeamBeatCount = <String, int>{};
-    for (final o in statusFilteredOrders) {
-      if (o.beat.isEmpty) continue;
-      sameTeamBeatCount[o.beat] = (sameTeamBeatCount[o.beat] ?? 0) + 1;
-    }
-    for (final o in crossTeamExtra) {
-      if (o.beat.isEmpty) continue;
-      crossTeamBeatCount[o.beat] = (crossTeamBeatCount[o.beat] ?? 0) + 1;
-    }
-    final beats = {...sameTeamBeatCount.keys, ...crossTeamBeatCount.keys}.toList()..sort();
-    final selectedBeats = <String>{...beats}; // all selected by default
-    final beatResult = await showDialog<Set<String>?>(
-      context: context,
-      builder: (ctx) {
-        return StatefulBuilder(
-          builder: (ctx, setDialogState) {
-            final allSelected = selectedBeats.length == beats.length;
-            return AlertDialog(
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-              title: Text('Select Beats', style: GoogleFonts.manrope(fontWeight: FontWeight.w800)),
-              content: SizedBox(
-                width: double.maxFinite,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text('Select which beat orders to export',
-                        style: GoogleFonts.manrope(fontSize: 13, color: AppTheme.onSurfaceVariant)),
-                    const SizedBox(height: 12),
-                    // Select All / Deselect All
-                    CheckboxListTile(
-                      dense: true,
-                      title: Text('All Beats', style: GoogleFonts.manrope(fontWeight: FontWeight.w700)),
-                      value: allSelected,
-                      onChanged: (_) {
-                        setDialogState(() {
-                          if (allSelected) {
-                            selectedBeats.clear();
-                          } else {
-                            selectedBeats.addAll(beats);
-                          }
-                        });
-                      },
-                    ),
-                    const Divider(height: 1),
-                    // Individual beats — bumped 300 → 520 so 20-30 beat
-                    // lists don't force inside-dialog scrolling on mobile.
-                    // User directive 2026-04-18: "i need bigger spaces in
-                    // everything".
-                    ConstrainedBox(
-                      constraints: BoxConstraints(
-                        maxHeight: MediaQuery.of(ctx).size.height * 0.6,
-                      ),
-                      child: ListView.builder(
-                        shrinkWrap: true,
-                        itemCount: beats.length,
-                        itemBuilder: (_, i) {
-                          final beat = beats[i];
-                          final sameCount = sameTeamBeatCount[beat] ?? 0;
-                          final crossCount = crossTeamBeatCount[beat] ?? 0;
-                          // Subtitle shows team-wise split so admin sees
-                          // whether the beat carries cross-team pickups too.
-                          // Team-letter labels use the admin's selected team
-                          // first (X same-team), then other team for cross.
-                          final parts = <String>[];
-                          if (sameCount > 0) parts.add('$sameCount $_selectedTeamFilter');
-                          if (crossCount > 0) parts.add('$crossCount cross-team from $otherTeam');
-                          final totalOrders = sameCount + crossCount;
-                          return CheckboxListTile(
-                            dense: true,
-                            title: Text(beat, style: GoogleFonts.manrope(fontSize: 13)),
-                            subtitle: Text(
-                              '$totalOrders order${totalOrders == 1 ? '' : 's'} · ${parts.join(' + ')}',
-                              style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant),
-                            ),
-                            value: selectedBeats.contains(beat),
-                            onChanged: (_) {
-                              setDialogState(() {
-                                if (selectedBeats.contains(beat)) {
-                                  selectedBeats.remove(beat);
-                                } else {
-                                  selectedBeats.add(beat);
-                                }
-                              });
-                            },
-                          );
-                        },
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.pop(ctx, null),
-                  child: Text('Cancel', style: GoogleFonts.manrope(fontWeight: FontWeight.w600)),
-                ),
-                FilledButton(
-                  onPressed: selectedBeats.isEmpty ? null : () => Navigator.pop(ctx, selectedBeats),
-                  child: Text('Next (${selectedBeats.length})', style: GoogleFonts.manrope(fontWeight: FontWeight.w700)),
-                ),
-              ],
-            );
-          },
-        );
-      },
+          );
+        },
+      ),
     );
     if (beatResult == null || beatResult.isEmpty) return;
 
-    // Apply the beat filter to BOTH same-team and cross-team sets. Admin's
-    // tick-list now governs both — unticking a beat excludes cross-team
-    // pickups on that beat as well.
-    final allSelected = beatResult.length == beats.length;
-    final exportOrders = allSelected
-        ? statusFilteredOrders
-        : statusFilteredOrders.where((o) => beatResult.contains(o.beat)).toList();
-    if (!allSelected) {
-      crossTeamExtra = crossTeamExtra
-          .where((o) => beatResult.contains(o.beat))
-          .toList();
-    }
-    if (exportOrders.isEmpty && crossTeamExtra.isEmpty) {
+    final beatFilteredOrders = statusFilteredOrders
+        .where((o) => beatResult.contains(o.beat))
+        .toList();
+    if (beatFilteredOrders.isEmpty) {
       Fluttertoast.showToast(msg: 'No orders for selected beats');
       return;
     }
 
-    // Step 3: Ask for starting invoice number
-    final invoiceController = TextEditingController();
-    final invoiceResult = await showDialog<String?>(
+    // ─── Step 4.5 (Phase C): Organic India per-customer routing ─────────
+    // OI items can go to either JA or MA billing depending on the customer
+    // (Pharmacy → JA default, other → MA default; admin can override and
+    // the choice is remembered in customer_brand_routing).
+    final organicIndiaKeys = <String>{};
+    for (final p in productFetches[0]) {
+      if (_isOrganicIndia(p)) {
+        organicIndiaKeys.add(p.id);
+        if (p.sku.isNotEmpty) organicIndiaKeys.add(p.sku);
+      }
+    }
+    for (final p in productFetches[1]) {
+      if (_isOrganicIndia(p)) {
+        organicIndiaKeys.add(p.id);
+        if (p.sku.isNotEmpty) organicIndiaKeys.add(p.sku);
+      }
+    }
+
+    Map<String, String> organicIndiaRouting = const {};
+    if (organicIndiaKeys.isNotEmpty) {
+      // Which customers in this export have at least one OI line item?
+      final oiCustomerIds = <String>{};
+      for (final o in beatFilteredOrders) {
+        final cid = o.customerId;
+        if (cid == null || cid.isEmpty) continue;
+        final hasOi = o.lineItems.any((it) {
+          if (it.productId != null && organicIndiaKeys.contains(it.productId)) return true;
+          if (it.sku.isNotEmpty && organicIndiaKeys.contains(it.sku)) return true;
+          return false;
+        });
+        if (hasOi) oiCustomerIds.add(cid);
+      }
+
+      if (oiCustomerIds.isNotEmpty) {
+        final decisions = await _showOrganicIndiaPicker(oiCustomerIds);
+        if (decisions == null) return; // admin cancelled
+        organicIndiaRouting = decisions;
+      }
+    }
+
+    // ─── Step 5: dual invoice number inputs (JA + MA) ───────────────────
+    final jaInvoiceCtl = TextEditingController();
+    final maInvoiceCtl = TextEditingController();
+    final invoiceResult = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: Text('Starting Invoice No', style: GoogleFonts.manrope(fontWeight: FontWeight.w800)),
+        title: Text('Starting Invoice Numbers', style: GoogleFonts.manrope(fontWeight: FontWeight.w800)),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Text('Enter starting invoice number (e.g. INV420).\nIt will auto-increment for each order.',
-                style: GoogleFonts.manrope(fontSize: 13, color: AppTheme.onSurfaceVariant)),
+            Text(
+              'Enter each team\'s starting invoice (e.g. INV420). Leave a field blank to skip numbering for that file.',
+              style: GoogleFonts.manrope(fontSize: 12, color: AppTheme.onSurfaceVariant),
+            ),
             const SizedBox(height: 12),
             TextField(
-              controller: invoiceController,
+              controller: jaInvoiceCtl,
               textCapitalization: TextCapitalization.characters,
               decoration: InputDecoration(
+                labelText: 'JA starting invoice',
                 hintText: 'e.g. INV420',
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+                contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              ),
+            ),
+            const SizedBox(height: 10),
+            TextField(
+              controller: maInvoiceCtl,
+              textCapitalization: TextCapitalization.characters,
+              decoration: InputDecoration(
+                labelText: 'MA starting invoice',
+                hintText: 'e.g. INVM100',
                 border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
                 contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
               ),
@@ -589,58 +804,62 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(ctx, null),
-            child: Text('Ignore', style: GoogleFonts.manrope(fontWeight: FontWeight.w600)),
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text('Cancel', style: GoogleFonts.manrope(fontWeight: FontWeight.w600)),
           ),
           FilledButton(
-            onPressed: () => Navigator.pop(ctx, invoiceController.text.trim()),
-            child: Text('Add Invoice No', style: GoogleFonts.manrope(fontWeight: FontWeight.w700)),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text('Next', style: GoogleFonts.manrope(fontWeight: FontWeight.w700)),
           ),
         ],
       ),
     );
+    if (invoiceResult != true) return;
 
-    // Parse prefix and starting number from input like "INV420"
-    String? invoicePrefix;
-    int? invoiceStartNum;
-    if (invoiceResult != null && invoiceResult.isNotEmpty) {
-      final match = RegExp(r'^([A-Za-z]*)(\d+)$').firstMatch(invoiceResult);
-      if (match != null) {
-        invoicePrefix = match.group(1)!;
-        invoiceStartNum = int.parse(match.group(2)!);
-      } else {
-        Fluttertoast.showToast(msg: 'Invalid format. Use like INV420');
+    final invoiceRe = RegExp(r'^([A-Za-z]*)(\d+)$');
+    String? jaPrefix;
+    int? jaStart;
+    if (jaInvoiceCtl.text.trim().isNotEmpty) {
+      final m = invoiceRe.firstMatch(jaInvoiceCtl.text.trim());
+      if (m == null) {
+        Fluttertoast.showToast(msg: 'Invalid JA invoice format. Use like INV420');
         return;
       }
+      jaPrefix = m.group(1)!;
+      jaStart = int.parse(m.group(2)!);
+    }
+    String? maPrefix;
+    int? maStart;
+    if (maInvoiceCtl.text.trim().isNotEmpty) {
+      final m = invoiceRe.firstMatch(maInvoiceCtl.text.trim());
+      if (m == null) {
+        Fluttertoast.showToast(msg: 'Invalid MA invoice format. Use like INVM100');
+        return;
+      }
+      maPrefix = m.group(1)!;
+      maStart = int.parse(m.group(2)!);
     }
 
-    // Step 4: Ask for export date (for DUA Clipper import — DD-MMM-YYYY text format)
-    DateTime exportDate = DateTime.now().subtract(const Duration(days: 1));
+    // ─── Step 6: export date picker (DUA Clipper wants DD-MMM-YYYY) ─────
     final pickedDate = await showDatePicker(
       context: context,
-      initialDate: exportDate,
+      initialDate: DateTime.now().subtract(const Duration(days: 1)),
       firstDate: DateTime(2020),
       lastDate: DateTime.now().add(const Duration(days: 365)),
-      helpText: 'Select order date for export',
+      helpText: 'Select invoice date (shared across both files)',
     );
     if (pickedDate == null) return;
-    exportDate = pickedDate;
+    final exportDate = pickedDate;
 
-    // products / teamProductIds / teamProductSkus / crossTeamExtra were all
-    // computed earlier (before the beat picker) so that the picker could
-    // show per-beat team-wise counts. They flow into the final _buildCsv
-    // call below unchanged.
-
-    // Build user name lookup map
-    // Map by app_users.id AND by email (handles early users like Ranjeet
-    // whose auth UID differs from app_users.id)
+    // ─── Step 7: user-name + role lookup (role needed by Phase D merge) ─
     final users = await _service.getAppUsers(allTeams: true);
     final userNameMap = <String, String>{};
+    final userRoleMap = <String, String>{};
     for (final u in users) {
       userNameMap[u.id] = u.fullName;
+      userRoleMap[u.id] = u.role;
     }
-    // For unmatched order user_ids, resolve via direct DB lookup
-    final unmatchedIds = _filteredOrders
+    final unmatchedIds = beatFilteredOrders
         .where((o) => o.userId != null && !userNameMap.containsKey(o.userId))
         .map((o) => o.userId!)
         .toSet();
@@ -649,59 +868,480 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
       if (name != null) userNameMap[uid] = name;
     }
 
-    // Pre-export summary: show the admin a breakdown of same-team vs
-    // cross-team orders BEFORE the CSV is generated. Cross-team pickups
-    // happen automatically when a rep from the other team sold one of this
-    // team's products (e.g. JA rep sold SHADANI → appears in MA export).
-    // Giving admin visibility prevents surprise if the order count looks
-    // higher than the Orders tab's team-filtered list.
-    if (crossTeamExtra.isNotEmpty) {
-      final proceed = await showDialog<bool>(
-        context: context,
-        barrierDismissible: false,
-        builder: (ctx) => AlertDialog(
+    // ─── Step 7.5: customer acc_code lookups per team. ──────────────────
+    // Customers missing acc_code for a team's billing software are skipped
+    // from that team's CSV — DUA Clipper would either fail the import or
+    // silently create a ghost customer. Applied uniformly across sales_rep
+    // and brand_rep (merged) orders so nothing leaks through.
+    final allCustomers = await _service.getCustomers();
+    final jaAccCodeByCustomer = <String, String>{};
+    final maAccCodeByCustomer = <String, String>{};
+    for (final c in allCustomers) {
+      final ja = c.accCodeJa;
+      final ma = c.accCodeMa;
+      if (ja != null && ja.trim().isNotEmpty) jaAccCodeByCustomer[c.id] = ja;
+      if (ma != null && ma.trim().isNotEmpty) maAccCodeByCustomer[c.id] = ma;
+    }
+
+    bool customerInvoiceableInTeam(String? customerId, String team) {
+      if (customerId == null || customerId.isEmpty) return true;
+      final m = team == 'JA' ? jaAccCodeByCustomer : maAccCodeByCustomer;
+      return m.containsKey(customerId);
+    }
+
+    // ─── Step 8: compute per-team bucket stats for the summary ──────────
+    // An order counts for team X's CSV when (a) it has at least one line
+    // that routes to X after OI override (Phase C) AND (b) the customer
+    // has an acc_code in X (Phase D guard). Cross-team = order booked by
+    // the OTHER team but landing in this team's file.
+    int jaOrderCount = 0, jaCrossCount = 0;
+    int maOrderCount = 0, maCrossCount = 0;
+    int jaSkippedNoAcc = 0, maSkippedNoAcc = 0;
+    for (final o in beatFilteredOrders) {
+      final jaAcc = customerInvoiceableInTeam(o.customerId, 'JA');
+      final maAcc = customerInvoiceableInTeam(o.customerId, 'MA');
+      final hasJaLine = o.lineItems.any((it) => _itemRoutesToTeam(
+            it, o.customerId, 'JA', jaProducts, organicIndiaKeys, organicIndiaRouting));
+      final hasMaLine = o.lineItems.any((it) => _itemRoutesToTeam(
+            it, o.customerId, 'MA', maProducts, organicIndiaKeys, organicIndiaRouting));
+      final hasJa = hasJaLine && jaAcc;
+      final hasMa = hasMaLine && maAcc;
+      if (hasJaLine && !jaAcc) jaSkippedNoAcc++;
+      if (hasMaLine && !maAcc) maSkippedNoAcc++;
+      if (hasJa) {
+        jaOrderCount++;
+        if (o.teamId != 'JA') jaCrossCount++;
+      }
+      if (hasMa) {
+        maOrderCount++;
+        if (o.teamId != 'MA') maCrossCount++;
+      }
+    }
+
+    // ─── Step 9: summary dialog with skip-file checkboxes ───────────────
+    bool buildJa = jaOrderCount > 0;
+    bool buildMa = maOrderCount > 0;
+    final jaFileName = _teamExportFilename('JA', exportDate);
+    final maFileName = _teamExportFilename('MA', exportDate);
+
+    final summaryResult = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
           title: Text('Export Summary', style: GoogleFonts.manrope(fontWeight: FontWeight.w800)),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                'Billing export for team $_selectedTeamFilter will include:',
-                style: GoogleFonts.manrope(fontSize: 13, color: AppTheme.onSurfaceVariant),
-              ),
-              const SizedBox(height: 12),
-              Row(
-                children: [
-                  Icon(Icons.check_circle_rounded, size: 16, color: Colors.green.shade700),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      '${exportOrders.length} order(s) booked under $_selectedTeamFilter',
-                      style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.w600),
-                    ),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // JA block
+                CheckboxListTile(
+                  dense: true,
+                  value: buildJa,
+                  onChanged: jaOrderCount == 0
+                      ? null
+                      : (v) => setDialogState(() => buildJa = v ?? false),
+                  title: Text(jaFileName, style: GoogleFonts.manrope(fontWeight: FontWeight.w700, fontSize: 14)),
+                  subtitle: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        jaOrderCount == 0
+                            ? 'No orders have JA line items'
+                            : '$jaOrderCount order(s) with JA line items'
+                              '${jaCrossCount > 0 ? ' (incl. $jaCrossCount cross-team from MA reps)' : ''}',
+                        style: GoogleFonts.manrope(fontSize: 12),
+                      ),
+                      if (jaSkippedNoAcc > 0)
+                        Text(
+                          '⚠ $jaSkippedNoAcc skipped — no JA acc_code on customer',
+                          style: GoogleFonts.manrope(fontSize: 11, color: Colors.orange.shade800),
+                        ),
+                      Text(
+                        'Starting invoice: ${jaPrefix != null ? '$jaPrefix$jaStart' : '(none)'}',
+                        style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant),
+                      ),
+                    ],
                   ),
-                ],
-              ),
-              const SizedBox(height: 6),
-              Row(
-                children: [
-                  Icon(Icons.compare_arrows_rounded, size: 16, color: Colors.orange.shade800),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      '${crossTeamExtra.length} cross-team order(s) from $otherTeam-booked reps with $_selectedTeamFilter products',
-                      style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.w600),
-                    ),
+                ),
+                const Divider(height: 4),
+                // MA block
+                CheckboxListTile(
+                  dense: true,
+                  value: buildMa,
+                  onChanged: maOrderCount == 0
+                      ? null
+                      : (v) => setDialogState(() => buildMa = v ?? false),
+                  title: Text(maFileName, style: GoogleFonts.manrope(fontWeight: FontWeight.w700, fontSize: 14)),
+                  subtitle: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        maOrderCount == 0
+                            ? 'No orders have MA line items'
+                            : '$maOrderCount order(s) with MA line items'
+                              '${maCrossCount > 0 ? ' (incl. $maCrossCount cross-team from JA reps)' : ''}',
+                        style: GoogleFonts.manrope(fontSize: 12),
+                      ),
+                      if (maSkippedNoAcc > 0)
+                        Text(
+                          '⚠ $maSkippedNoAcc skipped — no MA acc_code on customer',
+                          style: GoogleFonts.manrope(fontSize: 11, color: Colors.orange.shade800),
+                        ),
+                      Text(
+                        'Starting invoice: ${maPrefix != null ? '$maPrefix$maStart' : '(none)'}',
+                        style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant),
+                      ),
+                    ],
                   ),
-                ],
-              ),
-              const SizedBox(height: 10),
-              Text(
-                'Line items that don\'t belong to $_selectedTeamFilter will be skipped — each team\'s billing software only sees its own SKUs.',
-                style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant, fontStyle: FontStyle.italic),
-              ),
-            ],
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  'Uncheck a box to skip that team\'s file. Each CSV contains only its own team\'s products — cross-team line items are routed automatically.',
+                  style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant, fontStyle: FontStyle.italic),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: Text('Cancel', style: GoogleFonts.manrope(fontWeight: FontWeight.w600)),
+            ),
+            FilledButton(
+              onPressed: (!buildJa && !buildMa)
+                  ? null
+                  : () => Navigator.pop(ctx, true),
+              child: Text('Export', style: GoogleFonts.manrope(fontWeight: FontWeight.w700)),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (summaryResult != true) return;
+
+    // ─── Step 10: build CSVs and bundle for a single share sheet ────────
+    final filesToDownload = <MapEntry<String, String>>[];
+
+    // Merge product lookup maps across both teams so OI items routed across
+    // teams (e.g. a JA-catalog OI product going to MA CSV per customer
+    // override) still find their MRP / unit-price / billing-name refresh.
+    // Team-scoping of WHICH lines go in each CSV is governed separately by
+    // teamProductIds/teamProductSkus and organicIndiaRouting.
+    final mergedMrp = <String, double>{...jaProducts.mrp, ...maProducts.mrp};
+    final mergedUnitPrice = <String, double>{
+      ...jaProducts.unitPrice,
+      ...maProducts.unitPrice,
+    };
+    final mergedBillingName = <String, String>{
+      ...jaProducts.billingName,
+      ...maProducts.billingName,
+    };
+
+    // Phase E sinks: capture every order_items.id + order.id that lands in
+    // either CSV so the post-export RPC can persist the tracking state.
+    final writtenLineItemIds = <String>{};
+    final writtenOrderIds = <String>{};
+    int jaWrittenOrderCount = 0;
+    int maWrittenOrderCount = 0;
+
+    if (buildJa && jaOrderCount > 0) {
+      final jaLineSink = <String>[];
+      final jaOrderSink = <String>{};
+      final csv = _buildCsv(
+        orders: beatFilteredOrders,
+        productMrpMap: mergedMrp,
+        productUnitPriceMap: mergedUnitPrice,
+        productBillingNameMap: mergedBillingName,
+        userNameMap: userNameMap,
+        exportDate: exportDate,
+        invoicePrefix: jaPrefix,
+        invoiceStartNum: jaStart,
+        teamProductIds: jaProducts.ids,
+        teamProductSkus: jaProducts.skus,
+        organicIndiaKeys: organicIndiaKeys,
+        organicIndiaRouting: organicIndiaRouting,
+        csvTeamId: 'JA',
+        userRoleMap: userRoleMap,
+        customerAccCodeForCsvTeam: jaAccCodeByCustomer,
+        writtenLineItemIdsSink: jaLineSink,
+        writtenOrderIdsSink: jaOrderSink,
+      );
+      filesToDownload.add(MapEntry(jaFileName, csv));
+      writtenLineItemIds.addAll(jaLineSink);
+      writtenOrderIds.addAll(jaOrderSink);
+      jaWrittenOrderCount = jaOrderSink.length;
+    }
+    if (buildMa && maOrderCount > 0) {
+      final maLineSink = <String>[];
+      final maOrderSink = <String>{};
+      final csv = _buildCsv(
+        orders: beatFilteredOrders,
+        productMrpMap: mergedMrp,
+        productUnitPriceMap: mergedUnitPrice,
+        productBillingNameMap: mergedBillingName,
+        userNameMap: userNameMap,
+        exportDate: exportDate,
+        invoicePrefix: maPrefix,
+        invoiceStartNum: maStart,
+        teamProductIds: maProducts.ids,
+        teamProductSkus: maProducts.skus,
+        organicIndiaKeys: organicIndiaKeys,
+        organicIndiaRouting: organicIndiaRouting,
+        csvTeamId: 'MA',
+        userRoleMap: userRoleMap,
+        customerAccCodeForCsvTeam: maAccCodeByCustomer,
+        writtenLineItemIdsSink: maLineSink,
+        writtenOrderIdsSink: maOrderSink,
+      );
+      filesToDownload.add(MapEntry(maFileName, csv));
+      writtenLineItemIds.addAll(maLineSink);
+      writtenOrderIds.addAll(maOrderSink);
+      maWrittenOrderCount = maOrderSink.length;
+    }
+
+    if (filesToDownload.isEmpty) {
+      Fluttertoast.showToast(msg: 'Nothing to export');
+      return;
+    }
+
+    await triggerMultiCsvDownload(filesToDownload);
+    Fluttertoast.showToast(
+      msg: 'Downloaded: ${filesToDownload.map((e) => e.key).join(', ')}',
+    );
+
+    // ─── Step 11 (Phase E): post-export "Mark as Delivered" dialog ──────
+    if (!mounted) return;
+    await _showPostExportDialog(
+      filesToDownload: filesToDownload,
+      jaWrittenOrderCount: jaWrittenOrderCount,
+      maWrittenOrderCount: maWrittenOrderCount,
+      writtenOrderIds: writtenOrderIds,
+      writtenLineItemIds: writtenLineItemIds,
+      ordersById: {for (final o in beatFilteredOrders) o.id: o},
+      invoiceDate: exportDate,
+      jaFileName: buildJa ? jaFileName : null,
+      maFileName: buildMa ? maFileName : null,
+      jaInvoiceRange: buildJa && jaPrefix != null
+          ? _invoiceRangeLabel(jaPrefix, jaStart!, jaWrittenOrderCount)
+          : null,
+      maInvoiceRange: buildMa && maPrefix != null
+          ? _invoiceRangeLabel(maPrefix, maStart!, maWrittenOrderCount)
+          : null,
+      statusFilter: statusResult,
+    );
+  }
+
+  // ─── Dual-team export helpers ─────────────────────────────────────────
+
+  String _teamExportFilename(String teamCode, DateTime exportDate) {
+    final dd = exportDate.day.toString().padLeft(2, '0');
+    final mm = exportDate.month.toString().padLeft(2, '0');
+    return '$teamCode$dd$mm.xls';
+  }
+
+  _TeamProductIndex _indexTeamProducts(List<ProductModel> products) {
+    final idx = _TeamProductIndex();
+    for (final p in products) {
+      idx.ids.add(p.id);
+      idx.mrp[p.id] = p.mrp;
+      idx.unitPrice[p.id] = p.unitPrice;
+      idx.billingName[p.id] = p.billingName ?? p.name;
+      if (p.sku.isNotEmpty) {
+        idx.skus.add(p.sku);
+        idx.mrp[p.sku] = p.mrp;
+        idx.unitPrice[p.sku] = p.unitPrice;
+        idx.billingName[p.sku] = p.billingName ?? p.name;
+      }
+    }
+    return idx;
+  }
+
+  bool _itemInTeam(OrderItemModel it, _TeamProductIndex idx) {
+    if (it.productId != null && idx.ids.contains(it.productId)) return true;
+    if (it.sku.isNotEmpty && idx.skus.contains(it.sku)) return true;
+    return false;
+  }
+
+  // Phase C: is this product an Organic India item? Category is the
+  // authoritative signal (plan mandate). Trim + lowercase to match what
+  // product_categories.name uses.
+  static const _organicIndiaBrandName = 'Organic India';
+  bool _isOrganicIndia(ProductModel p) =>
+      p.category.trim().toLowerCase() == _organicIndiaBrandName.toLowerCase();
+
+  /// Does this line item route to [csvTeamId] given the OI override?
+  /// Mirrors the rule inside _buildCsv.itemBelongsToTeam so summary counts
+  /// match what actually lands in each file.
+  bool _itemRoutesToTeam(
+    OrderItemModel it,
+    String? customerId,
+    String csvTeamId,
+    _TeamProductIndex sameTeamIdx,
+    Set<String> oiKeys,
+    Map<String, String> oiRouting,
+  ) {
+    if (oiKeys.isNotEmpty) {
+      final isOi = (it.productId != null && oiKeys.contains(it.productId)) ||
+          (it.sku.isNotEmpty && oiKeys.contains(it.sku));
+      if (isOi && customerId != null && oiRouting.containsKey(customerId)) {
+        return oiRouting[customerId] == csvTeamId;
+      }
+    }
+    return _itemInTeam(it, sameTeamIdx);
+  }
+
+  /// Organic India per-customer routing picker.
+  /// - Loads existing `customer_brand_routing` rows for the given customers.
+  /// - Fills in the default for each customer (Pharmacy → JA, else MA).
+  /// - Lets admin toggle per customer, optionally persist as "remember".
+  /// - Returns customer_id → 'JA'|'MA' on confirm, or null on cancel.
+  Future<Map<String, String>?> _showOrganicIndiaPicker(
+    Iterable<String> customerIds,
+  ) async {
+    final allCustomers = await _service.getCustomers();
+    final customersById = <String, CustomerModel>{
+      for (final c in allCustomers) c.id: c,
+    };
+    final remembered = await _service.getBrandRouting(
+      brandName: _organicIndiaBrandName,
+      customerIds: customerIds,
+    );
+
+    // Sort by customer name for stable presentation.
+    final sortedCustomers = customerIds
+        .where((id) => customersById.containsKey(id))
+        .map((id) => customersById[id]!)
+        .toList()
+      ..sort((a, b) => a.name.compareTo(b.name));
+
+    if (sortedCustomers.isEmpty) {
+      // OI items exist but customers couldn't be resolved — fall back to
+      // defaults without pestering the admin.
+      debugPrint('[OI Picker] No resolvable customers for ids=$customerIds');
+      return const {};
+    }
+
+    final decisions = <String, String>{
+      for (final c in sortedCustomers)
+        c.id: remembered[c.id] ?? _defaultOrganicIndiaTeam(c),
+    };
+    bool rememberChoices = true;
+
+    if (!mounted) return null;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          title: Text('Organic India Billing', style: GoogleFonts.manrope(fontWeight: FontWeight.w800)),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Organic India items found for ${sortedCustomers.length} customer(s). Pick which team each customer bills under.',
+                  style: GoogleFonts.manrope(fontSize: 12, color: AppTheme.onSurfaceVariant),
+                ),
+                const SizedBox(height: 10),
+                ConstrainedBox(
+                  constraints: BoxConstraints(
+                    maxHeight: MediaQuery.of(ctx).size.height * 0.55,
+                  ),
+                  child: ListView.builder(
+                    shrinkWrap: true,
+                    itemCount: sortedCustomers.length,
+                    itemBuilder: (_, i) {
+                      final c = sortedCustomers[i];
+                      final current = decisions[c.id] ?? 'MA';
+                      final wasRemembered = remembered.containsKey(c.id);
+                      return Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 4),
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    c.name,
+                                    style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.w600),
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                  Text(
+                                    '${c.type}${wasRemembered ? ' · remembered' : ''}',
+                                    style: GoogleFonts.manrope(fontSize: 10, color: AppTheme.onSurfaceVariant),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            const SizedBox(width: 4),
+                            ToggleButtons(
+                              constraints: const BoxConstraints(minWidth: 40, minHeight: 30),
+                              borderRadius: BorderRadius.circular(8),
+                              isSelected: [current == 'JA', current == 'MA'],
+                              onPressed: (idx) {
+                                setDialogState(() {
+                                  decisions[c.id] = idx == 0 ? 'JA' : 'MA';
+                                });
+                              },
+                              children: const [
+                                Padding(padding: EdgeInsets.symmetric(horizontal: 8), child: Text('JA')),
+                                Padding(padding: EdgeInsets.symmetric(horizontal: 8), child: Text('MA')),
+                              ],
+                            ),
+                          ],
+                        ),
+                      );
+                    },
+                  ),
+                ),
+                const Divider(height: 16),
+                Row(
+                  children: [
+                    OutlinedButton(
+                      onPressed: () {
+                        setDialogState(() {
+                          for (final c in sortedCustomers) {
+                            if (c.type.toLowerCase() == 'pharmacy') {
+                              decisions[c.id] = 'JA';
+                            }
+                          }
+                        });
+                      },
+                      child: Text('All Pharmacy → JA',
+                          style: GoogleFonts.manrope(fontSize: 11)),
+                    ),
+                    const SizedBox(width: 8),
+                    OutlinedButton(
+                      onPressed: () {
+                        setDialogState(() {
+                          for (final c in sortedCustomers) {
+                            decisions[c.id] = 'MA';
+                          }
+                        });
+                      },
+                      child: Text('Set all to MA',
+                          style: GoogleFonts.manrope(fontSize: 11)),
+                    ),
+                  ],
+                ),
+                CheckboxListTile(
+                  dense: true,
+                  contentPadding: EdgeInsets.zero,
+                  value: rememberChoices,
+                  onChanged: (v) => setDialogState(() => rememberChoices = v ?? false),
+                  title: Text('Remember these choices for next time',
+                      style: GoogleFonts.manrope(fontSize: 12)),
+                ),
+              ],
+            ),
           ),
           actions: [
             TextButton(
@@ -710,37 +1350,189 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
             ),
             FilledButton(
               onPressed: () => Navigator.pop(ctx, true),
-              child: Text('Export CSV', style: GoogleFonts.manrope(fontWeight: FontWeight.w700)),
+              child: Text('Continue', style: GoogleFonts.manrope(fontWeight: FontWeight.w700)),
             ),
           ],
         ),
-      );
-      if (proceed != true) return;
+      ),
+    );
+    if (confirmed != true) return null;
+
+    if (rememberChoices) {
+      try {
+        await _service.upsertBrandRouting(
+          brandName: _organicIndiaBrandName,
+          decisions: decisions,
+        );
+      } catch (e) {
+        // Surfacing the failure is better than silently losing the choice —
+        // the decisions still apply to THIS export, just won't persist.
+        Fluttertoast.showToast(
+          msg: 'Could not save routing preferences: $e',
+          toastLength: Toast.LENGTH_LONG,
+        );
+      }
+    }
+    return decisions;
+  }
+
+  /// Default OI billing team when nothing is remembered. Pharmacy → JA
+  /// (business rule from plan); everything else → MA.
+  String _defaultOrganicIndiaTeam(CustomerModel c) =>
+      c.type.toLowerCase() == 'pharmacy' ? 'JA' : 'MA';
+
+  /// Phase E: label like "INV420..INV453" for display. On 0 orders returns
+  /// just the starting value so admin isn't confused.
+  String _invoiceRangeLabel(String prefix, int start, int count) {
+    if (count <= 0) return '$prefix$start';
+    if (count == 1) return '$prefix$start';
+    return '$prefix$start..$prefix${start + count - 1}';
+  }
+
+  /// Phase E: "Export Complete" dialog. Shows per-file order counts + a
+  /// fully-vs-partial preview, then calls finalize_export_batch regardless
+  /// of admin's choice so line-item tracking is always persisted. Only the
+  /// `p_mark_delivered` flag toggles on Confirm vs Cancel.
+  Future<void> _showPostExportDialog({
+    required List<MapEntry<String, String>> filesToDownload,
+    required int jaWrittenOrderCount,
+    required int maWrittenOrderCount,
+    required Set<String> writtenOrderIds,
+    required Set<String> writtenLineItemIds,
+    required Map<String, OrderModel> ordersById,
+    required DateTime invoiceDate,
+    required String? jaFileName,
+    required String? maFileName,
+    required String? jaInvoiceRange,
+    required String? maInvoiceRange,
+    required String statusFilter,
+  }) async {
+    // Client-side preview of fully-vs-partial. The RPC authoritatively
+    // re-computes server-side; these numbers just help admin decide
+    // whether to tick "mark Delivered".
+    int fullCount = 0;
+    int partialCount = 0;
+    for (final oid in writtenOrderIds) {
+      final o = ordersById[oid];
+      if (o == null) continue;
+      final totalLines = o.lineItems.length;
+      if (totalLines == 0) continue; // empty orders never "fully export"
+      final already = o.exportedLineItemIds.toSet();
+      final itemIdsInOrder = o.lineItems
+          .map((it) => it.id)
+          .whereType<String>()
+          .where((id) => id.isNotEmpty)
+          .toSet();
+      final newlyForThisOrder =
+          itemIdsInOrder.where(writtenLineItemIds.contains).toSet();
+      final cumulative = {...already, ...newlyForThisOrder};
+      // intersect with actual line-item ids so stale entries don't inflate
+      final match = cumulative.intersection(itemIdsInOrder);
+      if (match.length == totalLines && totalLines > 0) {
+        fullCount++;
+      } else {
+        partialCount++;
+      }
     }
 
-    // Merge the same-team picked orders with the cross-team orders that carry
-    // this-team products. _buildCsv will skip any line items that don't
-    // belong to this team, so mixed orders are automatically trimmed.
-    final mergedExportOrders = <OrderModel>[...exportOrders, ...crossTeamExtra];
-    final csv = _buildCsv(
-      orders: mergedExportOrders,
-      productMrpMap: mrpMap,
-      productUnitPriceMap: unitPriceMap,
-      productBillingNameMap: billingNameMap,
-      userNameMap: userNameMap,
-      exportDate: exportDate,
-      invoicePrefix: invoicePrefix,
-      invoiceStartNum: invoiceStartNum,
-      teamProductIds: teamProductIds,
-      teamProductSkus: teamProductSkus,
+    final result = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Text('Export Complete', style: GoogleFonts.manrope(fontWeight: FontWeight.w800)),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('Downloaded:', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700)),
+              const SizedBox(height: 4),
+              if (jaFileName != null)
+                Text('✓ $jaFileName — $jaWrittenOrderCount order(s)'
+                    '${jaInvoiceRange != null ? ' · $jaInvoiceRange' : ''}',
+                    style: GoogleFonts.manrope(fontSize: 12)),
+              if (maFileName != null)
+                Text('✓ $maFileName — $maWrittenOrderCount order(s)'
+                    '${maInvoiceRange != null ? ' · $maInvoiceRange' : ''}',
+                    style: GoogleFonts.manrope(fontSize: 12)),
+              const SizedBox(height: 12),
+              Text('Of these:', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700)),
+              const SizedBox(height: 4),
+              Text('• $fullCount order(s) FULLY exported — every line item covered.',
+                  style: GoogleFonts.manrope(fontSize: 12)),
+              Text('• $partialCount order(s) PARTIALLY exported — waiting on remaining line items.',
+                  style: GoogleFonts.manrope(fontSize: 12)),
+              const SizedBox(height: 12),
+              Text(
+                fullCount == 0
+                    ? 'No fully-exported orders to mark as Delivered.'
+                    : 'Mark the $fullCount fully-exported order(s) as Delivered? Partial orders stay Pending and flip automatically when their remaining items get exported.',
+                style: GoogleFonts.manrope(fontSize: 12, color: AppTheme.onSurfaceVariant),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text(fullCount == 0 ? 'Close' : 'Cancel',
+                style: GoogleFonts.manrope(fontWeight: FontWeight.w600)),
+          ),
+          if (fullCount > 0)
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: Text('Yes, mark Delivered',
+                  style: GoogleFonts.manrope(fontWeight: FontWeight.w700)),
+            ),
+        ],
+      ),
     );
-    final dateLabel = _startDate != null || _endDate != null
-        ? '_${_formatDate(_startDate).replaceAll('/', '-')}_to_${_formatDate(_endDate).replaceAll('/', '-')}'
-        : '_all';
-    final filename = 'orders_customer_wise$dateLabel.xls';
 
-    triggerCsvDownload(csv, filename);
-    Fluttertoast.showToast(msg: 'File downloaded: $filename');
+    // RPC call runs either way so line-item tracking is persisted even
+    // when admin declines the status flip. result == null is impossible
+    // (barrierDismissible is false) but defend anyway.
+    final markDelivered = result == true;
+    try {
+      await _service.finalizeExportBatch(
+        orderIds: writtenOrderIds.toList(),
+        lineItemIdsWritten: writtenLineItemIds.toList(),
+        markDelivered: markDelivered,
+        batchMetadata: {
+          'invoice_date': '${invoiceDate.year}-${invoiceDate.month.toString().padLeft(2, '0')}-${invoiceDate.day.toString().padLeft(2, '0')}',
+          if (jaFileName != null) 'ja_file_name': jaFileName,
+          if (maFileName != null) 'ma_file_name': maFileName,
+          if (jaInvoiceRange != null) 'ja_invoice_range': jaInvoiceRange,
+          if (maInvoiceRange != null) 'ma_invoice_range': maInvoiceRange,
+          'status_filter': statusFilter,
+          if (_startDate != null)
+            'date_range_start':
+                '${_startDate!.year}-${_startDate!.month.toString().padLeft(2, '0')}-${_startDate!.day.toString().padLeft(2, '0')}',
+          if (_endDate != null)
+            'date_range_end':
+                '${_endDate!.year}-${_endDate!.month.toString().padLeft(2, '0')}-${_endDate!.day.toString().padLeft(2, '0')}',
+        },
+      );
+      if (mounted) {
+        Fluttertoast.showToast(
+          msg: markDelivered
+              ? 'Batch recorded. $fullCount order(s) marked Delivered.'
+              : 'Batch recorded. Statuses unchanged.',
+        );
+      }
+      if (markDelivered && fullCount > 0) {
+        // Refresh the Orders tab so the admin sees new statuses immediately.
+        await _loadOrders();
+      }
+    } catch (e) {
+      if (mounted) {
+        Fluttertoast.showToast(
+          msg: 'Export saved locally but batch log failed: $e',
+          toastLength: Toast.LENGTH_LONG,
+        );
+      }
+    }
   }
 
   Future<void> _downloadPdf() async {
@@ -1113,8 +1905,12 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
                   onPressed: () async {
                     Navigator.pop(ctx);
                     try {
+                      // Pass team so JA-authed admin editing MA via filter
+                      // hits the right team_id row instead of silently no-op'ing.
                       await _service.updateOrderStatus(
-                          order.id, s, isSuperAdmin: _isSuperAdmin);
+                          order.id, s,
+                          isSuperAdmin: _isSuperAdmin,
+                          teamId: _selectedTeamFilter);
                       // Update status in-place without refetching
                       setState(() {
                         final idx = _orders.indexWhere((o) => o.id == order.id);
@@ -1796,4 +2592,29 @@ class _OrderAdminCard extends StatelessWidget {
       ),
     );
   }
+}
+
+// Product-index scratchpad for dual-team export. Holds a team's products
+// keyed by product id AND by sku (SKU is a secondary key so legacy order
+// items that lost their product_id can still be routed via SKU match).
+class _TeamProductIndex {
+  final Set<String> ids = <String>{};
+  final Set<String> skus = <String>{};
+  final Map<String, double> mrp = <String, double>{};
+  final Map<String, double> unitPrice = <String, double>{};
+  final Map<String, String> billingName = <String, String>{};
+}
+
+// Phase D: one merged row inside a brand_rep-per-customer invoice.
+// Representative keeps the original line's product/sku/name/unit-price so
+// the merged row renders with the same identity as the originals.
+class _MergedBrandRepLine {
+  final OrderItemModel representative;
+  int quantitySum;
+  double lineTotalSum;
+  _MergedBrandRepLine({
+    required this.representative,
+    required this.quantitySum,
+    required this.lineTotalSum,
+  });
 }

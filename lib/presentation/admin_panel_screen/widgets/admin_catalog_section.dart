@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'admin_section_wrapper.dart';
 import 'admin_products_tab.dart';
 import 'admin_brand_access_tab.dart';
+import 'admin_pricing_tab.dart';
 import 'team_split_wrapper.dart';
 
 class AdminCatalogSection extends StatelessWidget {
@@ -27,6 +28,11 @@ class AdminCatalogSection extends StatelessWidget {
               isSuperAdmin: isSuperAdmin,
             ),
           ),
+        ),
+        const AdminSectionItem(
+          label: 'Pricing',
+          icon: Icons.discount_rounded,
+          child: AdminPricingTab(),
         ),
       ],
     );
