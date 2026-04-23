@@ -17,11 +17,19 @@
 -- per team on every ITTR/CRN/ADV/RECT sync. Composite team+invoice index
 -- on customer_bills because the invoice export joins by invoice_no.
 --
--- NOT covered here: RLS policies. Deciding on policies requires product
--- input (who sees which team's bills?). For now these tables follow the
--- service-role-writes-via-drive-sync pattern and are read client-side
--- with team_id filters. If RLS is needed later, add in a separate
--- migration.
+-- RLS policies (added 2026-04-23 after live audit confirmed prod had
+-- these tables RLS-OFF — that was an accident, not a design choice):
+--   SELECT : authenticated users, team-scoped via app_users.team_id.
+--            A sales_rep on JA sees only JA bills; brand_rep sees only
+--            their assigned team's rows. Matches the rep-visibility rule
+--            on every other table in this project.
+--   WRITE  : admin + super_admin only. Drive sync is always initiated by
+--            an admin session, so this lines up with how the data is
+--            written today. If a background/service-role sync is added
+--            later, it bypasses RLS automatically.
+--   Pattern mirrors billing_rules (20260423000003) and Smart Import
+--   Phase 0 (20260423000002): both-sides TEXT cast on auth.uid() so
+--   it works regardless of auth.uid() return type across versions.
 -- ─────────────────────────────────────────────────────────────────────────
 
 -- 1. customer_advances — unallocated advance balances synced from ADV file.
@@ -162,3 +170,148 @@ CREATE INDEX IF NOT EXISTS idx_customer_receipt_bills_receipt
   ON public.customer_receipt_bills(team_id, receipt_no);
 CREATE INDEX IF NOT EXISTS idx_customer_receipt_bills_invoice
   ON public.customer_receipt_bills(team_id, invoice_no);
+
+-- ─────────────────────────────────────────────────────────────────────────
+-- RLS — enable + add (team-scoped-read, admin-write) policies on all six.
+-- Safe to re-run: ENABLE is idempotent; DROP POLICY IF EXISTS before each
+-- CREATE handles replay.
+-- ─────────────────────────────────────────────────────────────────────────
+
+ALTER TABLE public.customer_advances        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.customer_credit_notes    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.customer_bills           ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.customer_billed_items    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.customer_receipts        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.customer_receipt_bills   ENABLE ROW LEVEL SECURITY;
+
+-- customer_advances
+DROP POLICY IF EXISTS "Team members read customer_advances"
+  ON public.customer_advances;
+CREATE POLICY "Team members read customer_advances"
+  ON public.customer_advances FOR SELECT
+  USING (team_id = (
+    SELECT team_id FROM public.app_users
+    WHERE id::TEXT = auth.uid()::TEXT
+  ));
+DROP POLICY IF EXISTS "Admins write customer_advances"
+  ON public.customer_advances;
+CREATE POLICY "Admins write customer_advances"
+  ON public.customer_advances FOR ALL
+  USING (
+    (SELECT role FROM public.app_users WHERE id::TEXT = auth.uid()::TEXT)
+      IN ('admin', 'super_admin')
+  )
+  WITH CHECK (
+    (SELECT role FROM public.app_users WHERE id::TEXT = auth.uid()::TEXT)
+      IN ('admin', 'super_admin')
+  );
+
+-- customer_credit_notes
+DROP POLICY IF EXISTS "Team members read customer_credit_notes"
+  ON public.customer_credit_notes;
+CREATE POLICY "Team members read customer_credit_notes"
+  ON public.customer_credit_notes FOR SELECT
+  USING (team_id = (
+    SELECT team_id FROM public.app_users
+    WHERE id::TEXT = auth.uid()::TEXT
+  ));
+DROP POLICY IF EXISTS "Admins write customer_credit_notes"
+  ON public.customer_credit_notes;
+CREATE POLICY "Admins write customer_credit_notes"
+  ON public.customer_credit_notes FOR ALL
+  USING (
+    (SELECT role FROM public.app_users WHERE id::TEXT = auth.uid()::TEXT)
+      IN ('admin', 'super_admin')
+  )
+  WITH CHECK (
+    (SELECT role FROM public.app_users WHERE id::TEXT = auth.uid()::TEXT)
+      IN ('admin', 'super_admin')
+  );
+
+-- customer_bills
+DROP POLICY IF EXISTS "Team members read customer_bills"
+  ON public.customer_bills;
+CREATE POLICY "Team members read customer_bills"
+  ON public.customer_bills FOR SELECT
+  USING (team_id = (
+    SELECT team_id FROM public.app_users
+    WHERE id::TEXT = auth.uid()::TEXT
+  ));
+DROP POLICY IF EXISTS "Admins write customer_bills"
+  ON public.customer_bills;
+CREATE POLICY "Admins write customer_bills"
+  ON public.customer_bills FOR ALL
+  USING (
+    (SELECT role FROM public.app_users WHERE id::TEXT = auth.uid()::TEXT)
+      IN ('admin', 'super_admin')
+  )
+  WITH CHECK (
+    (SELECT role FROM public.app_users WHERE id::TEXT = auth.uid()::TEXT)
+      IN ('admin', 'super_admin')
+  );
+
+-- customer_billed_items
+DROP POLICY IF EXISTS "Team members read customer_billed_items"
+  ON public.customer_billed_items;
+CREATE POLICY "Team members read customer_billed_items"
+  ON public.customer_billed_items FOR SELECT
+  USING (team_id = (
+    SELECT team_id FROM public.app_users
+    WHERE id::TEXT = auth.uid()::TEXT
+  ));
+DROP POLICY IF EXISTS "Admins write customer_billed_items"
+  ON public.customer_billed_items;
+CREATE POLICY "Admins write customer_billed_items"
+  ON public.customer_billed_items FOR ALL
+  USING (
+    (SELECT role FROM public.app_users WHERE id::TEXT = auth.uid()::TEXT)
+      IN ('admin', 'super_admin')
+  )
+  WITH CHECK (
+    (SELECT role FROM public.app_users WHERE id::TEXT = auth.uid()::TEXT)
+      IN ('admin', 'super_admin')
+  );
+
+-- customer_receipts
+DROP POLICY IF EXISTS "Team members read customer_receipts"
+  ON public.customer_receipts;
+CREATE POLICY "Team members read customer_receipts"
+  ON public.customer_receipts FOR SELECT
+  USING (team_id = (
+    SELECT team_id FROM public.app_users
+    WHERE id::TEXT = auth.uid()::TEXT
+  ));
+DROP POLICY IF EXISTS "Admins write customer_receipts"
+  ON public.customer_receipts;
+CREATE POLICY "Admins write customer_receipts"
+  ON public.customer_receipts FOR ALL
+  USING (
+    (SELECT role FROM public.app_users WHERE id::TEXT = auth.uid()::TEXT)
+      IN ('admin', 'super_admin')
+  )
+  WITH CHECK (
+    (SELECT role FROM public.app_users WHERE id::TEXT = auth.uid()::TEXT)
+      IN ('admin', 'super_admin')
+  );
+
+-- customer_receipt_bills
+DROP POLICY IF EXISTS "Team members read customer_receipt_bills"
+  ON public.customer_receipt_bills;
+CREATE POLICY "Team members read customer_receipt_bills"
+  ON public.customer_receipt_bills FOR SELECT
+  USING (team_id = (
+    SELECT team_id FROM public.app_users
+    WHERE id::TEXT = auth.uid()::TEXT
+  ));
+DROP POLICY IF EXISTS "Admins write customer_receipt_bills"
+  ON public.customer_receipt_bills;
+CREATE POLICY "Admins write customer_receipt_bills"
+  ON public.customer_receipt_bills FOR ALL
+  USING (
+    (SELECT role FROM public.app_users WHERE id::TEXT = auth.uid()::TEXT)
+      IN ('admin', 'super_admin')
+  )
+  WITH CHECK (
+    (SELECT role FROM public.app_users WHERE id::TEXT = auth.uid()::TEXT)
+      IN ('admin', 'super_admin')
+  );
