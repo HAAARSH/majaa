@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:fluttertoast/fluttertoast.dart';
 import 'package:google_fonts/google_fonts.dart';
 
+import '../../../core/pricing.dart';
 import '../../../services/billing_rules_service.dart';
 import '../../../services/supabase_service.dart';
 import '../../../theme/app_theme.dart';
@@ -251,13 +252,80 @@ class _AdminRulesTabState extends State<AdminRulesTab>
         ),
       ]);
     }
+    // Pricing category gets a contextual header — migrated from the old
+    // admin_pricing_tab.dart (now removed). Shows the CSDS kill-switch
+    // banner when kForcedOff is true AND a short "what are these" blurb.
+    final headers = <Widget>[];
+    if (category == 'pricing') {
+      headers.add(_buildPricingHeader());
+    }
     return RefreshIndicator(
       onRefresh: _load,
       child: ListView.separated(
         padding: const EdgeInsets.all(12),
-        itemCount: inCategory.length,
+        itemCount: headers.length + inCategory.length,
         separatorBuilder: (_, __) => const SizedBox(height: 8),
-        itemBuilder: (_, i) => _buildRuleCard(inCategory[i]),
+        itemBuilder: (_, i) => i < headers.length
+            ? headers[i]
+            : _buildRuleCard(inCategory[i - headers.length]),
+      ),
+    );
+  }
+
+  /// Header for the Pricing category — CSDS explanation + kForcedOff
+  /// warning banner. Ported from admin_pricing_tab.dart so admins don't
+  /// lose this context when Pricing tab was removed in favour of this
+  /// centralised Rules Tab.
+  Widget _buildPricingHeader() {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: AppTheme.surface,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: AppTheme.outlineVariant),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            Icon(Icons.discount_rounded, size: 18, color: AppTheme.primary),
+            const SizedBox(width: 8),
+            Text('Customer-Specific Discounts (CSDS)',
+                style: GoogleFonts.manrope(fontWeight: FontWeight.w700, fontSize: 13)),
+          ]),
+          const SizedBox(height: 6),
+          Text(
+            "When ON, orders apply each customer's DUA-synced discount cascade "
+            "(D1→D3→D5) plus scheme free-goods. Leave OFF until rep-price "
+            "parity with DUA is verified on a test order.",
+            style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant, height: 1.35),
+          ),
+          if (CsdsPricing.kForcedOff) ...[
+            const SizedBox(height: 10),
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: Colors.red.shade50,
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.red.shade200),
+              ),
+              child: Row(children: [
+                Icon(Icons.lock_rounded, size: 16, color: Colors.red.shade700),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'CSDS is hard-disabled in code (kForcedOff = true). '
+                    'The switches below have no effect until the constant '
+                    'is flipped in lib/core/pricing.dart and '
+                    'majaa_desktop/lib/core/pricing.dart.',
+                    style: GoogleFonts.manrope(
+                        fontSize: 11, fontWeight: FontWeight.w600, color: Colors.red.shade900),
+                  ),
+                ),
+              ]),
+            ),
+          ],
+        ],
       ),
     );
   }
