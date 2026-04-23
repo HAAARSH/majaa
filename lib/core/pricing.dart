@@ -113,11 +113,10 @@ class CsdsPricing {
   /// path regardless of [enabled] or per-team SharedPreferences flags.
   /// Settings toggles are disabled in the UI and show a banner.
   ///
-  /// Currently ON (2026-04-22) — user paused CSDS rollout to tackle
-  /// open questions (COMPANY semantics, D2/D4, display-path mismatch).
-  /// Flip back to false when ready to resume. See
-  /// `reference_csds_working.md` for the re-enable checklist.
-  static const bool kForcedOff = true;
+  /// Flipped OFF on 2026-04-23 after Tier-4 smoke (19 tests), 7 flow gaps
+  /// closed, zero-override sync bug fixed, and desktop Create Order wired.
+  /// If a rep reports a wrong price, flip back to true and patch.
+  static const bool kForcedOff = false;
 
   /// Per-team feature flag, loaded from SharedPreferences at order-save.
   /// Ignored when [kForcedOff] is true.
