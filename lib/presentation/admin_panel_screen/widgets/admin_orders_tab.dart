@@ -1359,17 +1359,22 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
                 const Divider(height: 16),
                 Row(
                   children: [
+                    // Rule-driven reset: reads organic_india_default_by_
+                    // customer_type from billing_rules via the snapshot we
+                    // already captured. Replaces the old hardcoded
+                    // "All Pharmacy → JA" shortcut which ignored admin
+                    // edits to the rule. If admin changes the rule to
+                    // route pharmacy → MA, this button respects it.
                     OutlinedButton(
                       onPressed: () {
                         setDialogState(() {
                           for (final c in sortedCustomers) {
-                            if (c.type.toLowerCase() == 'pharmacy') {
-                              decisions[c.id] = 'JA';
-                            }
+                            decisions[c.id] =
+                                rulesSnapshot.organicIndiaDefaultFor(c.type);
                           }
                         });
                       },
-                      child: Text('All Pharmacy → JA',
+                      child: Text('Reset to rule defaults',
                           style: GoogleFonts.manrope(fontSize: 11)),
                     ),
                     const SizedBox(width: 8),

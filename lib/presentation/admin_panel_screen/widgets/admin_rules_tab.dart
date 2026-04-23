@@ -141,6 +141,56 @@ class _AdminRulesTabState extends State<AdminRulesTab>
             ],
           ),
         ),
+        // Migration-applied sanity banner. BillingRulesService._reload()
+        // silently swallows DB errors and returns an empty cache, so a
+        // missing migration would let the Rules Tab open normally — but
+        // every save below would no-op at the RLS/table level. This
+        // banner turns that silent failure into an obvious one.
+        if (_rules.isEmpty)
+          Container(
+            width: double.infinity,
+            margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: Colors.red.shade50,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: Colors.red.shade300),
+            ),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(Icons.error_outline_rounded,
+                    size: 20, color: Colors.red.shade800),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text('Rules table is empty',
+                          style: GoogleFonts.manrope(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w800,
+                              color: Colors.red.shade900)),
+                      const SizedBox(height: 4),
+                      Text(
+                        'Migrations 20260423000003_billing_rules.sql and '
+                        '20260423000004_billing_rules_seed.sql have not '
+                        'been applied to this Supabase database. Edits '
+                        'made here will not persist.\n\n'
+                        'Ask the developer to run them in Supabase SQL '
+                        'Editor (in order), then pull-to-refresh this tab.',
+                        style: GoogleFonts.manrope(
+                          fontSize: 11,
+                          color: Colors.red.shade900,
+                          height: 1.35,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
         TabBar(
           controller: _tabs,
           isScrollable: true,
