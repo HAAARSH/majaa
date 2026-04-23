@@ -8,9 +8,12 @@
 --
 -- All FKs use TEXT (customers.id / products.id / orders.id are TEXT, NOT
 -- UUID — see 20260323072756_fmcg_core_schema.sql). app_users.id is UUID.
--- RLS: admin + super_admin only, with team scoping. Follows the
--- auth.uid()::TEXT cast pattern established in
--- 20260331000001_enhance_collections.sql:75.
+-- RLS: admin + super_admin only, with team scoping. Uses
+-- id::TEXT = auth.uid()::TEXT — both sides cast to TEXT. app_users.id
+-- is UUID and auth.uid() returns UUID; casting both to TEXT sidesteps
+-- the "operator does not exist: uuid = text" error and works
+-- regardless of whether auth.uid() returns UUID or TEXT across
+-- Supabase versions.
 -- ─────────────────────────────────────────────────────────────────────────
 
 -- ═════════════════════════════════════════════════════════════════════════
@@ -71,12 +74,12 @@ DROP POLICY IF EXISTS "Admins manage product aliases" ON public.product_alias_le
 CREATE POLICY "Admins manage product aliases"
   ON public.product_alias_learning FOR ALL
   USING (
-    (SELECT role FROM public.app_users WHERE id = auth.uid()::TEXT) IN ('admin', 'super_admin')
-    AND team_id = (SELECT team_id FROM public.app_users WHERE id = auth.uid()::TEXT)
+    (SELECT role FROM public.app_users WHERE id::TEXT = auth.uid()::TEXT) IN ('admin', 'super_admin')
+    AND team_id = (SELECT team_id FROM public.app_users WHERE id::TEXT = auth.uid()::TEXT)
   )
   WITH CHECK (
-    (SELECT role FROM public.app_users WHERE id = auth.uid()::TEXT) IN ('admin', 'super_admin')
-    AND team_id = (SELECT team_id FROM public.app_users WHERE id = auth.uid()::TEXT)
+    (SELECT role FROM public.app_users WHERE id::TEXT = auth.uid()::TEXT) IN ('admin', 'super_admin')
+    AND team_id = (SELECT team_id FROM public.app_users WHERE id::TEXT = auth.uid()::TEXT)
   );
 
 
@@ -110,12 +113,12 @@ DROP POLICY IF EXISTS "Admins manage customer aliases" ON public.customer_alias_
 CREATE POLICY "Admins manage customer aliases"
   ON public.customer_alias_learning FOR ALL
   USING (
-    (SELECT role FROM public.app_users WHERE id = auth.uid()::TEXT) IN ('admin', 'super_admin')
-    AND team_id = (SELECT team_id FROM public.app_users WHERE id = auth.uid()::TEXT)
+    (SELECT role FROM public.app_users WHERE id::TEXT = auth.uid()::TEXT) IN ('admin', 'super_admin')
+    AND team_id = (SELECT team_id FROM public.app_users WHERE id::TEXT = auth.uid()::TEXT)
   )
   WITH CHECK (
-    (SELECT role FROM public.app_users WHERE id = auth.uid()::TEXT) IN ('admin', 'super_admin')
-    AND team_id = (SELECT team_id FROM public.app_users WHERE id = auth.uid()::TEXT)
+    (SELECT role FROM public.app_users WHERE id::TEXT = auth.uid()::TEXT) IN ('admin', 'super_admin')
+    AND team_id = (SELECT team_id FROM public.app_users WHERE id::TEXT = auth.uid()::TEXT)
   );
 
 
@@ -163,12 +166,12 @@ DROP POLICY IF EXISTS "Admins manage import history" ON public.smart_import_hist
 CREATE POLICY "Admins manage import history"
   ON public.smart_import_history FOR ALL
   USING (
-    (SELECT role FROM public.app_users WHERE id = auth.uid()::TEXT) IN ('admin', 'super_admin')
-    AND team_id = (SELECT team_id FROM public.app_users WHERE id = auth.uid()::TEXT)
+    (SELECT role FROM public.app_users WHERE id::TEXT = auth.uid()::TEXT) IN ('admin', 'super_admin')
+    AND team_id = (SELECT team_id FROM public.app_users WHERE id::TEXT = auth.uid()::TEXT)
   )
   WITH CHECK (
-    (SELECT role FROM public.app_users WHERE id = auth.uid()::TEXT) IN ('admin', 'super_admin')
-    AND team_id = (SELECT team_id FROM public.app_users WHERE id = auth.uid()::TEXT)
+    (SELECT role FROM public.app_users WHERE id::TEXT = auth.uid()::TEXT) IN ('admin', 'super_admin')
+    AND team_id = (SELECT team_id FROM public.app_users WHERE id::TEXT = auth.uid()::TEXT)
   );
 
 
