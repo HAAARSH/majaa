@@ -682,6 +682,7 @@ class _AdminCustomersTabState extends State<AdminCustomersTab> {
                           return _CustomerCard(
                             customer: c,
                             onEdit: () => _showCustomerDialog(c),
+                            onBlockToggle: () => _showBlockDialog(c),
                           );
                         },
                       ),
@@ -691,6 +692,161 @@ class _AdminCustomersTabState extends State<AdminCustomersTab> {
         ],
       ),
     );
+  }
+
+  /// Block / unblock per-team. Opens a dialog asking which team to apply
+  /// the change on (if the customer is on both) and a reason (when
+  /// blocking). Hits SupabaseService.setCustomerOrderBlock which
+  /// invalidates both the customer cache and the block-cache so the
+  /// rep flow sees the change within 60s.
+  Future<void> _showBlockDialog(CustomerModel c) async {
+    final teams = <String>[
+      if (c.belongsToTeam('JA')) 'JA',
+      if (c.belongsToTeam('MA')) 'MA',
+    ];
+    if (teams.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Customer has no team profile')),
+      );
+      return;
+    }
+
+    String selectedTeam = teams.first;
+    final reasonCtl = TextEditingController();
+
+    final result = await showDialog<({String team, bool blocked, String? reason})>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setS) {
+          final currentlyBlocked = c.isOrderBlockedFor(selectedTeam);
+          return AlertDialog(
+            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+            title: Text('Block orders  ·  ${c.name}',
+                style: GoogleFonts.manrope(fontWeight: FontWeight.w800)),
+            content: SizedBox(
+              width: double.maxFinite,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  if (teams.length > 1) ...[
+                    Text('Team',
+                        style: GoogleFonts.manrope(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w700,
+                            color: AppTheme.onSurfaceVariant)),
+                    const SizedBox(height: 4),
+                    Row(children: [
+                      for (final t in teams)
+                        Padding(
+                          padding: const EdgeInsets.only(right: 6),
+                          child: ChoiceChip(
+                            label: Text(t),
+                            selected: selectedTeam == t,
+                            onSelected: (_) => setS(() => selectedTeam = t),
+                          ),
+                        ),
+                    ]),
+                    const SizedBox(height: 12),
+                  ],
+                  Text(
+                    currentlyBlocked
+                        ? 'Currently BLOCKED on $selectedTeam.'
+                            '${c.orderBlockReasonFor(selectedTeam) != null ? "\nReason: ${c.orderBlockReasonFor(selectedTeam)}" : ""}'
+                        : 'Currently open for orders on $selectedTeam.',
+                    style: GoogleFonts.manrope(
+                      fontSize: 12,
+                      color: currentlyBlocked ? Colors.red.shade700 : AppTheme.onSurfaceVariant,
+                      fontWeight: currentlyBlocked ? FontWeight.w700 : FontWeight.w500,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  if (!currentlyBlocked) ...[
+                    Text('Reason (required)',
+                        style: GoogleFonts.manrope(
+                            fontSize: 11, fontWeight: FontWeight.w700)),
+                    const SizedBox(height: 4),
+                    TextField(
+                      controller: reasonCtl,
+                      maxLines: 2,
+                      decoration: InputDecoration(
+                        hintText: 'Why is this customer being blocked?',
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+                        isDense: true,
+                        contentPadding: const EdgeInsets.all(10),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Cancel'),
+              ),
+              if (currentlyBlocked)
+                FilledButton.icon(
+                  style: FilledButton.styleFrom(backgroundColor: Colors.green.shade700),
+                  icon: const Icon(Icons.lock_open_rounded, size: 16),
+                  label: const Text('Unblock'),
+                  onPressed: () => Navigator.pop(ctx, (
+                    team: selectedTeam,
+                    blocked: false,
+                    reason: null,
+                  )),
+                )
+              else
+                FilledButton.icon(
+                  style: FilledButton.styleFrom(backgroundColor: Colors.red.shade700),
+                  icon: const Icon(Icons.block_rounded, size: 16),
+                  label: const Text('Block'),
+                  onPressed: () {
+                    if (reasonCtl.text.trim().isEmpty) {
+                      ScaffoldMessenger.of(ctx).showSnackBar(
+                        const SnackBar(content: Text('Reason is required')),
+                      );
+                      return;
+                    }
+                    Navigator.pop(ctx, (
+                      team: selectedTeam,
+                      blocked: true,
+                      reason: reasonCtl.text.trim(),
+                    ));
+                  },
+                ),
+            ],
+          );
+        },
+      ),
+    );
+
+    if (result == null || !mounted) return;
+
+    try {
+      await SupabaseService.instance.setCustomerOrderBlock(
+        customerId: c.id,
+        teamId: result.team,
+        blocked: result.blocked,
+        reason: result.reason,
+      );
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(result.blocked
+              ? '${c.name} blocked on ${result.team}'
+              : '${c.name} unblocked on ${result.team}'),
+          backgroundColor: result.blocked ? Colors.red.shade700 : Colors.green.shade700,
+        ),
+      );
+      // Refresh the list so the chip + action button reflect new state.
+      await _load(forceRefresh: true);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Block change failed: $e'), backgroundColor: Colors.red),
+      );
+    }
   }
 
   Future<void> _showCsvUploadSheet() async {
@@ -804,10 +960,12 @@ class _AdminCustomersTabState extends State<AdminCustomersTab> {
 class _CustomerCard extends StatelessWidget {
   final CustomerModel customer;
   final VoidCallback onEdit;
+  final VoidCallback? onBlockToggle;
 
   const _CustomerCard({
     required this.customer,
     required this.onEdit,
+    this.onBlockToggle,
   });
 
   @override
@@ -851,22 +1009,56 @@ class _CustomerCard extends StatelessWidget {
                         fontSize: 12, color: AppTheme.onSurfaceVariant),
                   ),
                   const SizedBox(height: 4),
-                  // ADDED: team badges
-                  Row(
+                  // ADDED: team badges + per-team BLOCKED indicator (2026-04-24)
+                  Wrap(
+                    spacing: 4,
+                    runSpacing: 4,
                     children: [
                       if (customer.belongsToTeam('JA'))
                         Container(
-                          margin: const EdgeInsets.only(right: 4),
                           padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
-                          decoration: BoxDecoration(color: Colors.blue.withValues(alpha: 0.12), borderRadius: BorderRadius.circular(4)),
-                          child: Text('JA', style: GoogleFonts.manrope(fontSize: 9, fontWeight: FontWeight.w800, color: Colors.blue)),
+                          decoration: BoxDecoration(
+                            color: customer.isOrderBlockedFor('JA')
+                                ? Colors.red.withValues(alpha: 0.15)
+                                : Colors.blue.withValues(alpha: 0.12),
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: Row(mainAxisSize: MainAxisSize.min, children: [
+                            if (customer.isOrderBlockedFor('JA'))
+                              Icon(Icons.block_rounded, size: 9, color: Colors.red.shade700),
+                            if (customer.isOrderBlockedFor('JA'))
+                              const SizedBox(width: 2),
+                            Text(customer.isOrderBlockedFor('JA') ? 'JA BLOCKED' : 'JA',
+                                style: GoogleFonts.manrope(
+                                    fontSize: 9,
+                                    fontWeight: FontWeight.w800,
+                                    color: customer.isOrderBlockedFor('JA')
+                                        ? Colors.red.shade700
+                                        : Colors.blue)),
+                          ]),
                         ),
                       if (customer.belongsToTeam('MA'))
                         Container(
-                          margin: const EdgeInsets.only(right: 4),
                           padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
-                          decoration: BoxDecoration(color: Colors.orange.withValues(alpha: 0.12), borderRadius: BorderRadius.circular(4)),
-                          child: Text('MA', style: GoogleFonts.manrope(fontSize: 9, fontWeight: FontWeight.w800, color: Colors.orange)),
+                          decoration: BoxDecoration(
+                            color: customer.isOrderBlockedFor('MA')
+                                ? Colors.red.withValues(alpha: 0.15)
+                                : Colors.orange.withValues(alpha: 0.12),
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: Row(mainAxisSize: MainAxisSize.min, children: [
+                            if (customer.isOrderBlockedFor('MA'))
+                              Icon(Icons.block_rounded, size: 9, color: Colors.red.shade700),
+                            if (customer.isOrderBlockedFor('MA'))
+                              const SizedBox(width: 2),
+                            Text(customer.isOrderBlockedFor('MA') ? 'MA BLOCKED' : 'MA',
+                                style: GoogleFonts.manrope(
+                                    fontSize: 9,
+                                    fontWeight: FontWeight.w800,
+                                    color: customer.isOrderBlockedFor('MA')
+                                        ? Colors.red.shade700
+                                        : Colors.orange)),
+                          ]),
                         ),
                     ],
                   ),
@@ -899,6 +1091,29 @@ class _CustomerCard extends StatelessWidget {
                     ),
                   ),
                 ),
+                if (onBlockToggle != null) ...[
+                  const SizedBox(height: 6),
+                  GestureDetector(
+                    onTap: onBlockToggle,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                      decoration: BoxDecoration(
+                        color: Colors.red.shade50,
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: Colors.red.shade200),
+                      ),
+                      child: Row(mainAxisSize: MainAxisSize.min, children: [
+                        Icon(Icons.block_rounded, size: 12, color: Colors.red.shade700),
+                        const SizedBox(width: 4),
+                        Text('Block',
+                            style: GoogleFonts.manrope(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w700,
+                                color: Colors.red.shade700)),
+                      ]),
+                    ),
+                  ),
+                ],
               ],
             ),
           ],

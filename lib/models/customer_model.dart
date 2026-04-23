@@ -23,6 +23,17 @@ class CustomerTeamProfile {
   final String? orderBeatIdMa;
   final String orderBeatNameMa;
 
+  // Manual order blocks (per-team). See
+  // 20260424000001_customer_block_flags.sql.
+  final bool orderBlockedJa;
+  final bool orderBlockedMa;
+  final String? orderBlockReasonJa;
+  final String? orderBlockReasonMa;
+  final DateTime? orderBlockSetAtJa;
+  final DateTime? orderBlockSetAtMa;
+  final String? orderBlockSetByJa; // app_users.id
+  final String? orderBlockSetByMa;
+
   const CustomerTeamProfile({
     required this.id,
     required this.customerId,
@@ -42,6 +53,14 @@ class CustomerTeamProfile {
     this.orderBeatNameJa = '',
     this.orderBeatIdMa,
     this.orderBeatNameMa = '',
+    this.orderBlockedJa = false,
+    this.orderBlockedMa = false,
+    this.orderBlockReasonJa,
+    this.orderBlockReasonMa,
+    this.orderBlockSetAtJa,
+    this.orderBlockSetAtMa,
+    this.orderBlockSetByJa,
+    this.orderBlockSetByMa,
   });
 
   factory CustomerTeamProfile.fromJson(Map<String, dynamic> json) =>
@@ -64,6 +83,18 @@ class CustomerTeamProfile {
         orderBeatNameJa: json['order_beat_name_ja'] as String? ?? '',
         orderBeatIdMa: json['order_beat_id_ma'] as String?,
         orderBeatNameMa: json['order_beat_name_ma'] as String? ?? '',
+        orderBlockedJa: json['order_blocked_ja'] as bool? ?? false,
+        orderBlockedMa: json['order_blocked_ma'] as bool? ?? false,
+        orderBlockReasonJa: json['order_block_reason_ja'] as String?,
+        orderBlockReasonMa: json['order_block_reason_ma'] as String?,
+        orderBlockSetAtJa: json['order_block_set_at_ja'] == null
+            ? null
+            : DateTime.tryParse(json['order_block_set_at_ja'].toString()),
+        orderBlockSetAtMa: json['order_block_set_at_ma'] == null
+            ? null
+            : DateTime.tryParse(json['order_block_set_at_ma'].toString()),
+        orderBlockSetByJa: json['order_block_set_by_ja'] as String?,
+        orderBlockSetByMa: json['order_block_set_by_ma'] as String?,
       );
 
   Map<String, dynamic> toJson() => {
@@ -111,6 +142,16 @@ class CustomerTeamProfile {
 
   /// Helper: current year billed for a given team
   double currentYearBilledFor(String team) => team == 'JA' ? currentYearBilledJa : currentYearBilledMa;
+
+  /// Admin-set manual block for [team]. When true, reps cannot create
+  /// new orders for this customer on [team] regardless of outstanding /
+  /// overdue state. Auto-block thresholds are separate (BillingRules).
+  bool orderBlockedFor(String team) =>
+      team == 'JA' ? orderBlockedJa : orderBlockedMa;
+
+  /// Block reason for [team] when orderBlockedFor(team) is true.
+  String? orderBlockReasonFor(String team) =>
+      team == 'JA' ? orderBlockReasonJa : orderBlockReasonMa;
 }
 
 class CustomerModel {
@@ -228,6 +269,14 @@ class CustomerModel {
 
   /// Does this customer belong to [team]?
   bool belongsToTeam(String team) => _profile?.belongsToTeam(team) ?? false;
+
+  /// True when admin has manually blocked this customer's orders on [team].
+  bool isOrderBlockedFor(String team) =>
+      _profile?.orderBlockedFor(team) ?? false;
+
+  /// Reason admin gave for the block on [team], if any.
+  String? orderBlockReasonFor(String team) =>
+      _profile?.orderBlockReasonFor(team);
 
   CustomerModel copyWith({String? phone}) {
     return CustomerModel(

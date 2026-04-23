@@ -314,6 +314,10 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
     // tests) get the legacy behaviour. New code should pass the value
     // from a BillingRulesSnapshot so per-team configuration applies.
     MergingStrategy mergingStrategy = MergingStrategy.splitByRepRole,
+    // Customer-category rule: customers in this set NEVER merge. Their
+    // orders stay one-invoice-per-order even when mergingStrategy would
+    // otherwise merge them. Empty set (default) = rule disabled.
+    Set<String> noMergeCustomerIds = const {},
   }) {
     final buffer = StringBuffer();
     const t = '\t';
@@ -383,6 +387,13 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
     final salesRepOrders = <OrderModel>[];
     final brandRepOrders = <OrderModel>[];
     for (final o in orders) {
+      // No-merge customer exception: force the per-order (sales_rep)
+      // path regardless of team mergingStrategy. Set is populated from
+      // billing_rules.no_merge_customer_ids for this team's CSV.
+      if (o.customerId != null && noMergeCustomerIds.contains(o.customerId)) {
+        salesRepOrders.add(o);
+        continue;
+      }
       switch (mergingStrategy) {
         case MergingStrategy.mergeAllByCustomer:
           brandRepOrders.add(o);
@@ -1141,6 +1152,7 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
         writtenLineItemIdsSink: jaLineSink,
         writtenOrderIdsSink: jaOrderSink,
         mergingStrategy: rulesSnapshot.mergingFor('JA'),
+        noMergeCustomerIds: rulesSnapshot.noMergeCustomerIdsFor('JA'),
       );
       filesToDownload.add(MapEntry(jaFileName, csv));
       writtenLineItemIds.addAll(jaLineSink);
@@ -1169,6 +1181,7 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
         writtenLineItemIdsSink: maLineSink,
         writtenOrderIdsSink: maOrderSink,
         mergingStrategy: rulesSnapshot.mergingFor('MA'),
+        noMergeCustomerIds: rulesSnapshot.noMergeCustomerIdsFor('MA'),
       );
       filesToDownload.add(MapEntry(maFileName, csv));
       writtenLineItemIds.addAll(maLineSink);

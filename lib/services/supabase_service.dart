@@ -6,6 +6,7 @@ import 'package:http/http.dart' as http;
 import 'package:hive_flutter/hive_flutter.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'auth_service.dart';
+import 'billing_rules_service.dart';
 import 'google_drive_auth_service.dart';
 import 'gemini_ocr_service.dart';
 import '../models/models.dart';
@@ -314,7 +315,7 @@ class SupabaseService {
       while (true) {
         final batch = await client
             .from('customers')
-            .select('*, customer_team_profiles(id, customer_id, team_ja, team_ma, beat_id_ja, beat_name_ja, outstanding_ja, beat_id_ma, beat_name_ma, outstanding_ma, order_beat_id_ja, order_beat_name_ja, order_beat_id_ma, order_beat_name_ma)') // CHANGED: unified profile columns
+            .select('*, customer_team_profiles(id, customer_id, team_ja, team_ma, beat_id_ja, beat_name_ja, outstanding_ja, beat_id_ma, beat_name_ma, outstanding_ma, order_beat_id_ja, order_beat_name_ja, order_beat_id_ma, order_beat_name_ma, order_blocked_ja, order_blocked_ma, order_block_reason_ja, order_block_reason_ma, order_block_set_at_ja, order_block_set_at_ma, order_block_set_by_ja, order_block_set_by_ma)') // CHANGED: unified profile columns
             .order('name')
             .range(offset, offset + batchSize - 1);
         all.addAll(batch);
@@ -329,7 +330,7 @@ class SupabaseService {
   Future<CustomerModel?> getCustomerById(String id) async {
     try {
       final resp = await client.from('customers')
-          .select('*, customer_team_profiles(id, customer_id, team_ja, team_ma, beat_id_ja, beat_name_ja, outstanding_ja, beat_id_ma, beat_name_ma, outstanding_ma, order_beat_id_ja, order_beat_name_ja, order_beat_id_ma, order_beat_name_ma)')
+          .select('*, customer_team_profiles(id, customer_id, team_ja, team_ma, beat_id_ja, beat_name_ja, outstanding_ja, beat_id_ma, beat_name_ma, outstanding_ma, order_beat_id_ja, order_beat_name_ja, order_beat_id_ma, order_beat_name_ma, order_blocked_ja, order_blocked_ma, order_block_reason_ja, order_block_reason_ma, order_block_set_at_ja, order_block_set_at_ma, order_block_set_by_ja, order_block_set_by_ma)')
           .eq('id', id)
           .maybeSingle();
       if (resp == null) return null;
@@ -1547,6 +1548,42 @@ class SupabaseService {
     } catch (e) {
       debugPrint('⚠️ updateCustomerLastOrder failed: $e');
     }
+  }
+
+  /// Set or clear the manual order-block flag on a customer for a specific
+  /// team. [blocked]=false clears the reason + timestamp too. Columns are
+  /// on `customer_team_profiles` (one row per customer, team_ja/team_ma
+  /// booleans inside). See migration 20260424000001.
+  ///
+  /// After toggling, caches are invalidated so the rep sees the change on
+  /// the next order-creation click (within the 60s block-cache TTL).
+  Future<void> setCustomerOrderBlock({
+    required String customerId,
+    required String teamId,
+    required bool blocked,
+    String? reason,
+  }) async {
+    final blockCol = teamId == 'JA' ? 'order_blocked_ja' : 'order_blocked_ma';
+    final reasonCol = teamId == 'JA' ? 'order_block_reason_ja' : 'order_block_reason_ma';
+    final setAtCol = teamId == 'JA' ? 'order_block_set_at_ja' : 'order_block_set_at_ma';
+    final setByCol = teamId == 'JA' ? 'order_block_set_by_ja' : 'order_block_set_by_ma';
+    final authUid = client.auth.currentUser?.id;
+    final appUid = authUid == null ? null : await _resolveAppUserId(authUid);
+    final now = blocked ? DateTime.now().toIso8601String() : null;
+    final data = <String, dynamic>{
+      blockCol: blocked,
+      reasonCol: blocked ? (reason == null || reason.trim().isEmpty ? null : reason.trim()) : null,
+      setAtCol: now,
+      setByCol: blocked ? appUid : null,
+    };
+    await client
+        .from('customer_team_profiles')
+        .update(data)
+        .eq('customer_id', customerId);
+    // Blow customer cache so admin's list repaints with the new flag.
+    await invalidateCache('customers');
+    // Blow per-customer block cache so rep path re-evaluates immediately.
+    BillingRulesService.instance.invalidateBlockCache(customerId);
   }
 
 

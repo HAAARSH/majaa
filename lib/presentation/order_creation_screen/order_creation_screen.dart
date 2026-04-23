@@ -109,6 +109,42 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
       return;
     }
 
+    // Customer-block gate (added 2026-04-24 with the Rules Tab customer-
+    // category rules). Combines manual admin block on the profile row
+    // with auto-block thresholds from billing_rules. Cached 60s, so
+    // admin's block takes effect on the rep's next submit within a
+    // minute of toggling.
+    final block = await BillingRulesService.instance.isCustomerBlocked(
+      _selectedCustomer!.id,
+      AuthService.currentTeam,
+    );
+    if (block.blocked) {
+      _submitLock = false;
+      if (!mounted) return;
+      await showDialog<void>(
+        context: context,
+        builder: (_) => AlertDialog(
+          title: Row(children: [
+            Icon(Icons.block_rounded, color: Colors.red.shade700),
+            const SizedBox(width: 8),
+            const Text('Customer blocked'),
+          ]),
+          content: Text(
+            '${_selectedCustomer!.name} cannot place new orders right now.\n\n'
+            '${block.reason ?? "Contact admin for details."}',
+            style: const TextStyle(fontSize: 13, height: 1.4),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('OK'),
+            ),
+          ],
+        ),
+      );
+      return;
+    }
+
     // Defense-in-depth: brand access is enforced at product list time
     // (see products_screen), but a stale cart restored from a previous
     // session could theoretically contain now-disallowed items. Instead of

@@ -382,7 +382,30 @@ class _AdminRulesTabState extends State<AdminRulesTab>
             const SizedBox(height: 4),
             Text(description,
                 style: GoogleFonts.manrope(
-                    fontSize: 11, color: AppTheme.onSurfaceVariant)),
+                    fontSize: 11,
+                    color: AppTheme.onSurfaceVariant,
+                    fontStyle: FontStyle.italic)),
+          ],
+          // Expandable "Learn more" panel — pulls hardcoded copy keyed
+          // by rule_key from _help. Collapsed by default; a small hint
+          // on the tappable tile keeps it low-noise.
+          if (_help.containsKey(ruleKey)) ...[
+            const SizedBox(height: 6),
+            Theme(
+              data: Theme.of(context).copyWith(
+                dividerColor: Colors.transparent,
+                listTileTheme: const ListTileThemeData(dense: true),
+              ),
+              child: ExpansionTile(
+                tilePadding: EdgeInsets.zero,
+                childrenPadding: const EdgeInsets.only(bottom: 6),
+                leading: const Icon(Icons.info_outline_rounded, size: 16),
+                title: Text('Learn more',
+                    style: GoogleFonts.manrope(
+                        fontSize: 11, fontWeight: FontWeight.w700, color: AppTheme.primary)),
+                children: [_buildHelpPanel(_help[ruleKey]!)],
+              ),
+            ),
           ],
           const SizedBox(height: 6),
           Text(
@@ -395,6 +418,37 @@ class _AdminRulesTabState extends State<AdminRulesTab>
                 color: AppTheme.onSurfaceVariant,
                 fontStyle: FontStyle.italic),
           ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildHelpPanel(_RuleHelp help) {
+    TextStyle head() => GoogleFonts.manrope(
+        fontSize: 10, fontWeight: FontWeight.w800, letterSpacing: 0.4,
+        color: AppTheme.primary);
+    TextStyle body() => GoogleFonts.manrope(
+        fontSize: 11, color: AppTheme.onSurface, height: 1.4);
+    return Container(
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: AppTheme.primaryContainer.withValues(alpha: 0.35),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('WHAT IT DOES', style: head()),
+          const SizedBox(height: 2),
+          Text(help.what, style: body()),
+          const SizedBox(height: 8),
+          Text('WHERE IT\'S USED', style: head()),
+          const SizedBox(height: 2),
+          Text(help.where, style: body()),
+          const SizedBox(height: 8),
+          Text('EXAMPLE', style: head()),
+          const SizedBox(height: 2),
+          Text(help.example, style: body()),
         ],
       ),
     );
@@ -428,8 +482,57 @@ class _AdminRulesTabState extends State<AdminRulesTab>
     if (value is Map) {
       return value.entries.map((e) => '${e.key} → ${e.value}').join(', ');
     }
+    if (value is List) {
+      return value.isEmpty ? '(empty — rule disabled)' : '${value.length} item(s)';
+    }
+    if (value is num) {
+      return value == 0 ? '0  (disabled)' : value.toString();
+    }
     return value?.toString() ?? '—';
   }
+
+  /// Per-rule help copy. Shown inside the expandable "Learn more" panel
+  /// on every rule card. Hardcoded here (not in the DB) so we can evolve
+  /// the docs without a migration.
+  static const Map<String, _RuleHelp> _help = {
+    'export_merging_strategy': _RuleHelp(
+      what: 'How orders are grouped into invoices when you export the CSV.',
+      where: 'Export button on the Orders tab. Applied per team, so JA and MA can use different strategies.',
+      example: 'split_by_rep_role = brand_rep orders merge per customer; sales_rep orders stay one-per-order.\n'
+          'merge_all_by_customer = EVERY order for a customer collapses into one invoice.\n'
+          'no_merge = every order is its own invoice regardless of rep.',
+    ),
+    'pricing_csds_enabled': _RuleHelp(
+      what: 'Switch to apply the DUA customer-specific discount cascade (D1 → D3 → D5) + scheme free-goods on order save.',
+      where: 'Every order-creation path (rep and admin). Read once at order-start, cached for that session.',
+      example: 'Off → rep sees MRP × qty. On → rep sees MRP × qty minus each discount layer, plus any free goods the scheme adds.',
+    ),
+    'organic_india_default_by_customer_type': _RuleHelp(
+      what: 'Default billing team for Organic India items based on the customer''s type (Pharmacy, General Trade, etc.).',
+      where: 'Organic India picker dialog during CSV export. Admin can still override per customer row.',
+      example: '{"pharmacy": "JA", "_default": "MA"} — pharmacies default to JA, everyone else MA.',
+    ),
+    'stock_zero_grace_days': _RuleHelp(
+      what: 'Days a product stays billable by reps after stock first hits zero.',
+      where: 'Rep product list + detail screen. Admin products tab shows "in grace" vs "out" counts.',
+      example: '2 → 2-day grace (default). 0 → reps locked immediately on zero. 5 → week-long cushion.',
+    ),
+    'no_merge_customer_ids': _RuleHelp(
+      what: 'Customer IDs that must NEVER merge into a combined brand_rep invoice at export. Their orders stay one-invoice-per-order.',
+      where: 'Export CSV build on the Orders tab. Applied per team.',
+      example: '["cust-001", "cust-042"] — those two customers always get one invoice per order even if mergingStrategy says "merge_all".',
+    ),
+    'auto_block_overdue_days': _RuleHelp(
+      what: 'Auto-block new orders when a customer''s oldest unpaid bill is older than N days.',
+      where: 'Order creation (rep flow and admin Manual tab). Block is checked at save-click.',
+      example: '30 → customer with a 31-day-old unpaid bill is blocked with reason "oldest unpaid bill exceeds 30-day threshold". 0 = disabled.',
+    ),
+    'auto_block_outstanding': _RuleHelp(
+      what: 'Auto-block new orders when a customer''s outstanding balance exceeds this rupee amount.',
+      where: 'Order creation (rep flow and admin Manual tab). Block is checked at save-click.',
+      example: '50000 → customer with ₹51,200 outstanding is blocked. 0 = disabled.',
+    ),
+  };
 
   String _relativeTime(DateTime when) {
     final diff = DateTime.now().difference(when);
@@ -450,12 +553,225 @@ class _AdminRulesTabState extends State<AdminRulesTab>
       await _editMergingStrategy(rule);
     } else if (value is Map) {
       await _editMap(rule);
+    } else if (value is num) {
+      await _editNumber(rule);
+    } else if (value is List) {
+      await _editStringList(rule);
     } else {
       Fluttertoast.showToast(
         msg: 'Editing this rule type is not supported in the UI yet.',
         toastLength: Toast.LENGTH_LONG,
       );
     }
+  }
+
+  /// Number editor. Used by auto_block_overdue_days (int) and
+  /// auto_block_outstanding (any num). Writes back as a JSON number.
+  Future<void> _editNumber(Map<String, dynamic> rule) async {
+    final current = (rule['value'] as num).toString();
+    final valueCtrl = TextEditingController(text: current);
+    final reasonCtrl = TextEditingController();
+    final result = await showDialog<num>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Edit ${_humanRuleKey(rule['rule_key'] as String)}',
+            style: GoogleFonts.manrope(fontWeight: FontWeight.w800)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (rule['description'] != null)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: Text(rule['description'] as String,
+                    style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
+              ),
+            TextField(
+              controller: valueCtrl,
+              autofocus: true,
+              keyboardType: const TextInputType.numberWithOptions(decimal: true),
+              decoration: InputDecoration(
+                labelText: 'Value (0 disables the rule)',
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+              ),
+            ),
+            const SizedBox(height: 10),
+            TextField(
+              controller: reasonCtrl,
+              maxLines: 2,
+              decoration: InputDecoration(
+                labelText: 'Reason (optional, stored in audit log)',
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          FilledButton(
+            onPressed: () {
+              final parsed = num.tryParse(valueCtrl.text.trim());
+              if (parsed == null) {
+                ScaffoldMessenger.of(ctx).showSnackBar(
+                  const SnackBar(content: Text('Not a number')),
+                );
+                return;
+              }
+              if (parsed < 0) {
+                ScaffoldMessenger.of(ctx).showSnackBar(
+                  const SnackBar(content: Text('Value must be ≥ 0')),
+                );
+                return;
+              }
+              Navigator.pop(ctx, parsed);
+            },
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    if (result == null) return;
+    final json = result is int ? result : (result == result.toInt() ? result.toInt() : result);
+    await _saveRule(
+        rule: rule, newValue: json, reason: reasonCtrl.text);
+  }
+
+  /// Editor for a JSON string list — today used only for
+  /// no_merge_customer_ids. Renders current IDs as removable chips, with
+  /// a picker at the bottom to add more from the team's customer roster.
+  Future<void> _editStringList(Map<String, dynamic> rule) async {
+    final current = List<String>.from(
+        (rule['value'] as List).map((e) => e.toString()));
+    final scopeTeam = rule['scope_id']?.toString();
+    final reasonCtrl = TextEditingController();
+
+    // Load the team's customer roster for the autocomplete.
+    List<CustomerModel> roster;
+    try {
+      final all = await SupabaseService.instance.getCustomers();
+      roster = scopeTeam == null
+          ? all
+          : all.where((c) => c.belongsToTeam(scopeTeam)).toList();
+    } catch (e) {
+      roster = const [];
+    }
+    if (!mounted) return;
+
+    final result = await showDialog<List<String>>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setS) {
+          final pickerCtrl = TextEditingController();
+          final query = pickerCtrl.text.trim().toLowerCase();
+          final matches = query.isEmpty
+              ? roster.take(8).toList()
+              : roster.where((c) =>
+                  c.name.toLowerCase().contains(query) ||
+                  c.phone.contains(query) ||
+                  c.id.contains(query))
+                .take(20).toList();
+          return AlertDialog(
+            title: Text('Edit ${_humanRuleKey(rule['rule_key'] as String)} '
+                '${scopeTeam != null ? "· $scopeTeam" : ""}',
+                style: GoogleFonts.manrope(fontWeight: FontWeight.w800)),
+            content: SizedBox(
+              width: double.maxFinite,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  if (rule['description'] != null)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 10),
+                      child: Text(rule['description'] as String,
+                          style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
+                    ),
+                  Text('Current list (${current.length}):',
+                      style: GoogleFonts.manrope(fontSize: 11, fontWeight: FontWeight.w700)),
+                  const SizedBox(height: 6),
+                  if (current.isEmpty)
+                    Text('(empty — no customers excluded from merge)',
+                        style: GoogleFonts.manrope(
+                            fontSize: 11, color: AppTheme.onSurfaceVariant, fontStyle: FontStyle.italic))
+                  else
+                    Wrap(spacing: 6, runSpacing: 6, children: [
+                      for (final id in current)
+                        InputChip(
+                          label: Text(
+                            roster.firstWhere(
+                                  (c) => c.id == id,
+                                  orElse: () => const CustomerModel(
+                                      id: '', name: '', address: '', phone: '',
+                                      type: '', lastOrderValue: 0),
+                                ).name.isEmpty
+                                ? id
+                                : roster.firstWhere((c) => c.id == id).name,
+                            style: GoogleFonts.manrope(fontSize: 11),
+                          ),
+                          onDeleted: () => setS(() => current.remove(id)),
+                        ),
+                    ]),
+                  const Divider(height: 24),
+                  Text('Add a customer:',
+                      style: GoogleFonts.manrope(fontSize: 11, fontWeight: FontWeight.w700)),
+                  const SizedBox(height: 4),
+                  TextField(
+                    controller: pickerCtrl,
+                    onChanged: (_) => setS(() {}),
+                    decoration: InputDecoration(
+                      hintText: 'Search name / phone / id',
+                      prefixIcon: const Icon(Icons.search_rounded, size: 16),
+                      isDense: true,
+                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  ConstrainedBox(
+                    constraints: const BoxConstraints(maxHeight: 180),
+                    child: ListView(shrinkWrap: true, children: [
+                      for (final c in matches)
+                        ListTile(
+                          dense: true,
+                          title: Text(c.name, style: GoogleFonts.manrope(fontSize: 12)),
+                          subtitle: Text('${c.phone}  ·  ${c.id}',
+                              style: GoogleFonts.manrope(fontSize: 10, color: AppTheme.onSurfaceVariant)),
+                          trailing: current.contains(c.id)
+                              ? const Icon(Icons.check, color: Colors.green, size: 18)
+                              : const Icon(Icons.add_circle_outline, size: 18),
+                          onTap: current.contains(c.id)
+                              ? null
+                              : () => setS(() => current.add(c.id)),
+                        ),
+                      if (matches.isEmpty)
+                        Padding(
+                          padding: const EdgeInsets.all(8),
+                          child: Text('No matches',
+                              style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
+                        ),
+                    ]),
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: reasonCtrl,
+                    maxLines: 2,
+                    decoration: InputDecoration(
+                      labelText: 'Reason (optional, stored in audit log)',
+                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+              FilledButton(onPressed: () => Navigator.pop(ctx, current), child: const Text('Save')),
+            ],
+          );
+        },
+      ),
+    );
+    if (result == null) return;
+    await _saveRule(rule: rule, newValue: result, reason: reasonCtrl.text);
   }
 
   Future<void> _editBool(Map<String, dynamic> rule) async {
@@ -878,4 +1194,13 @@ class _AuditLogViewState extends State<_AuditLogView> {
     if (d.inDays < 1) return '${d.inHours}h';
     return '${d.inDays}d';
   }
+}
+
+/// Immutable hardcoded help copy for a single rule_key. Rendered inside
+/// the expandable panel on each rule card in the Rules Tab.
+class _RuleHelp {
+  final String what;
+  final String where;
+  final String example;
+  const _RuleHelp({required this.what, required this.where, required this.example});
 }

@@ -52,12 +52,27 @@ class BillingRulesSnapshot {
   final MergingStrategy mergingForMa;
   final Map<String, String> organicIndiaDefaults; // lowercased keys
   final String organicIndiaFallback;
+  /// Per-team customer IDs that must NEVER merge at export.
+  final Set<String> noMergeCustomerIdsJa;
+  final Set<String> noMergeCustomerIdsMa;
+  /// Per-team auto-block threshold in days. 0 = disabled.
+  final int autoBlockOverdueDaysJa;
+  final int autoBlockOverdueDaysMa;
+  /// Per-team auto-block outstanding rupee threshold. 0 = disabled.
+  final double autoBlockOutstandingJa;
+  final double autoBlockOutstandingMa;
 
   const BillingRulesSnapshot({
     required this.mergingForJa,
     required this.mergingForMa,
     required this.organicIndiaDefaults,
     required this.organicIndiaFallback,
+    this.noMergeCustomerIdsJa = const {},
+    this.noMergeCustomerIdsMa = const {},
+    this.autoBlockOverdueDaysJa = 0,
+    this.autoBlockOverdueDaysMa = 0,
+    this.autoBlockOutstandingJa = 0,
+    this.autoBlockOutstandingMa = 0,
   });
 
   MergingStrategy mergingFor(String teamId) =>
@@ -70,6 +85,15 @@ class BillingRulesSnapshot {
     final key = (customerType ?? '').toLowerCase().trim();
     return organicIndiaDefaults[key] ?? organicIndiaFallback;
   }
+
+  Set<String> noMergeCustomerIdsFor(String teamId) =>
+      teamId == 'JA' ? noMergeCustomerIdsJa : noMergeCustomerIdsMa;
+
+  int autoBlockOverdueDaysFor(String teamId) =>
+      teamId == 'JA' ? autoBlockOverdueDaysJa : autoBlockOverdueDaysMa;
+
+  double autoBlockOutstandingFor(String teamId) =>
+      teamId == 'JA' ? autoBlockOutstandingJa : autoBlockOutstandingMa;
 }
 
 class BillingRulesService {
@@ -189,18 +213,181 @@ class BillingRulesService {
         }
       });
     }
+    // Customer-category rules (Phase B of Rules Tab customer work).
+    Set<String> readIdSet(String teamId) {
+      final raw = _readSync('no_merge_customer_ids', 'team', teamId);
+      if (raw is List) {
+        return raw.map((e) => e.toString()).toSet();
+      }
+      return const <String>{};
+    }
+    int readInt(String key, String teamId, int fallback) {
+      final v = _readSync(key, 'team', teamId);
+      if (v is int) return v;
+      if (v is num) return v.toInt();
+      if (v is String) return int.tryParse(v) ?? fallback;
+      return fallback;
+    }
+    double readDouble(String key, String teamId, double fallback) {
+      final v = _readSync(key, 'team', teamId);
+      if (v is num) return v.toDouble();
+      if (v is String) return double.tryParse(v) ?? fallback;
+      return fallback;
+    }
+
     return BillingRulesSnapshot(
       mergingForJa: mergingForJa,
       mergingForMa: mergingForMa,
       organicIndiaDefaults: oiMap,
       organicIndiaFallback: fallback,
+      noMergeCustomerIdsJa: readIdSet('JA'),
+      noMergeCustomerIdsMa: readIdSet('MA'),
+      autoBlockOverdueDaysJa: readInt('auto_block_overdue_days', 'JA', 0),
+      autoBlockOverdueDaysMa: readInt('auto_block_overdue_days', 'MA', 0),
+      autoBlockOutstandingJa: readDouble('auto_block_outstanding', 'JA', 0),
+      autoBlockOutstandingMa: readDouble('auto_block_outstanding', 'MA', 0),
     );
   }
+
+  // ── Customer block check ─────────────────────────────────────────────
+
+  /// Returns block status for a customer on a team. Combines the manual
+  /// `order_blocked_*` flag on `customer_team_profiles` with the auto-
+  /// block thresholds from billing_rules. Manual reason wins when both
+  /// trigger (explicit > derived). Cached 60s per (customer, team).
+  ///
+  /// Caller pattern:
+  ///   final r = await BillingRulesService.instance.isCustomerBlocked(id, 'JA');
+  ///   if (r.blocked) showDialog(...r.reason);
+  Future<({bool blocked, String? reason, String source})> isCustomerBlocked(
+    String customerId,
+    String teamId,
+  ) async {
+    final cacheKey = '$customerId|$teamId';
+    final cached = _blockCache[cacheKey];
+    if (cached != null &&
+        DateTime.now().difference(cached.loadedAt) < _blockCacheTtl) {
+      return (blocked: cached.blocked, reason: cached.reason, source: cached.source);
+    }
+
+    // 1. Manual block on profile row (wins if set).
+    try {
+      final teamBlockCol = teamId == 'JA' ? 'order_blocked_ja' : 'order_blocked_ma';
+      final teamReasonCol = teamId == 'JA' ? 'order_block_reason_ja' : 'order_block_reason_ma';
+      final row = await SupabaseService.instance.client
+          .from('customer_team_profiles')
+          .select('$teamBlockCol, $teamReasonCol, outstanding_ja, outstanding_ma')
+          .eq('customer_id', customerId)
+          .maybeSingle();
+      final manual = (row?[teamBlockCol] as bool?) ?? false;
+      final manualReason = row?[teamReasonCol] as String?;
+      if (manual) {
+        final res = (
+          blocked: true,
+          reason: (manualReason == null || manualReason.isEmpty)
+              ? 'Blocked by admin'
+              : 'Blocked by admin: $manualReason',
+          source: 'manual',
+        );
+        _blockCache[cacheKey] = _BlockCacheEntry(
+          blocked: res.blocked, reason: res.reason, source: res.source,
+          loadedAt: DateTime.now());
+        return res;
+      }
+
+      // 2. Auto-block by outstanding amount.
+      await _ensureLoaded();
+      final outThreshold = (teamId == 'JA'
+          ? _readSync('auto_block_outstanding', 'team', 'JA')
+          : _readSync('auto_block_outstanding', 'team', 'MA'));
+      final outThresholdD = outThreshold is num ? outThreshold.toDouble() : 0.0;
+      if (outThresholdD > 0) {
+        final outCol = teamId == 'JA' ? 'outstanding_ja' : 'outstanding_ma';
+        final outVal = (row?[outCol] as num?)?.toDouble() ?? 0.0;
+        if (outVal > outThresholdD) {
+          final res = (
+            blocked: true,
+            reason: 'Outstanding ₹${outVal.toStringAsFixed(0)} '
+                'exceeds threshold ₹${outThresholdD.toStringAsFixed(0)}',
+            source: 'auto_outstanding',
+          );
+          _blockCache[cacheKey] = _BlockCacheEntry(
+            blocked: res.blocked, reason: res.reason, source: res.source,
+            loadedAt: DateTime.now());
+          return res;
+        }
+      }
+
+      // 3. Auto-block by oldest overdue days.
+      final daysThreshold = (teamId == 'JA'
+          ? _readSync('auto_block_overdue_days', 'team', 'JA')
+          : _readSync('auto_block_overdue_days', 'team', 'MA'));
+      final daysThresholdI = daysThreshold is num
+          ? daysThreshold.toInt()
+          : (daysThreshold is String ? int.tryParse(daysThreshold) ?? 0 : 0);
+      if (daysThresholdI > 0) {
+        // Look for an unpaid bill whose bill_date is older than threshold.
+        final cutoff = DateTime.now()
+            .subtract(Duration(days: daysThresholdI))
+            .toIso8601String()
+            .substring(0, 10);
+        final oldestBill = await SupabaseService.instance.client
+            .from('customer_bills')
+            .select('bill_date, invoice_no')
+            .eq('customer_id', customerId)
+            .eq('team_id', teamId)
+            .eq('cleared', false)
+            .lte('bill_date', cutoff)
+            .order('bill_date', ascending: true)
+            .limit(1)
+            .maybeSingle();
+        if (oldestBill != null) {
+          final billDate = oldestBill['bill_date']?.toString();
+          final inv = oldestBill['invoice_no']?.toString();
+          final res = (
+            blocked: true,
+            reason: 'Oldest unpaid bill ($inv on $billDate) exceeds '
+                '$daysThresholdI-day threshold',
+            source: 'auto_overdue',
+          );
+          _blockCache[cacheKey] = _BlockCacheEntry(
+            blocked: res.blocked, reason: res.reason, source: res.source,
+            loadedAt: DateTime.now());
+          return res;
+        }
+      }
+    } catch (e) {
+      debugPrint('[BillingRules] isCustomerBlocked lookup failed: $e');
+      // Fail-open so a transient DB hiccup doesn't lock out legitimate
+      // orders. Admin's manual flag is authoritative for critical blocks.
+    }
+
+    final res = (blocked: false, reason: null as String?, source: 'ok');
+    _blockCache[cacheKey] = _BlockCacheEntry(
+      blocked: res.blocked, reason: res.reason, source: res.source,
+      loadedAt: DateTime.now());
+    return res;
+  }
+
+  /// Drop cached block decisions (e.g. after admin toggles a block).
+  void invalidateBlockCache([String? customerId]) {
+    if (customerId == null) {
+      _blockCache.clear();
+    } else {
+      _blockCache.removeWhere((k, _) => k.startsWith('$customerId|'));
+    }
+  }
+
+  static const Duration _blockCacheTtl = Duration(seconds: 60);
+  final Map<String, _BlockCacheEntry> _blockCache = {};
 
   /// Force the next read to refetch. Call after a rule write from the UI.
   void invalidate() {
     _cache = null;
     _loadedAt = null;
+    // When a rule changes, auto-block thresholds may shift — wipe the
+    // per-customer block cache too.
+    _blockCache.clear();
   }
 
   /// Synchronous snapshot of the stock-zero-grace rule.
@@ -279,4 +466,20 @@ class BillingRulesService {
       _loadedAt = DateTime.now();
     }
   }
+}
+
+/// Internal: cached outcome of a customer-block check. See
+/// [BillingRulesService.isCustomerBlocked]. 60s TTL matches the admin's
+/// expected "flip block → rep is locked within a minute" behaviour.
+class _BlockCacheEntry {
+  final bool blocked;
+  final String? reason;
+  final String source;
+  final DateTime loadedAt;
+  _BlockCacheEntry({
+    required this.blocked,
+    required this.reason,
+    required this.source,
+    required this.loadedAt,
+  });
 }
