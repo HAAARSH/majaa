@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import '../admin_panel_screen/widgets/admin_section_wrapper.dart';
+import 'widgets/alias_manager_tab.dart';
 import 'widgets/manual_order_tab.dart';
 import 'widgets/smart_import_tab.dart';
 
@@ -31,6 +32,11 @@ class AdminNewOrderSection extends StatelessWidget {
           label: 'Smart Import',
           icon: Icons.auto_awesome_rounded,
           child: SmartImportTab(),
+        ),
+        const AdminSectionItem(
+          label: 'Aliases',
+          icon: Icons.translate_rounded,
+          child: AliasManagerTab(),
         ),
       ],
     );
