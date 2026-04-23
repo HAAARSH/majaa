@@ -609,12 +609,24 @@ class SupabaseService {
     required int totalUnits, required String notes, required List<Map<String, dynamic>> items,
     bool isOutOfBeat = false,
     String? csdsStatus,
+    // Admin-only: when the admin punches an order via the New Order tab,
+    // the order should be attributed to the picked rep (brand_rep or
+    // sales_rep), not the admin. Pass the rep's app_users.id here.
+    String? overrideUserId,
+    // Admin-only: stamps orders.source. Defaults to NULL → DB default 'app'.
+    // Pass 'office' for admin-punched Smart Import / Manual New Order.
+    String? source,
   }) async {
-    final authUid = client.auth.currentUser?.id;
-    // Resolve to app_users.id so "old" users' orders are attributed correctly.
-    // Without this, getOrdersByDate's .eq('user_id', authUid) would return
-    // nothing for the rep who placed the order.
-    final userId = authUid == null ? null : await _resolveAppUserId(authUid);
+    String? userId;
+    if (overrideUserId != null && overrideUserId.isNotEmpty) {
+      userId = overrideUserId;
+    } else {
+      final authUid = client.auth.currentUser?.id;
+      // Resolve to app_users.id so "old" users' orders are attributed correctly.
+      // Without this, getOrdersByDate's .eq('user_id', authUid) would return
+      // nothing for the rep who placed the order.
+      userId = authUid == null ? null : await _resolveAppUserId(authUid);
+    }
 
     // 1. Insert the main order
     await client.from('orders').upsert({
@@ -635,6 +647,7 @@ class SupabaseService {
       'team_id': AuthService.currentTeam, // Blueprint Filter
       'is_out_of_beat': isOutOfBeat,
       if (csdsStatus != null) 'csds_status': csdsStatus,
+      if (source != null) 'source': source,
     });
 
     // 2. Insert the line items. order_items has no team_id column — team
@@ -2178,6 +2191,24 @@ class SupabaseService {
           .from('app_users')
           .select()
           .eq('team_id', AuthService.currentTeam)
+          .or('role.eq.sales_rep,role.eq.brand_rep')
+          .eq('is_active', true)
+          .order('full_name');
+      return response.map((e) => AppUserModel.fromJson(Map<String, dynamic>.from(e))).toList();
+    } catch (e) {
+      return [];
+    }
+  }
+
+  /// Admin-only variant of getSalesReps that takes a team_id explicitly,
+  /// bypassing AuthService.currentTeam. Used by the admin New Order tab
+  /// where admin picks a team AT THE TOP before choosing the rep.
+  Future<List<AppUserModel>> getSalesRepsForTeam(String teamId) async {
+    try {
+      final response = await client
+          .from('app_users')
+          .select()
+          .eq('team_id', teamId)
           .or('role.eq.sales_rep,role.eq.brand_rep')
           .eq('is_active', true)
           .order('full_name');

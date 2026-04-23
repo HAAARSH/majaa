@@ -13,6 +13,7 @@ import './widgets/admin_field_ops_section.dart';
 import './widgets/admin_orders_section.dart';
 import './widgets/admin_system_section.dart';
 import './widgets/team_split_wrapper.dart';
+import '../admin_new_order_screen/admin_new_order_section.dart';
 import '../../services/drive_sync_service.dart';
 import '../../widgets/hero_selfie_modal.dart';
 
@@ -50,7 +51,7 @@ class _AdminPanelScreenState extends State<AdminPanelScreen>
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 5, vsync: this);
+    _tabController = TabController(length: 6, vsync: this);
     _checkRoleAndInit();
   }
 
@@ -166,7 +167,8 @@ class _AdminPanelScreenState extends State<AdminPanelScreen>
     final error = DriveSyncService.instance.authError.value;
     if (error == null || !mounted) return;
 
-    // Show persistent banner and navigate to System tab (index 4) for re-login
+    // Show persistent banner and navigate to System tab (index 5 after the
+    // New Order tab was inserted at index 4) for re-login.
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Row(children: [
@@ -180,12 +182,12 @@ class _AdminPanelScreenState extends State<AdminPanelScreen>
         action: SnackBarAction(
           label: 'GO',
           textColor: Colors.white,
-          onPressed: () => _tabController.animateTo(4),
+          onPressed: () => _tabController.animateTo(5),
         ),
       ),
     );
     // Auto-navigate to System tab
-    _tabController.animateTo(4);
+    _tabController.animateTo(5);
   }
 
   @override
@@ -279,6 +281,7 @@ class _AdminPanelScreenState extends State<AdminPanelScreen>
                   Tab(icon: Icon(Icons.inventory_2_rounded), text: 'Catalog'),
                   Tab(icon: Icon(Icons.groups_rounded), text: 'Field Ops'),
                   Tab(icon: Icon(Icons.receipt_long_rounded), text: 'Orders'),
+                  Tab(icon: Icon(Icons.add_shopping_cart_rounded), text: 'New Order'),
                   Tab(icon: Icon(Icons.admin_panel_settings_rounded), text: 'System'),
                 ],
               ),
@@ -294,6 +297,7 @@ class _AdminPanelScreenState extends State<AdminPanelScreen>
               AdminCatalogSection(isSuperAdmin: _isSuperAdmin),
               AdminFieldOpsSection(isSuperAdmin: _isSuperAdmin),
               const AdminOrdersSection(),
+              AdminNewOrderSection(isSuperAdmin: _isSuperAdmin),
               AdminSystemSection(isSuperAdmin: _isSuperAdmin),
             ],
           ),

@@ -364,6 +364,10 @@ class OfflineService {
       notes: data['notes'] as String? ?? '',
       items: items,
       isOutOfBeat: data['is_out_of_beat'] as bool? ?? false,
+      // Admin New Order tab writes these; rep orders leave them null and
+      // createOrder falls back to auth.uid() + default 'app' source.
+      overrideUserId: data['override_user_id'] as String?,
+      source: data['source'] as String?,
     );
   }
 
