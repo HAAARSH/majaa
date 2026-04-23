@@ -53,8 +53,10 @@ class Product {
     return DateTime.now().difference(stockZeroedAt!) < Duration(days: graceDays);
   }
 
-  /// Can the rep add this to cart right now?
-  bool get isBillable => stockQty > 0 || isInStockGrace();
+  /// Can the rep add this to cart right now? [graceDays] lets callers
+  /// pass a rule-driven value; defaults to 2 when the rule isn't loaded.
+  bool isBillable({int graceDays = 2}) =>
+      stockQty > 0 || isInStockGrace(graceDays: graceDays);
 
   /// Whole days of grace remaining (1 or 2). 0 when not in grace or
   /// already expired.

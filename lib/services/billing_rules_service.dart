@@ -162,6 +162,32 @@ class BillingRulesService {
     _loadedAt = null;
   }
 
+  /// Synchronous snapshot of the stock-zero-grace rule.
+  ///
+  /// Called on every product-card render so it MUST be sync. Returns
+  /// the cached value when available, else the hardcoded default of 2.
+  /// The cache is warmed on the first product-list fetch via
+  /// [ensureWarmed]; callers that render products early should await
+  /// that once at app start so the first frame uses the real rule.
+  ///
+  /// Returning 0 is a legit admin choice (kill the grace window), so
+  /// callers must NOT treat 0 as "not loaded".
+  int get stockZeroGraceDays {
+    // Not loaded yet → safe default. Matches the hardcoded fallback
+    // used in ProductModel.isInStockGrace before this wiring.
+    if (_cache == null) return 2;
+    final raw = _readSync('stock_zero_grace_days', 'global', null);
+    if (raw is int) return raw;
+    if (raw is num) return raw.toInt();
+    if (raw is String) return int.tryParse(raw) ?? 2;
+    return 2;
+  }
+
+  /// Prime the cache so the very first product-list render uses the
+  /// rule, not the default. Safe to call redundantly; the internal
+  /// TTL handles stampede.
+  Future<void> ensureWarmed() async => _ensureLoaded();
+
   // ── Internals ─────────────────────────────────────────────────────────
 
   Future<dynamic> _get({

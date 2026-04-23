@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import '../../theme/app_theme.dart';
+import '../../services/billing_rules_service.dart';
 import '../../services/cart_service.dart';
 import 'package:fluttertoast/fluttertoast.dart';
 
@@ -82,14 +83,16 @@ class _ProductDetailScreenState extends State<ProductDetailScreen> {
                               minimumSize: const Size.fromHeight(52),
                               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
                             ),
-                            // Gate on ProductModel.isBillable instead of the
-                            // legacy status == outOfStock check: billable is
-                            // (stockQty > 0) OR within the 2-day grace
-                            // window after the product first zeroed. Drive
-                            // sync still sets status='outOfStock' for qty<=0
-                            // but that no longer blocks an in-grace product
-                            // from being added to cart.
-                            onPressed: !product.isBillable
+                            // Gate on isBillable: (stockQty > 0) OR within
+                            // the configurable grace window after the
+                            // product first zeroed. Grace days come from
+                            // billing_rules.stock_zero_grace_days (admin-
+                            // tunable via Rules Tab). Drive sync still sets
+                            // status='outOfStock' for qty<=0 but that no
+                            // longer blocks an in-grace product.
+                            onPressed: !product.isBillable(
+                              graceDays: BillingRulesService.instance.stockZeroGraceDays,
+                            )
                                 ? null
                                 : () {
                                     CartService.instance.addOrUpdateItem(product, product.stepSize);
@@ -198,7 +201,7 @@ class _ProductDetailScreenState extends State<ProductDetailScreen> {
                         // card chip so state is consistent across the flow.
                         color: product.stockQty > 0
                             ? AppTheme.statusAvailableContainer
-                            : product.isInStockGrace()
+                            : product.isInStockGrace(graceDays: BillingRulesService.instance.stockZeroGraceDays)
                                 ? AppTheme.warningContainer
                                 : AppTheme.errorContainer,
                         shape: BoxShape.circle,
@@ -206,12 +209,12 @@ class _ProductDetailScreenState extends State<ProductDetailScreen> {
                       child: Icon(
                         product.stockQty > 0
                             ? Icons.inventory_2_rounded
-                            : product.isInStockGrace()
+                            : product.isInStockGrace(graceDays: BillingRulesService.instance.stockZeroGraceDays)
                                 ? Icons.hourglass_bottom_rounded
                                 : Icons.block_rounded,
                         color: product.stockQty > 0
                             ? AppTheme.statusAvailable
-                            : product.isInStockGrace()
+                            : product.isInStockGrace(graceDays: BillingRulesService.instance.stockZeroGraceDays)
                                 ? AppTheme.warning
                                 : AppTheme.error,
                       ),
@@ -231,8 +234,8 @@ class _ProductDetailScreenState extends State<ProductDetailScreen> {
                           Text(
                             product.stockQty > 0
                                 ? '${product.stockQty} Units Available'
-                                : product.isInStockGrace()
-                                    ? 'Out of stock — grace ${product.graceDaysLeft()}d left'
+                                : product.isInStockGrace(graceDays: BillingRulesService.instance.stockZeroGraceDays)
+                                    ? 'Out of stock — grace ${product.graceDaysLeft(graceDays: BillingRulesService.instance.stockZeroGraceDays)}d left'
                                     : 'Out of stock — ask office to restock',
                             style: GoogleFonts.manrope(
                               fontSize: 18,

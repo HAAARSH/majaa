@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
+import '../../../services/billing_rules_service.dart';
 import '../../../services/cart_service.dart';
 import '../../../theme/app_theme.dart';
 import '../../../widgets/custom_image_widget.dart';
@@ -261,7 +262,11 @@ class _ProductGridItemWidgetState extends State<ProductGridItemWidget>
                           ],
                           if (widget.product.stockQty <= 0) ...[
                             Builder(builder: (_) {
-                              final inGrace = widget.product.isInStockGrace();
+                              // Grace days comes from billing_rules →
+                              // admin can tune via the Rules Tab without a
+                              // rebuild. Service exposes a sync cached int.
+                              final graceDays = BillingRulesService.instance.stockZeroGraceDays;
+                              final inGrace = widget.product.isInStockGrace(graceDays: graceDays);
                               final bg = inGrace
                                   ? AppTheme.warningContainer
                                   : AppTheme.errorContainer;
@@ -269,7 +274,7 @@ class _ProductGridItemWidgetState extends State<ProductGridItemWidget>
                                   ? AppTheme.warning
                                   : AppTheme.error;
                               final label = inGrace
-                                  ? 'GRACE ${widget.product.graceDaysLeft()}d'
+                                  ? 'GRACE ${widget.product.graceDaysLeft(graceDays: graceDays)}d'
                                   : 'OUT OF STOCK';
                               final icon = inGrace
                                   ? Icons.hourglass_bottom_rounded

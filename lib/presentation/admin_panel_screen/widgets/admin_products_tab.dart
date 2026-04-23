@@ -8,9 +8,10 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
 import '../../../core/search_utils.dart';
+import '../../../services/auth_service.dart';
+import '../../../services/billing_rules_service.dart';
 import '../../../services/supabase_service.dart';
 import '../../../theme/app_theme.dart';
-import './admin_shared_widgets.dart';
 import 'category_management_dialog.dart';
 
 class AdminProductsTab extends StatefulWidget {
@@ -38,10 +39,13 @@ class _AdminProductsTabState extends State<AdminProductsTab>
   bool _isSelectMode = false;
   final Set<String> _selectedIds = {};
 
-  // Team scope picker. 'All' merges JA+MA products (two calls, concat);
-  // 'JA' / 'MA' fetches a single team. Default 'All' so super_admin sees
-  // the full catalog on open instead of being silently scoped.
-  String _teamFilter = 'All';
+  // Team scope follows the outer TeamSplitWrapper (JA or MA). The in-tab
+  // 'All Teams / Jagannath / Madhav' chip row was removed 2026-04-23 —
+  // having two stacked team pickers (outer JA/MA + inner All/JA/MA) was
+  // redundant. AuthService.currentTeam is kept in sync by the outer
+  // wrapper's onTap, and the wrapper rebuilds this widget on team change
+  // via ValueKey('prod_$team'), so reading it on init is sufficient.
+  String get _teamFilter => AuthService.currentTeam;
 
   @override
   void initState() {
@@ -94,19 +98,8 @@ class _AdminProductsTabState extends State<AdminProductsTab>
   Future<void> _loadProducts({bool forceRefresh = false}) async {
     setState(() => _isLoading = true);
     try {
-      List<ProductModel> products;
-      if (_teamFilter == 'All') {
-        // Two calls + client merge — getProducts' existing signature treats
-        // teamId=null as currentTeam fallback, so we explicitly fetch each.
-        final ja = await SupabaseService.instance.getProducts(
-          forceRefresh: forceRefresh, teamId: 'JA');
-        final ma = await SupabaseService.instance.getProducts(
-          forceRefresh: forceRefresh, teamId: 'MA');
-        products = [...ja, ...ma];
-      } else {
-        products = await SupabaseService.instance.getProducts(
-          forceRefresh: forceRefresh, teamId: _teamFilter);
-      }
+      final products = await SupabaseService.instance.getProducts(
+        forceRefresh: forceRefresh, teamId: _teamFilter);
       products.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
       if (mounted) {
         setState(() {
@@ -590,25 +583,44 @@ class _AdminProductsTabState extends State<AdminProductsTab>
                                     await SupabaseService.instance
                                         .addProduct(data);
                                   }
-                                  nav.pop();
-                                  // Wait for bottom sheet dismiss animation to complete
-                                  // before updating parent state to avoid _dependents.isEmpty assertion
-                                  await Future.delayed(const Duration(milliseconds: 300));
-                                  if (!mounted) return;
+                                  // Fetch the refreshed row BEFORE closing the
+                                  // sheet so there is no async gap between the
+                                  // pop and the parent setState. A prior
+                                  // workaround (300ms Future.delayed) was
+                                  // racy; the pop + post-frame callback below
+                                  // is deterministic and avoids the known
+                                  // _dependents.isEmpty assertion that fires
+                                  // when the sheet's InheritedWidgets are
+                                  // unmounted mid-update.
+                                  ProductModel? updatedProduct;
                                   if (isEdit) {
-                                    // Refresh only the edited product in-place
-                                    final updated = await SupabaseService.instance.getProductById(existing.id);
-                                    if (updated != null && mounted) {
-                                      setState(() {
-                                        final idx = _products.indexWhere((p) => p.id == existing.id);
-                                        if (idx != -1) _products[idx] = updated;
-                                        final fIdx = _filtered.indexWhere((p) => p.id == existing.id);
-                                        if (fIdx != -1) _filtered[fIdx] = updated;
-                                      });
-                                    }
-                                  } else {
-                                    _loadProducts(forceRefresh: true);
+                                    updatedProduct = await SupabaseService
+                                        .instance
+                                        .getProductById(existing.id);
                                   }
+                                  nav.pop();
+                                  WidgetsBinding.instance
+                                      .addPostFrameCallback((_) {
+                                    if (!mounted) return;
+                                    if (isEdit) {
+                                      if (updatedProduct != null) {
+                                        setState(() {
+                                          final idx = _products.indexWhere(
+                                              (p) => p.id == existing.id);
+                                          if (idx != -1) {
+                                            _products[idx] = updatedProduct!;
+                                          }
+                                          final fIdx = _filtered.indexWhere(
+                                              (p) => p.id == existing.id);
+                                          if (fIdx != -1) {
+                                            _filtered[fIdx] = updatedProduct!;
+                                          }
+                                        });
+                                      }
+                                    } else {
+                                      _loadProducts(forceRefresh: true);
+                                    }
+                                  });
                                   messenger.showSnackBar(
                                     SnackBar(
                                       content: Text(isEdit
@@ -1291,15 +1303,6 @@ class _AdminProductsTabState extends State<AdminProductsTab>
       bottomNavigationBar: _isSelectMode ? _buildBulkBar() : null,
       body: Column(
         children: [
-          // Team scope picker — 'All' merges JA+MA catalogs (two calls on
-          // load). Kept in the pinned area alongside search for quick access.
-          TeamFilterChips(
-            value: _teamFilter,
-            onChanged: (v) {
-              setState(() => _teamFilter = v);
-              _loadProducts(forceRefresh: true);
-            },
-          ),
           // ── Pinned: Search only ───────────────────────────────
           // Per user directive 2026-04-18: only the search field stays fixed
           // at the top on scroll; category chips and everything else slide
@@ -1645,18 +1648,32 @@ class _StockBadgeSummary extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final outOfStock = products.where((p) => p.stockQty <= 0).length;
+    final graceDays = BillingRulesService.instance.stockZeroGraceDays;
+    // Split zero-stock into in-grace vs past-grace so admin knows at a
+    // glance how many products are silently un-orderable for reps.
+    final zeroStock = products.where((p) => p.stockQty <= 0).toList();
+    final inGrace =
+        zeroStock.where((p) => p.isInStockGrace(graceDays: graceDays)).length;
+    final pastGrace = zeroStock.length - inGrace;
     final lowStock =
         products.where((p) => p.stockQty > 0 && p.stockQty <= 10).length;
 
-    if (outOfStock == 0 && lowStock == 0) return const SizedBox.shrink();
+    if (zeroStock.isEmpty && lowStock == 0) return const SizedBox.shrink();
 
-    return Row(
-      children: [
-        if (outOfStock > 0) _badge('$outOfStock Out', Colors.red.shade600),
-        if (outOfStock > 0 && lowStock > 0) const SizedBox(width: 6),
-        if (lowStock > 0) _badge('$lowStock Low', Colors.orange.shade600),
-      ],
+    return Tooltip(
+      message:
+          'Stock-zero grace window: $graceDays day${graceDays == 1 ? '' : 's'}.\n'
+          'Reps can still order in-grace items; past-grace are hard-locked.\n'
+          'Edit this value in Admin Panel → System → Rules → Pricing.',
+      child: Row(
+        children: [
+          if (inGrace > 0) _badge('$inGrace in grace', Colors.orange.shade700),
+          if (inGrace > 0 && pastGrace > 0) const SizedBox(width: 6),
+          if (pastGrace > 0) _badge('$pastGrace out', Colors.red.shade600),
+          if ((inGrace > 0 || pastGrace > 0) && lowStock > 0) const SizedBox(width: 6),
+          if (lowStock > 0) _badge('$lowStock Low', Colors.orange.shade600),
+        ],
+      ),
     );
   }
 

@@ -9,6 +9,7 @@ import 'services/google_drive_auth_service.dart';
 
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'services/billing_rules_service.dart';
 import 'services/cart_service.dart';
 import 'services/offline_service.dart';
 import 'services/smart_import_share_service.dart';
@@ -66,6 +67,13 @@ Future<void> main() async {
   await CartService.instance.restoreCart();
   await SessionService.instance.init(); // load persisted session timestamp
   await OfflineService.instance.init(); // open offline_orders Hive box
+  // Warm the billing-rules cache once so the first product-list render uses
+  // the real grace-days value instead of the 2-day fallback. Failure is
+  // non-fatal — accessors fall back to defaults on a cold cache.
+  try {
+    // Defer the import via the service singleton so main stays light.
+    await BillingRulesService.instance.ensureWarmed();
+  } catch (_) {/* non-fatal */}
   if (!kIsWeb) {
     OfflineService.instance.startMonitoring(); // connectivity watch + 1-hr cache refresh
 

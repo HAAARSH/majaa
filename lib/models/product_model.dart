@@ -134,7 +134,10 @@ class ProductModel {
 
   /// Convenience: true when the rep is allowed to add this to cart
   /// right now. Combines current stock > 0 with the in-grace window.
-  bool get isBillable => stockQty > 0 || isInStockGrace();
+  /// [graceDays] defaults to 2; pass the value from BillingRulesService
+  /// if you have it handy.
+  bool isBillable({int graceDays = 2}) =>
+      stockQty > 0 || isInStockGrace(graceDays: graceDays);
 
   /// Whole days of grace remaining before the product hard-locks.
   /// Returns 0 for not-in-grace or already-expired; otherwise 1 or 2.
