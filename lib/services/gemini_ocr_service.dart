@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
@@ -142,11 +143,20 @@ class GeminiOcrService {
       ]
     });
 
-    final response = await http.post(
-      Uri.parse('$_endpoint?key=$apiKey'),
-      headers: {'Content-Type': 'application/json'},
-      body: body,
-    );
+    final http.Response response;
+    try {
+      response = await http.post(
+        Uri.parse('$_endpoint?key=$apiKey'),
+        headers: {'Content-Type': 'application/json'},
+        body: body,
+      ).timeout(const Duration(seconds: 30));
+    } on TimeoutException catch (_) {
+      debugPrint('🚨 GeminiOcrService: request timed out after 30s');
+      return null;
+    } catch (e) {
+      debugPrint('🚨 GeminiOcrService: network error: $e');
+      return null;
+    }
 
     if (response.statusCode != 200) {
       debugPrint('🚨 GeminiOcrService: API error ${response.statusCode}: ${response.body}');
@@ -164,36 +174,45 @@ class GeminiOcrService {
 
     debugPrint('✅ Raw Gemini Response: $text');
 
-    // Bulletproof JSON Extraction
-    try {
-      final startIndex = text.indexOf('{');
-      final endIndex = text.lastIndexOf('}');
+    // JSON Extraction: try clean decode first, then substring fallback.
+    // Strip markdown fences Gemini sometimes adds despite the "JSON only" instruction.
+    final cleaned = text
+        .replaceAll('```json', '')
+        .replaceAll('```', '')
+        .trim();
 
-      if (startIndex == -1 || endIndex == -1) {
-        debugPrint('🚨 GeminiOcrService: No JSON block found in response.');
+    Map<String, dynamic>? parsed;
+    try {
+      parsed = jsonDecode(cleaned) as Map<String, dynamic>;
+    } catch (_) {
+      // Fallback: extract the largest {...} block from the cleaned text.
+      final startIndex = cleaned.indexOf('{');
+      final endIndex = cleaned.lastIndexOf('}');
+      if (startIndex == -1 || endIndex == -1 || endIndex < startIndex) {
+        debugPrint('🚨 GeminiOcrService: no JSON block found. Raw text: $text');
         return null;
       }
-
-      final jsonString = text.substring(startIndex, endIndex + 1);
-      final parsed = jsonDecode(jsonString) as Map<String, dynamic>;
-
-      String? clean(dynamic v) {
-        final s = v?.toString().trim();
-        if (s == null || s.isEmpty || s == 'null') return null;
-        return s;
+      try {
+        parsed = jsonDecode(cleaned.substring(startIndex, endIndex + 1)) as Map<String, dynamic>;
+      } catch (e) {
+        debugPrint('🚨 GeminiOcrService: JSON parse failed ($e). Raw text: $text');
+        return null;
       }
-
-      final out = <String, String?>{
-        'bill_no': clean(parsed['bill_no']),
-        'amount': clean(parsed['amount']),
-      };
-      for (final k in extraKeys) {
-        out[k] = clean(parsed[k]);
-      }
-      return out;
-    } catch (e) {
-      debugPrint('🚨 GeminiOcrService: Failed to parse JSON: $e');
-      return null;
     }
+
+    String? clean(dynamic v) {
+      final s = v?.toString().trim();
+      if (s == null || s.isEmpty || s == 'null') return null;
+      return s;
+    }
+
+    final out = <String, String?>{
+      'bill_no': clean(parsed['bill_no']),
+      'amount': clean(parsed['amount']),
+    };
+    for (final k in extraKeys) {
+      out[k] = clean(parsed[k]);
+    }
+    return out;
   }
 }

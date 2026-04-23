@@ -637,7 +637,9 @@ class SupabaseService {
       if (csdsStatus != null) 'csds_status': csdsStatus,
     });
 
-    // 2. Insert the line items
+    // 2. Insert the line items. order_items has no team_id column — team
+    // scoping comes from orders.id (upserted team-scoped in step 1) and the
+    // FK with ON DELETE CASCADE. Transactional atomicity is deferred (RPC).
     if (items.isNotEmpty) {
       final itemsWithId = items.map((i) => {...i, 'user_id': userId}).toList();
       await client.from('order_items').delete().eq('order_id', orderId);
@@ -1154,7 +1156,7 @@ class SupabaseService {
   /// Admin: clears the bill photo from an order at any time.
   /// Nullifies bill_photo_url in the orders table and attempts to delete
   /// the file from Supabase Storage if it's still hosted there.
-  Future<void> clearBillPhoto(String orderId, String? currentPhotoUrl) async {
+  Future<void> clearBillPhoto(String orderId, String? currentPhotoUrl, {String? teamId}) async {
     // 1. Remove file from Supabase Storage (only if URL is still a Supabase URL)
     if (currentPhotoUrl != null && currentPhotoUrl.contains('supabase')) {
       try {
@@ -1166,8 +1168,11 @@ class SupabaseService {
     }
     // Drive-hosted photos are intentionally kept in Drive — only the DB reference is cleared.
 
-    // 2. Null out the URL in the orders table
-    await client.from('orders').update({'bill_photo_url': null}).eq('id', orderId);
+    // 2. Null out the URL in the orders table (team-scoped to prevent cross-team mutation)
+    await client.from('orders')
+        .update({'bill_photo_url': null})
+        .eq('id', orderId)
+        .eq('team_id', teamId ?? AuthService.currentTeam);
   }
 
   // ─── 👤 USER ADMIN (uses service role key via env for user creation) ───

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
@@ -171,11 +172,16 @@ IMPORTANT:
       }
     });
 
-    final response = await http.post(
-      Uri.parse('$_endpoint?key=$apiKey'),
-      headers: {'Content-Type': 'application/json'},
-      body: body,
-    );
+    final http.Response response;
+    try {
+      response = await http.post(
+        Uri.parse('$_endpoint?key=$apiKey'),
+        headers: {'Content-Type': 'application/json'},
+        body: body,
+      ).timeout(const Duration(seconds: 60));
+    } on TimeoutException catch (_) {
+      throw Exception('Gemini request timed out after 60s — try a smaller file or retry.');
+    }
 
     if (response.statusCode != 200) {
       throw Exception('Gemini API error (${response.statusCode}): ${response.body}');
@@ -309,6 +315,7 @@ IMPORTANT:
     final extraction = await _client.from('bill_extractions')
         .select('customer_name_ocr')
         .eq('id', extractionId)
+        .eq('team_id', teamId)
         .maybeSingle();
     if (extraction == null) return;
     final ocrName = (extraction['customer_name_ocr'] as String? ?? '').trim();
@@ -316,12 +323,14 @@ IMPORTANT:
     if (ocrName.isNotEmpty) {
       final customer = await _client.from('customers')
           .select('id')
+          .eq('team_id', teamId)
           .ilike('name', ocrName)
           .maybeSingle();
       if (customer != null) {
         await _client.from('bill_extractions')
             .update({'customer_id': customer['id'], 'customer_matched': true})
-            .eq('id', extractionId);
+            .eq('id', extractionId)
+            .eq('team_id', teamId);
       }
     }
 
@@ -335,12 +344,14 @@ IMPORTANT:
     if (matchingOrder != null) {
       await _client.from('bill_extractions')
           .update({'order_id': matchingOrder['id'], 'order_matched': true})
-          .eq('id', extractionId);
+          .eq('id', extractionId)
+          .eq('team_id', teamId);
 
       // 3. Auto-verify: bill# matched. Check amount.
       final billExtraction = await _client.from('bill_extractions')
           .select('grand_total, customer_matched')
           .eq('id', extractionId)
+          .eq('team_id', teamId)
           .maybeSingle();
       if (billExtraction == null) return;
       final extractedTotal = (billExtraction['grand_total'] as num?)?.toDouble() ?? 0;
@@ -350,7 +361,8 @@ IMPORTANT:
       if ((extractedTotal - orderTotal).abs() <= 5) {
         await _client.from('bill_extractions')
             .update({'auto_verified': true})
-            .eq('id', extractionId);
+            .eq('id', extractionId)
+            .eq('team_id', teamId);
 
         // Update the order
         await _client.from('orders').update({
@@ -358,19 +370,20 @@ IMPORTANT:
           'actual_billed_amount': extractedTotal,
           'verified_by_office': true,
           'status': 'Verified',
-        }).eq('id', matchingOrder['id']);
+        }).eq('id', matchingOrder['id']).eq('team_id', teamId);
 
         debugPrint('Auto-verified bill $billNo → order ${matchingOrder['id']}');
       } else {
         // Amount mismatch — flag for manual review, do NOT auto-verify
         await _client.from('bill_extractions')
             .update({'auto_verified': false, 'verification_failed': true})
-            .eq('id', extractionId);
+            .eq('id', extractionId)
+            .eq('team_id', teamId);
 
         await _client.from('orders').update({
           'final_bill_no': billNo,
           'actual_billed_amount': extractedTotal,
-        }).eq('id', matchingOrder['id']);
+        }).eq('id', matchingOrder['id']).eq('team_id', teamId);
 
         debugPrint('Bill $billNo amount mismatch (bill: $extractedTotal, order: $orderTotal) — flagged for manual review');
       }
@@ -436,9 +449,11 @@ IMPORTANT:
 
   /// Link an item to a product and remember the mapping.
   Future<void> matchItem(String itemId, String productId, String ocrName) async {
+    final teamId = AuthService.currentTeam;
     await _client.from('order_billed_items')
         .update({'product_id': productId, 'matched': true})
-        .eq('id', itemId);
+        .eq('id', itemId)
+        .eq('team_id', teamId);
     await saveItemMapping(ocrName, productId);
   }
 
@@ -446,6 +461,7 @@ IMPORTANT:
   Future<void> matchCustomer(String extractionId, String customerId) async {
     await _client.from('bill_extractions')
         .update({'customer_id': customerId, 'customer_matched': true})
-        .eq('id', extractionId);
+        .eq('id', extractionId)
+        .eq('team_id', AuthService.currentTeam);
   }
 }

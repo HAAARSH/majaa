@@ -176,7 +176,13 @@ class OfflineService {
     Map<String, dynamic> orderData,
     List<Map<String, dynamic>> orderItems,
   ) async {
-    await _orderBox.add({'order': orderData, 'items': orderItems});
+    // Stamp the active team on the envelope so replay after a team-switch
+    // can skip (not misattribute) orders queued under the other team.
+    await _orderBox.add({
+      'order': orderData,
+      'items': orderItems,
+      'team_id': AuthService.currentTeam,
+    });
     _refreshPendingCount();
     syncAll();
   }
@@ -226,15 +232,24 @@ class OfflineService {
 
         final Map<String, dynamic> orderData;
         final List<Map<String, dynamic>> itemsList;
+        String? stampedTeam;
         if (entry is Map && entry.containsKey('order') && entry['order'] is Map) {
           orderData = Map<String, dynamic>.from(entry['order'] as Map);
           final rawItems = entry['items'];
           itemsList = (rawItems is List) ? rawItems.map((i) => i is Map ? Map<String, dynamic>.from(i) : <String, dynamic>{}).toList() : [];
+          stampedTeam = entry['team_id'] as String?;
         } else if (entry is Map) {
           orderData = Map<String, dynamic>.from(entry);
           itemsList = [];
         } else {
           await _orderBox.delete(key);
+          continue;
+        }
+
+        // Cross-team guard: if this order was queued under a different team,
+        // defer syncing until the user switches back. Don't delete, don't misattribute.
+        if (stampedTeam != null && stampedTeam != AuthService.currentTeam) {
+          debugPrint('[OfflineService] Skipping order queued for team $stampedTeam (current: ${AuthService.currentTeam})');
           continue;
         }
 
@@ -287,6 +302,15 @@ class OfflineService {
 
         final type = entry['type'] as String? ?? '';
         final data = Map<String, dynamic>.from(entry['data'] as Map);
+        final stampedTeam = entry['team_id'] as String?;
+
+        // Cross-team guard: ops are stamped at queue-time (see queueOperation).
+        // If the active team has changed since then, defer this op — don't
+        // replay it against the wrong team.
+        if (stampedTeam != null && stampedTeam != AuthService.currentTeam) {
+          debugPrint('[OfflineService] Skipping $type queued for team $stampedTeam (current: ${AuthService.currentTeam})');
+          continue;
+        }
 
         switch (type) {
           case 'order':
