@@ -11,7 +11,11 @@
 // (use snapshotForExport) and pass the snapshot through, instead of
 // hitting the service again mid-build.
 
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+
 import 'supabase_service.dart';
 
 /// How orders are grouped into invoices on a CSV export.
@@ -69,13 +73,50 @@ class BillingRulesSnapshot {
 }
 
 class BillingRulesService {
-  BillingRulesService._();
+  BillingRulesService._() {
+    _subscribeToAuthChanges();
+  }
   static final BillingRulesService instance = BillingRulesService._();
 
   static const Duration _cacheTtl = Duration(minutes: 5);
 
   Map<String, dynamic>? _cache;
   DateTime? _loadedAt;
+  // Stored only to keep the subscription alive for the app's lifetime;
+  // the singleton is never disposed in the live app. Tests that care
+  // can reach it via a debug hook if one is added later.
+  // ignore: unused_field
+  StreamSubscription<AuthState>? _authSub;
+
+  /// Subscribe to Supabase auth so a pre-login empty cache (from RLS
+  /// denying the warm-up read before the user signs in) is discarded
+  /// the moment the user authenticates. Without this, the first 5 min
+  /// of post-login reads return hardcoded defaults even though the DB
+  /// has admin-edited values. See the audit note in
+  /// `project_billing_rules_audit_2026_04_23.md`.
+  void _subscribeToAuthChanges() {
+    try {
+      _authSub = Supabase.instance.client.auth.onAuthStateChange.listen((e) {
+        switch (e.event) {
+          case AuthChangeEvent.signedIn:
+          case AuthChangeEvent.signedOut:
+          case AuthChangeEvent.userUpdated:
+          case AuthChangeEvent.initialSession:
+            // initialSession fires on cold-start when a persisted
+            // session is restored — ensures any empty pre-login cache
+            // is discarded before the first post-auth accessor call.
+            invalidate();
+            break;
+          default:
+            break;
+        }
+      });
+    } catch (err) {
+      // If Supabase isn't initialized yet (tests, etc.), skip. Tests
+      // that exercise this service should call invalidate() manually.
+      debugPrint('[BillingRules] auth subscribe failed: $err');
+    }
+  }
 
   // ── Typed accessors ────────────────────────────────────────────────────
 

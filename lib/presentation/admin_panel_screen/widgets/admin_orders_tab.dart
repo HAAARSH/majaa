@@ -48,6 +48,13 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
   bool _loadingMore = false;
   bool _hasMore = true;
 
+  // Rules snapshot captured once per export. Set when the OI picker is
+  // shown (line ~806) and consumed during _buildCsv (line ~1100), then
+  // cleared. Without this shared ref, the 5-min cache TTL could expire
+  // between the two dialogs and JA / MA CSVs might use inconsistent
+  // merging strategies. Nullable so a non-OI export path still works.
+  BillingRulesSnapshot? _cachedRulesSnapshot;
+
   // Statuses that ONLY admins can set
   static const _adminOnlyStatuses = {'Cancelled', 'Returned', 'Partially Delivered'};
   // All statuses for display filter
@@ -803,7 +810,17 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
       }
 
       if (oiCustomerIds.isNotEmpty) {
-        final decisions = await _showOrganicIndiaPicker(oiCustomerIds);
+        // Capture rules ONCE at the start of the export flow and thread
+        // the snapshot through both the OI picker and the CSV build.
+        // Previously each called snapshotForExport() independently,
+        // risking mid-export drift if the cache TTL lapsed between
+        // dialog steps (admin takes >5 min at the OI picker).
+        final rulesSnapshot = await BillingRulesService.instance.snapshotForExport();
+        _cachedRulesSnapshot = rulesSnapshot;
+        final decisions = await _showOrganicIndiaPicker(
+          oiCustomerIds,
+          rulesSnapshot: rulesSnapshot,
+        );
         if (decisions == null) return; // admin cancelled
         organicIndiaRouting = decisions;
       }
@@ -1094,10 +1111,13 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
     int jaWrittenOrderCount = 0;
     int maWrittenOrderCount = 0;
 
-    // Snapshot the rules engine ONCE for this export so a mid-build cache
-    // expiry can't shift JA's strategy halfway through MA's CSV (or vice
-    // versa). Both teams' merging strategies come from this single read.
-    final rulesSnapshot = await BillingRulesService.instance.snapshotForExport();
+    // Re-use the snapshot captured at the top of the export flow (OI
+    // picker path) if available; otherwise the OI picker wasn't needed
+    // and we take a fresh snapshot now. Either way, every _buildCsv
+    // call below uses the SAME snapshot so JA + MA CSVs never disagree.
+    final rulesSnapshot = _cachedRulesSnapshot
+        ?? await BillingRulesService.instance.snapshotForExport();
+    _cachedRulesSnapshot = null; // release the ref; no longer needed.
 
     if (buildJa && jaOrderCount > 0) {
       final jaLineSink = <String>[];
@@ -1253,8 +1273,13 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
   /// - Lets admin toggle per customer, optionally persist as "remember".
   /// - Returns customer_id → 'JA'|'MA' on confirm, or null on cancel.
   Future<Map<String, String>?> _showOrganicIndiaPicker(
-    Iterable<String> customerIds,
-  ) async {
+    Iterable<String> customerIds, {
+    // Passed in from the export flow so the OI picker and the later
+    // CSV build share ONE snapshot of the rules. Without this, a long
+    // admin pause in this dialog could let the 5-min cache TTL expire
+    // and the CSV build (line ~1100) re-fetch different rule values.
+    required BillingRulesSnapshot rulesSnapshot,
+  }) async {
     final allCustomers = await _service.getCustomers();
     final customersById = <String, CustomerModel>{
       for (final c in allCustomers) c.id: c,
@@ -1263,7 +1288,6 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
       brandName: _organicIndiaBrandName,
       customerIds: customerIds,
     );
-    final rulesSnapshot = await BillingRulesService.instance.snapshotForExport();
 
     // Sort by customer name for stable presentation.
     final sortedCustomers = customerIds
