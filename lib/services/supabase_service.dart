@@ -639,11 +639,35 @@ class SupabaseService {
 
     // 2. Insert the line items. order_items has no team_id column — team
     // scoping comes from orders.id (upserted team-scoped in step 1) and the
-    // FK with ON DELETE CASCADE. Transactional atomicity is deferred (RPC).
+    // FK with ON DELETE CASCADE.
+    //
+    // Full transactional atomicity (delete+insert as a single server-side
+    // operation) is deferred to an RPC. For now a post-insert count guard
+    // detects the partial-failure case (delete succeeded, insert failed) and
+    // logs to app_error_logs so admin sees orphaned-items orders.
     if (items.isNotEmpty) {
       final itemsWithId = items.map((i) => {...i, 'user_id': userId}).toList();
       await client.from('order_items').delete().eq('order_id', orderId);
       await client.from('order_items').insert(itemsWithId);
+
+      try {
+        final saved = await client.from('order_items')
+            .select('id')
+            .eq('order_id', orderId);
+        final savedCount = (saved as List).length;
+        if (savedCount < items.length) {
+          debugPrint('🚨 createOrder partial-save: $orderId expected ${items.length}, got $savedCount');
+          await client.from('app_error_logs').insert({
+            'error_type': 'order_items_partial_save',
+            'error_message': 'Order $orderId: expected ${items.length} items, got $savedCount',
+            'order_id': orderId,
+            'team_id': AuthService.currentTeam,
+            'resolved': false,
+          });
+        }
+      } catch (e) {
+        debugPrint('createOrder verify step failed ($e)');
+      }
     }
 
     return orderId;
