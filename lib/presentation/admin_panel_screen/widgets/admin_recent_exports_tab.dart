@@ -5,6 +5,9 @@ import 'package:google_fonts/google_fonts.dart';
 import '../../../services/supabase_service.dart';
 import '../../../theme/app_theme.dart';
 import '../../../widgets/empty_state_widget.dart';
+import '../../../widgets/pin_dialog.dart';
+
+const Duration _kUndoWindow = Duration(hours: 24);
 
 /// Phase F of ORDERS_EXPORT_OVERHAUL: history of every admin export run.
 /// Lists last 20 `export_batches` rows. Super-admins get per-row Undo
@@ -78,12 +81,28 @@ class _AdminRecentExportsTabState extends State<AdminRecentExportsTab> {
           FilledButton(
             style: FilledButton.styleFrom(backgroundColor: Colors.red.shade700),
             onPressed: () => Navigator.pop(c, true),
-            child: const Text('Undo'),
+            child: const Text('Continue'),
           ),
         ],
       ),
     );
     if (confirm != true) return;
+    if (!mounted) return;
+
+    final pinOk = await showPinDialog(
+      context,
+      title: 'Confirm Undo with PIN',
+      warningMessage:
+          'This will restore previous statuses on ${deliveredIds.length} '
+          'order(s) and un-track ${lineItemIds.length} line item(s). '
+          'This cannot be re-undone.',
+    );
+    if (!pinOk) {
+      if (!mounted) return;
+      Fluttertoast.showToast(msg: 'PIN cancelled — undo aborted');
+      return;
+    }
+
     try {
       await _service.undoExportBatch(batch['id'].toString());
       if (!mounted) return;
@@ -176,7 +195,12 @@ class _AdminRecentExportsTabState extends State<AdminRecentExportsTab> {
             '${exportedAt.minute.toString().padLeft(2, '0')}'
         : '—';
 
-    final canUndo = _isSuperAdmin && !wasUndone && deliveredIds.isNotEmpty;
+    final isExpired = exportedAt != null &&
+        DateTime.now().difference(exportedAt) > _kUndoWindow;
+    final canUndo =
+        _isSuperAdmin && !wasUndone && deliveredIds.isNotEmpty && !isExpired;
+    final showExpiredChip =
+        _isSuperAdmin && !wasUndone && deliveredIds.isNotEmpty && isExpired;
 
     return Container(
       decoration: BoxDecoration(
@@ -245,6 +269,31 @@ class _AdminRecentExportsTabState extends State<AdminRecentExportsTab> {
                   icon: Icon(Icons.undo_rounded, size: 16, color: Colors.red.shade700),
                   label: Text('Undo',
                       style: GoogleFonts.manrope(fontSize: 12, color: Colors.red.shade700, fontWeight: FontWeight.w700)),
+                )
+              else if (showExpiredChip)
+                Tooltip(
+                  message: 'Undo window (24h) has expired',
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: Colors.grey.shade100,
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: Colors.grey.shade300),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.lock_clock_rounded,
+                            size: 12, color: Colors.grey.shade700),
+                        const SizedBox(width: 4),
+                        Text('LOCKED 24h',
+                            style: GoogleFonts.manrope(
+                                fontSize: 10,
+                                fontWeight: FontWeight.w800,
+                                color: Colors.grey.shade700)),
+                      ],
+                    ),
+                  ),
                 ),
             ],
           ),

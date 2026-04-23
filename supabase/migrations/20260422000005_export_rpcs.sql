@@ -126,6 +126,12 @@ BEGIN
     RAISE EXCEPTION 'Batch not found: %', p_batch_id;
   END IF;
 
+  -- Server-side 24h undo window. Authoritative even if a client bypasses the
+  -- UI check or has a wrong device clock.
+  IF now() - v_batch.exported_at > INTERVAL '24 hours' THEN
+    RAISE EXCEPTION 'Undo window (24h) expired for batch %', p_batch_id;
+  END IF;
+
   -- 1. Restore previous statuses exactly as captured.
   FOR v_order_id, v_prev_status IN
     SELECT key, value FROM jsonb_each_text(v_batch.previous_statuses)
