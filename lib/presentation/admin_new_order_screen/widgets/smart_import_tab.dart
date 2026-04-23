@@ -1,3 +1,5 @@
+import 'dart:io';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
@@ -39,6 +41,13 @@ class _SmartImportTabState extends State<SmartImportTab> {
   List<AppUserModel> _reps = [];
   AppUserModel? _selectedRep;
   final TextEditingController _pasteCtl = TextEditingController();
+
+  // File-upload state. When non-null, parse routes to parseFromBytes() and
+  // the paste box is ignored. Mime + inputType are detected from extension.
+  Uint8List? _pickedBytes;
+  String? _pickedFileName;
+  String? _pickedMime;       // 'application/pdf' | 'image/jpeg' | 'image/png'
+  String? _pickedInputType;  // 'pdf' | 'image_screenshot'
 
   bool _loading = true;
   bool _parsing = false;
@@ -93,25 +102,93 @@ class _SmartImportTabState extends State<SmartImportTab> {
     _loadForTeam(t);
   }
 
+  // ── File pick handlers ──────────────────────────────────────────────────
+  Future<void> _pickPdf() async {
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['pdf'],
+      withData: true, // needed for web where .path is null
+    );
+    await _acceptPicked(result, expectedInputType: 'pdf');
+  }
+
+  Future<void> _pickImage() async {
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['jpg', 'jpeg', 'png'],
+      withData: true,
+    );
+    await _acceptPicked(result, expectedInputType: 'image_screenshot');
+  }
+
+  Future<void> _acceptPicked(
+      FilePickerResult? result, {required String expectedInputType}) async {
+    if (result == null || result.files.isEmpty) return;
+    final file = result.files.first;
+    if (file.bytes == null && file.path == null) return;
+    try {
+      Uint8List bytes;
+      if (file.bytes != null) {
+        bytes = file.bytes!;
+      } else {
+        bytes = await File(file.path!).readAsBytes();
+      }
+      final ext = (file.extension ?? '').toLowerCase();
+      final mime = switch (ext) {
+        'pdf' => 'application/pdf',
+        'png' => 'image/png',
+        _ => 'image/jpeg',
+      };
+      setState(() {
+        _pickedBytes = bytes;
+        _pickedFileName = file.name;
+        _pickedMime = mime;
+        _pickedInputType = expectedInputType;
+        // File supersedes any pasted text. Clear it so the user isn't
+        // confused about which source Parse will use.
+        _pasteCtl.clear();
+      });
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not read file: $e'), backgroundColor: Colors.red),
+      );
+    }
+  }
+
+  void _clearPickedFile() {
+    setState(() {
+      _pickedBytes = null;
+      _pickedFileName = null;
+      _pickedMime = null;
+      _pickedInputType = null;
+    });
+  }
+
   // ── Parse pipeline ──────────────────────────────────────────────────────
   Future<void> _parse() async {
-    final raw = _pasteCtl.text;
-    if (raw.trim().isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Paste something first')),
-      );
-      return;
-    }
     if (_selectedRep == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Pick a rep for this import first')),
       );
       return;
     }
+
+    final hasFile = _pickedBytes != null;
+    final raw = _pasteCtl.text;
+    if (!hasFile && raw.trim().isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Paste text or upload a PDF / image first')),
+      );
+      return;
+    }
     setState(() => _parsing = true);
 
     try {
-      final hash = SmartImportService.computeInputHash(raw);
+      // Hash + dedup guard identical for all input types.
+      final hash = hasFile
+          ? SmartImportService.computeFileHash(_pickedBytes!)
+          : SmartImportService.computeInputHash(raw);
       final dup = await SmartImportService.instance.findImportByHash(hash, _team);
       if (dup != null) {
         if (!mounted) return;
@@ -120,7 +197,13 @@ class _SmartImportTabState extends State<SmartImportTab> {
         return;
       }
 
-      final draft = await SmartImportService.instance.parseBrandSoftwareText(raw);
+      final draft = hasFile
+          ? await SmartImportService.instance.parseFromBytes(
+              bytes: _pickedBytes!,
+              mimeType: _pickedMime!,
+              inputType: _pickedInputType!,
+            )
+          : await SmartImportService.instance.parseBrandSoftwareText(raw);
       if (draft == null) {
         if (!mounted) return;
         setState(() => _parsing = false);
@@ -300,11 +383,16 @@ class _SmartImportTabState extends State<SmartImportTab> {
         debugPrint('[SmartImport] alias writes failed: $e');
       }
 
-      // Audit row.
+      // Audit row — record which input path created this order.
       if (_inputHash != null && _draft != null) {
+        final historyInputType =
+            _pickedInputType ?? 'brand_software_text';
+        final historyPreview = _pickedFileName != null
+            ? 'file: $_pickedFileName (${_pickedBytes?.length ?? 0} bytes, $_pickedMime)'
+            : _pasteCtl.text;
         await svc.writeImportHistory(
-          inputType: 'brand_software_text',
-          inputPreview: _pasteCtl.text,
+          inputType: historyInputType,
+          inputPreview: historyPreview,
           inputHash: _inputHash!,
           parsedResult: {
             'customer': {
@@ -416,6 +504,10 @@ class _SmartImportTabState extends State<SmartImportTab> {
       _notesCtl.clear();
       _draft = null;
       _inputHash = null;
+      _pickedBytes = null;
+      _pickedFileName = null;
+      _pickedMime = null;
+      _pickedInputType = null;
       _resolvedCustomer = null;
       _chosenCustomer = null;
       _reviewLines.clear();
@@ -481,14 +573,10 @@ class _SmartImportTabState extends State<SmartImportTab> {
             onChanged: (r) => setState(() => _selectedRep = r),
           ),
           const SizedBox(height: 16),
-          _sectionLabel('PASTE BRAND-SOFTWARE OUTPUT (GUBB, SCO, ETC.)'),
-          TextField(
-            controller: _pasteCtl,
-            maxLines: 12,
-            decoration: _fieldDecoration(
-              hint: 'Paste order from brand app. Gemini parses it; you review every line.',
-            ),
-          ),
+          _sectionLabel('INPUT'),
+          if (_pickedBytes != null) _buildPickedFileCard() else _buildPasteBox(),
+          const SizedBox(height: 10),
+          if (_pickedBytes == null) _buildUploadButtons(),
           const SizedBox(height: 16),
           FilledButton.icon(
             onPressed: _parsing ? null : _parse,
@@ -498,8 +586,14 @@ class _SmartImportTabState extends State<SmartImportTab> {
                     child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
                   )
                 : const Icon(Icons.auto_awesome_rounded),
-            label: Text(_parsing ? 'Parsing…' : 'Parse with Gemini',
-                style: GoogleFonts.manrope(fontSize: 14, fontWeight: FontWeight.w800)),
+            label: Text(
+              _parsing
+                  ? 'Parsing…'
+                  : (_pickedBytes != null
+                      ? 'Parse ${_pickedInputType == "pdf" ? "PDF" : "image"} with Gemini'
+                      : 'Parse text with Gemini'),
+              style: GoogleFonts.manrope(fontSize: 14, fontWeight: FontWeight.w800),
+            ),
             style: FilledButton.styleFrom(
               minimumSize: const Size.fromHeight(48),
               backgroundColor: AppTheme.primary,
@@ -530,6 +624,84 @@ class _SmartImportTabState extends State<SmartImportTab> {
           ),
         ],
       ),
+    );
+  }
+
+  Widget _buildPasteBox() {
+    return TextField(
+      controller: _pasteCtl,
+      maxLines: 10,
+      decoration: _fieldDecoration(
+        hint: 'Paste brand-software text (GUBB, SCO, etc.) — or use the upload buttons below.',
+      ),
+    );
+  }
+
+  Widget _buildPickedFileCard() {
+    final sizeKb = ((_pickedBytes?.length ?? 0) / 1024).toStringAsFixed(1);
+    final icon = _pickedInputType == 'pdf'
+        ? Icons.picture_as_pdf_rounded
+        : Icons.image_rounded;
+    final accent = _pickedInputType == 'pdf' ? Colors.red.shade700 : Colors.teal.shade700;
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: accent.withValues(alpha: 0.06),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: accent.withValues(alpha: 0.4)),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, color: accent),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(_pickedFileName ?? '—',
+                    style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.w700)),
+                Text('$sizeKb KB · $_pickedMime',
+                    style: GoogleFonts.manrope(fontSize: 11, color: Colors.black54)),
+              ],
+            ),
+          ),
+          IconButton(
+            icon: const Icon(Icons.close_rounded, size: 20),
+            tooltip: 'Remove file',
+            onPressed: _clearPickedFile,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildUploadButtons() {
+    return Row(
+      children: [
+        Expanded(
+          child: OutlinedButton.icon(
+            onPressed: _pickPdf,
+            icon: const Icon(Icons.picture_as_pdf_rounded, size: 18),
+            label: Text('Upload PDF',
+                style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700)),
+            style: OutlinedButton.styleFrom(
+              minimumSize: const Size.fromHeight(44),
+            ),
+          ),
+        ),
+        const SizedBox(width: 8),
+        Expanded(
+          child: OutlinedButton.icon(
+            onPressed: _pickImage,
+            icon: const Icon(Icons.image_rounded, size: 18),
+            label: Text('Upload Image',
+                style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700)),
+            style: OutlinedButton.styleFrom(
+              minimumSize: const Size.fromHeight(44),
+            ),
+          ),
+        ),
+      ],
     );
   }
 

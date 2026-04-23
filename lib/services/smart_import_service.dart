@@ -113,6 +113,12 @@ class SmartImportService {
     return sha256.convert(utf8.encode(normalized)).toString();
   }
 
+  /// SHA-256 of raw file bytes. No normalization — the binary is already
+  /// canonical. Same bytes re-uploaded → same hash → dedup-guard fires.
+  static String computeFileHash(Uint8List bytes) {
+    return sha256.convert(bytes).toString();
+  }
+
   // ─── DUPLICATE GUARD ─────────────────────────────────────────────────
 
   /// Returns the existing import row's resulting_order_id if this hash was
@@ -616,6 +622,188 @@ RULES:
       );
     } catch (e) {
       debugPrint('[SmartImport] Gemini parse failed: $e');
+      return null;
+    }
+  }
+
+  // ─── GEMINI PARSE (pdf + image screenshot) ───────────────────────────
+
+  static const String _pdfPrompt = r'''
+You are a parsing assistant for a wholesale distributor's order system.
+You are given a purchase-order PDF from a large customer. Extract the
+structured order.
+
+OUTPUT FORMAT — STRICT JSON, NO PROSE, NO MARKDOWN FENCES:
+{
+  "customer": {
+    "name_as_written": "exact text from header",
+    "phone_if_present": "string or null"
+  },
+  "delivery_date_hint": "string or null",
+  "notes": "freeform PO notes, or null",
+  "line_items": [
+    {
+      "name_as_written": "product name / description as printed",
+      "ean_code": "13-digit EAN if a barcode or EAN column is shown, else null",
+      "quantity": 10,
+      "unit_hint": "pc | pcs | box | ctn | null",
+      "confidence": 0.95
+    }
+  ],
+  "overall_parse_confidence": 0.9
+}
+
+RULES:
+- EAN / barcode column is gold — always extract it when present. Our
+  system does exact EAN matching before falling back to name matching.
+- Do NOT invent items. Only rows present in the PO.
+- If a row has both Ordered Qty and Accepted Qty, use Ordered Qty.
+- Free-goods / bonus rows: emit as separate line items only if a real
+  quantity is present and not obviously a scheme description.
+- MRP, rate, and discount columns are NOT quantities.
+- JSON only.
+''';
+
+  static const String _screenshotPrompt = r'''
+You are a parsing assistant for a wholesale distributor's order system.
+You are given a screenshot of a spreadsheet or brand-software table
+exported by the customer. Extract the order lines.
+
+OUTPUT FORMAT — STRICT JSON, NO PROSE, NO MARKDOWN FENCES:
+{
+  "customer": {
+    "name_as_written": "best guess from header/visible context, or empty string",
+    "phone_if_present": "string or null"
+  },
+  "delivery_date_hint": "string or null",
+  "notes": "any freeform context seen (scheme %, due date, etc.), or null",
+  "line_items": [
+    {
+      "name_as_written": "exact product nickname / description",
+      "ean_code": "string or null",
+      "quantity": 5,
+      "unit_hint": "pc | pcs | ladi | box | null",
+      "confidence": 0.85
+    }
+  ],
+  "overall_parse_confidence": 0.8
+}
+
+RULES:
+- Identify the ORDER quantity column. Common headers: Order / Qty /
+  Ordered / To Ship. IGNORE "Stock", "Balance", "On Hand" columns —
+  those are NOT order quantities.
+- Scheme/discount % columns (e.g. "Scheme%", "Disc%") are NOT
+  quantities. If relevant, mention in notes instead.
+- If the order quantity is blank or 0 for a row, SKIP that row entirely.
+- Lower confidence on any row where the column alignment is ambiguous.
+- JSON only.
+''';
+
+  /// Parse an image screenshot OR a PDF. Returns null on failure; the UI
+  /// must surface an admin-facing error. [mimeType] must be one of
+  /// 'application/pdf', 'image/jpeg', 'image/png'. [inputType] picks the
+  /// prompt — 'pdf' | 'image_screenshot'. (Handwritten photos land in
+  /// Phase 4 with a stricter review flow.)
+  Future<SmartImportDraft?> parseFromBytes({
+    required Uint8List bytes,
+    required String mimeType,
+    required String inputType,
+  }) async {
+    final key = await _getGeminiKey();
+    if (key.isEmpty) {
+      debugPrint('[SmartImport] GEMINI_API_KEY missing');
+      return null;
+    }
+    final prompt = switch (inputType) {
+      'pdf' => _pdfPrompt,
+      'image_screenshot' => _screenshotPrompt,
+      _ => _screenshotPrompt,
+    };
+
+    final body = jsonEncode({
+      'contents': [
+        {
+          'parts': [
+            {'text': prompt},
+            {
+              'inline_data': {
+                'mime_type': mimeType,
+                'data': base64Encode(bytes),
+              },
+            },
+          ],
+        },
+      ],
+      'generationConfig': {
+        'temperature': 0.1,
+        // PDFs and image OCR tend to produce longer output; generous cap.
+        'maxOutputTokens': 32768,
+      },
+    });
+
+    http.Response resp;
+    try {
+      resp = await http.post(
+        Uri.parse('$_geminiEndpoint?key=$key'),
+        headers: {'Content-Type': 'application/json'},
+        body: body,
+        // PDFs + high-res images legitimately take longer than a text paste.
+      ).timeout(const Duration(seconds: 90));
+    } on TimeoutException {
+      debugPrint('[SmartImport] Gemini file parse timed out');
+      return null;
+    } catch (e) {
+      debugPrint('[SmartImport] Gemini file http error: $e');
+      return null;
+    }
+    if (resp.statusCode != 200) {
+      debugPrint('[SmartImport] Gemini file ${resp.statusCode}: ${resp.body}');
+      return null;
+    }
+
+    try {
+      final data = jsonDecode(resp.body) as Map<String, dynamic>;
+      final text = ((data['candidates'] as List?)?.firstOrNull?['content']
+              ?['parts'] as List?)?.firstOrNull?['text'] as String?;
+      if (text == null || text.isEmpty) return null;
+
+      final cleaned = text
+          .replaceAll('```json', '')
+          .replaceAll('```', '')
+          .trim();
+      Map<String, dynamic> json;
+      try {
+        json = jsonDecode(cleaned) as Map<String, dynamic>;
+      } catch (_) {
+        final s = cleaned.indexOf('{');
+        final e = cleaned.lastIndexOf('}');
+        if (s == -1 || e == -1 || e < s) return null;
+        json = jsonDecode(cleaned.substring(s, e + 1)) as Map<String, dynamic>;
+      }
+
+      final cust = (json['customer'] as Map?) ?? {};
+      final lines = (json['line_items'] as List? ?? []).map((l) {
+        final m = l as Map;
+        return SmartImportDraftLine(
+          nameAsWritten: (m['name_as_written'] as String? ?? '').trim(),
+          eanCode: m['ean_code'] as String?,
+          quantity: (m['quantity'] as num?)?.toInt() ?? 0,
+          unitHint: m['unit_hint'] as String?,
+          confidence: (m['confidence'] as num?)?.toDouble() ?? 0.7,
+        );
+      }).where((l) => l.nameAsWritten.isNotEmpty && l.quantity > 0).toList();
+
+      return SmartImportDraft(
+        customerNameAsWritten: (cust['name_as_written'] as String? ?? '').trim(),
+        customerPhoneFromInput: cust['phone_if_present'] as String?,
+        deliveryDateHint: json['delivery_date_hint'] as String?,
+        notes: json['notes'] as String?,
+        lines: lines,
+        overallConfidence: (json['overall_parse_confidence'] as num?)?.toDouble() ?? 0.7,
+      );
+    } catch (e) {
+      debugPrint('[SmartImport] Gemini file parse failed: $e');
       return null;
     }
   }
