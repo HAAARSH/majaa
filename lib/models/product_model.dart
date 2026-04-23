@@ -43,6 +43,14 @@ class ProductModel {
   final double? cessPer;
   final String? taxOnMrp;      // 'Y' / 'N'
 
+  /// Timestamp when stock_qty transitioned from >0 to <=0. Populated +
+  /// cleared automatically by a BEFORE UPDATE trigger on products (see
+  /// `20260423000007_products_stock_zeroed_at.sql`). NULL when the
+  /// product is currently stocked OR was NEVER-stocked since the
+  /// trigger was installed. Drives the 2-day billable grace window in
+  /// the rep product list — see [isInStockGrace] / [isBillable].
+  final DateTime? stockZeroedAt;
+
   const ProductModel({
     required this.id, required this.name, required this.sku, required this.category,
     required this.brand, required this.unitPrice, this.mrp = 0, required this.packSize,
@@ -52,6 +60,7 @@ class ProductModel {
     this.billingName, this.printName,
     this.company, this.itemGroup, this.hsn, this.packqty,
     this.vatPer, this.satPer, this.cstPer, this.cessPer, this.taxOnMrp,
+    this.stockZeroedAt,
   });
 
   factory ProductModel.fromJson(Map<String, dynamic> json) => ProductModel(
@@ -83,6 +92,9 @@ class ProductModel {
     cstPer: (json['cst_per'] as num?)?.toDouble(),
     cessPer: (json['cess_per'] as num?)?.toDouble(),
     taxOnMrp: json['tax_on_mrp'] as String?,
+    stockZeroedAt: json['stock_zeroed_at'] == null
+        ? null
+        : DateTime.tryParse(json['stock_zeroed_at'].toString()),
   );
 
   Map<String, dynamic> toJson() => {
@@ -102,6 +114,7 @@ class ProductModel {
     'cst_per': cstPer,
     'cess_per': cessPer,
     'tax_on_mrp': taxOnMrp,
+    if (stockZeroedAt != null) 'stock_zeroed_at': stockZeroedAt!.toIso8601String(),
   };
 
   /// Total tax rate from ITEM master (%). Sum of VATPER + SATPER + CESSPER.
@@ -109,6 +122,31 @@ class ProductModel {
   /// ITEM sync hasn't populated the columns yet.
   double get totalTaxPercent =>
       (vatPer ?? 0) + (satPer ?? 0) + (cessPer ?? 0);
+
+  /// True when stock is zero (or negative) BUT the grace period after
+  /// zeroing is still active. Rep should still be able to add this to
+  /// cart — office has [graceDays] to restock before it hard-locks.
+  bool isInStockGrace({int graceDays = 2}) {
+    if (stockQty > 0) return false;
+    if (stockZeroedAt == null) return false;
+    return DateTime.now().difference(stockZeroedAt!) < Duration(days: graceDays);
+  }
+
+  /// Convenience: true when the rep is allowed to add this to cart
+  /// right now. Combines current stock > 0 with the in-grace window.
+  bool get isBillable => stockQty > 0 || isInStockGrace();
+
+  /// Whole days of grace remaining before the product hard-locks.
+  /// Returns 0 for not-in-grace or already-expired; otherwise 1 or 2.
+  int graceDaysLeft({int graceDays = 2}) {
+    if (stockQty > 0 || stockZeroedAt == null) return 0;
+    final elapsed = DateTime.now().difference(stockZeroedAt!);
+    if (elapsed >= Duration(days: graceDays)) return 0;
+    // Remaining days rounded UP so "29h left" shows as "2 days" not "1".
+    final remaining = Duration(days: graceDays) - elapsed;
+    final wholeDays = remaining.inHours ~/ 24;
+    return (remaining.inHours % 24 == 0) ? wholeDays : wholeDays + 1;
+  }
 }
 
 class ProductCategoryModel {

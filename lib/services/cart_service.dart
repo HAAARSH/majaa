@@ -23,6 +23,9 @@ class Product {
   final double gstRate;
   final String unit;
   final int stepSize;
+  /// Mirrored from ProductModel.stockZeroedAt. Powers the 2-day grace
+  /// window in the rep flow — see [isInStockGrace] / [isBillable].
+  final DateTime? stockZeroedAt;
 
   const Product({
     required this.id,
@@ -40,7 +43,29 @@ class Product {
     this.gstRate = 0.18,
     this.unit = 'pcs',
     this.stepSize = 1,
+    this.stockZeroedAt,
   });
+
+  /// Within the 2-day billable grace window after stock first zeroed?
+  bool isInStockGrace({int graceDays = 2}) {
+    if (stockQty > 0) return false;
+    if (stockZeroedAt == null) return false;
+    return DateTime.now().difference(stockZeroedAt!) < Duration(days: graceDays);
+  }
+
+  /// Can the rep add this to cart right now?
+  bool get isBillable => stockQty > 0 || isInStockGrace();
+
+  /// Whole days of grace remaining (1 or 2). 0 when not in grace or
+  /// already expired.
+  int graceDaysLeft({int graceDays = 2}) {
+    if (stockQty > 0 || stockZeroedAt == null) return 0;
+    final elapsed = DateTime.now().difference(stockZeroedAt!);
+    if (elapsed >= Duration(days: graceDays)) return 0;
+    final remaining = Duration(days: graceDays) - elapsed;
+    final wholeDays = remaining.inHours ~/ 24;
+    return (remaining.inHours % 24 == 0) ? wholeDays : wholeDays + 1;
+  }
 
   factory Product.fromModel(ProductModel model) {
     return Product(
@@ -59,6 +84,7 @@ class Product {
       gstRate: model.gstRate,
       unit: model.unit,
       stepSize: model.stepSize,
+      stockZeroedAt: model.stockZeroedAt,
     );
   }
 

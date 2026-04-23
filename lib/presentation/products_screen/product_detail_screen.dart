@@ -82,7 +82,14 @@ class _ProductDetailScreenState extends State<ProductDetailScreen> {
                               minimumSize: const Size.fromHeight(52),
                               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
                             ),
-                            onPressed: product.status == ProductStatus.outOfStock
+                            // Gate on ProductModel.isBillable instead of the
+                            // legacy status == outOfStock check: billable is
+                            // (stockQty > 0) OR within the 2-day grace
+                            // window after the product first zeroed. Drive
+                            // sync still sets status='outOfStock' for qty<=0
+                            // but that no longer blocks an in-grace product
+                            // from being added to cart.
+                            onPressed: !product.isBillable
                                 ? null
                                 : () {
                                     CartService.instance.addOrUpdateItem(product, product.stepSize);
@@ -186,12 +193,27 @@ class _ProductDetailScreenState extends State<ProductDetailScreen> {
                     Container(
                       padding: const EdgeInsets.all(12),
                       decoration: BoxDecoration(
-                        color: product.stockQty > 0 ? AppTheme.statusAvailableContainer : AppTheme.errorContainer,
+                        // Three-state colour: stocked (green) / in-grace
+                        // (amber) / out-of-stock (red). Matches the grid
+                        // card chip so state is consistent across the flow.
+                        color: product.stockQty > 0
+                            ? AppTheme.statusAvailableContainer
+                            : product.isInStockGrace()
+                                ? AppTheme.warningContainer
+                                : AppTheme.errorContainer,
                         shape: BoxShape.circle,
                       ),
                       child: Icon(
-                        Icons.inventory_2_rounded,
-                        color: product.stockQty > 0 ? AppTheme.statusAvailable : AppTheme.error,
+                        product.stockQty > 0
+                            ? Icons.inventory_2_rounded
+                            : product.isInStockGrace()
+                                ? Icons.hourglass_bottom_rounded
+                                : Icons.block_rounded,
+                        color: product.stockQty > 0
+                            ? AppTheme.statusAvailable
+                            : product.isInStockGrace()
+                                ? AppTheme.warning
+                                : AppTheme.error,
                       ),
                     ),
                     const SizedBox(width: 16),
@@ -207,7 +229,11 @@ class _ProductDetailScreenState extends State<ProductDetailScreen> {
                             ),
                           ),
                           Text(
-                            '${product.stockQty} Units Available',
+                            product.stockQty > 0
+                                ? '${product.stockQty} Units Available'
+                                : product.isInStockGrace()
+                                    ? 'Out of stock — grace ${product.graceDaysLeft()}d left'
+                                    : 'Out of stock — ask office to restock',
                             style: GoogleFonts.manrope(
                               fontSize: 18,
                               fontWeight: FontWeight.bold,

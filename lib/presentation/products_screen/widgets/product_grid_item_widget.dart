@@ -213,8 +213,15 @@ class _ProductGridItemWidgetState extends State<ProductGridItemWidget>
                             ],
                           ),
                           const Spacer(),
-                          // CHANGED: only show stock qty when showStock is true
-                          if (widget.showStock) ...[
+                          // Stock chip. Two paths:
+                          //   • stockQty > 0 — respect showStock flag (user
+                          //     preference), render qty + color by threshold.
+                          //   • stockQty <= 0 — ALWAYS render (even when
+                          //     showStock is false) because the rep needs
+                          //     to know whether they can still add-to-cart
+                          //     within the 2-day grace. "GRACE: Nd" when
+                          //     in window, "OUT OF STOCK" after it expires.
+                          if (widget.product.stockQty > 0 && widget.showStock) ...[
                             Container(
                               padding: const EdgeInsets.symmetric(
                                 horizontal: 6,
@@ -223,9 +230,7 @@ class _ProductGridItemWidgetState extends State<ProductGridItemWidget>
                               decoration: BoxDecoration(
                                 color: widget.product.stockQty > 50
                                     ? AppTheme.statusAvailableContainer
-                                    : widget.product.stockQty > 0
-                                        ? AppTheme.warningContainer
-                                        : AppTheme.errorContainer,
+                                    : AppTheme.warningContainer,
                                 borderRadius: BorderRadius.circular(6),
                               ),
                               child: Row(
@@ -236,9 +241,7 @@ class _ProductGridItemWidgetState extends State<ProductGridItemWidget>
                                     size: 10,
                                     color: widget.product.stockQty > 50
                                         ? AppTheme.statusAvailable
-                                        : widget.product.stockQty > 0
-                                            ? AppTheme.warning
-                                            : AppTheme.error,
+                                        : AppTheme.warning,
                                   ),
                                   const SizedBox(width: 3),
                                   Text(
@@ -248,14 +251,53 @@ class _ProductGridItemWidgetState extends State<ProductGridItemWidget>
                                       fontWeight: FontWeight.w600,
                                       color: widget.product.stockQty > 50
                                           ? AppTheme.statusAvailable
-                                          : widget.product.stockQty > 0
-                                              ? AppTheme.warning
-                                              : AppTheme.error,
+                                          : AppTheme.warning,
                                     ),
                                   ),
                                 ],
                               ),
                             ),
+                            const SizedBox(width: 4),
+                          ],
+                          if (widget.product.stockQty <= 0) ...[
+                            Builder(builder: (_) {
+                              final inGrace = widget.product.isInStockGrace();
+                              final bg = inGrace
+                                  ? AppTheme.warningContainer
+                                  : AppTheme.errorContainer;
+                              final fg = inGrace
+                                  ? AppTheme.warning
+                                  : AppTheme.error;
+                              final label = inGrace
+                                  ? 'GRACE ${widget.product.graceDaysLeft()}d'
+                                  : 'OUT OF STOCK';
+                              final icon = inGrace
+                                  ? Icons.hourglass_bottom_rounded
+                                  : Icons.block_rounded;
+                              return Container(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 6,
+                                  vertical: 3,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: bg,
+                                  borderRadius: BorderRadius.circular(6),
+                                ),
+                                child: Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(icon, size: 10, color: fg),
+                                    const SizedBox(width: 3),
+                                    Text(label,
+                                        style: GoogleFonts.manrope(
+                                          fontSize: 9,
+                                          fontWeight: FontWeight.w700,
+                                          color: fg,
+                                        )),
+                                  ],
+                                ),
+                              );
+                            }),
                             const SizedBox(width: 4),
                           ],
                           Container(

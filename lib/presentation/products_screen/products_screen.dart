@@ -169,9 +169,14 @@ class _ProductsScreenState extends State<ProductsScreen>
   // uncategorized products on their route.
   bool get _isBrandRep => SupabaseService.instance.currentUserRole == 'brand_rep';
 
-  // ADDED: Computed filtered lists — hide products with stock_qty <= 0
-  List<Product> get _inStockDisplayed => _displayedProducts.where((p) => p.stockQty > 0).toList();
-  List<Product> get _inStockSearchResults => _searchResults.where((p) => p.stockQty > 0).toList();
+  // Rep-visible lists. 2-day grace window (2026-04-23): zero-stock
+  // products stay VISIBLE even past the grace window — rep needs to
+  // know the product exists. Whether it's ADD-TO-CART-able is a
+  // separate check (ProductModel.isBillable) enforced at the detail
+  // screen and grid card. This getter name stayed `_inStockDisplayed`
+  // to minimise the diff — despite the name it now shows everything.
+  List<Product> get _inStockDisplayed => _displayedProducts;
+  List<Product> get _inStockSearchResults => _searchResults;
 
   // ─── Search query ───
   String _searchQuery = '';
