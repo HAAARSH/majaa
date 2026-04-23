@@ -40,6 +40,7 @@ dependencies:
   # pub conflicts surface now, not mid-build. Dormant until wired.
   google_generative_ai: ^0.4.0           # Phase 3: PDF parsing via Gemini SDK
   receive_sharing_intent: ^1.8.0         # Phase 5: Android WhatsApp share-intent
+  crypto: ^3.0.0                         # Phase 2: SHA-256 of normalized input for dedup
 
 dev_dependencies:
   flutter_test:
