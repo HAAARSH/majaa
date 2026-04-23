@@ -8,23 +8,32 @@ import '../../../core/pricing.dart';
 import '../../../services/auth_service.dart';
 import '../../../services/offline_service.dart';
 import '../../../services/smart_import_service.dart';
+import '../../../services/smart_import_share_service.dart';
 import '../../../services/supabase_service.dart';
 import '../../../theme/app_theme.dart';
 
-/// Smart Import sub-tab (Phase 2 — brand_software_text only).
+/// Smart Import sub-tab — covers Phases 2/3/4/5 of NEW_ORDER_TAB_PLAN.md.
+///
+/// Input paths:
+///   * Paste text (brand_software_text or whatsapp_text — auto-classified,
+///     admin can override).
+///   * Upload PDF (structured purchase order, EAN-first matching).
+///   * Upload image (screenshot OR handwritten photo — admin toggle).
+///   * Android share-intent (Phase 5) delivers content here via a
+///     top-level listener — content arrives in [_pasteCtl] or [_pickedBytes].
 ///
 /// Flow:
-///   1. Admin picks team + rep attribution, pastes input.
-///   2. Tab computes SHA-256 of normalized input, checks smart_import_history
-///      for a prior import with same (hash, team_id) — rejects duplicates.
-///   3. Gemini parses the text into a SmartImportDraft (customer stub + lines
-///      with name_as_written + qty).
-///   4. Local resolvers map customer + each product to real rows. Lines are
-///      rendered with confidence indicators. Admin edits / confirms.
-///   5. CSDS breakdown computed per line (same flag respect as Manual tab).
-///   6. Stock validation per line (LOW STOCK chip).
+///   1. Admin picks team + rep attribution + input (paste or upload).
+///   2. SHA-256 hash (normalized for text, raw for bytes) checks
+///      smart_import_history.UNIQUE(input_hash, team_id) for dedup.
+///   3. Gemini parses with the per-type prompt → SmartImportDraft.
+///   4. Local resolvers map customer + each product. Lines are rendered
+///      with confidence chips. Handwritten inputs force confirmed=false
+///      on every line so Save is gated on admin review.
+///   5. CSDS breakdown computed per line (respects kForcedOff flag).
+///   6. Stock validation per line (soft LOW STOCK chip).
 ///   7. Save → createOrder (source='office', overrideUserId=rep) → alias
-///      writes → smart_import_history row.
+///      writes → smart_import_history audit row.
 class SmartImportTab extends StatefulWidget {
   const SmartImportTab({super.key});
 
@@ -70,13 +79,62 @@ class _SmartImportTabState extends State<SmartImportTab> {
   void initState() {
     super.initState();
     _loadForTeam(_team);
+    // Phase 5: listen for Android share-intent arrivals. The listener fires
+    // both for cold-start shares (app launched from share sheet) and for
+    // shares received while the tab is already alive. If a share is pending
+    // NOW (populated during main()'s init before this widget mounted), the
+    // WidgetsBinding.postFrameCallback drains it on first frame.
+    SmartImportShareService.pendingShare.addListener(_onSharePayload);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _onSharePayload());
   }
 
   @override
   void dispose() {
+    SmartImportShareService.pendingShare.removeListener(_onSharePayload);
     _pasteCtl.dispose();
     _notesCtl.dispose();
     super.dispose();
+  }
+
+  /// Drains the shared payload from the system share sheet into this tab's
+  /// input fields. Called from an initial post-frame callback AND whenever
+  /// a new share arrives via the notifier.
+  void _onSharePayload() {
+    final payload = SmartImportShareService.pendingShare.value;
+    if (payload == null || !payload.hasPayload) return;
+    // Only auto-apply while compose stage is visible. If the admin is deep
+    // in a review, don't stomp their draft — the notifier keeps the payload
+    // so they can go back and apply after.
+    if (_stage != _Stage.compose) return;
+
+    setState(() {
+      if (payload.text != null && payload.text!.trim().isNotEmpty) {
+        _pasteCtl.text = payload.text!;
+        _textInputType = null; // let classifier re-run on this fresh text
+      } else if (payload.fileBytes != null) {
+        _pickedBytes = payload.fileBytes;
+        _pickedFileName = payload.fileName;
+        _pickedMime = payload.fileMime;
+        _pickedInputType = (payload.fileMime == 'application/pdf')
+            ? 'pdf'
+            : 'image_screenshot';
+        _pasteCtl.clear();
+      }
+    });
+    SmartImportShareService.consume();
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            payload.text != null
+                ? 'Text from share loaded — pick team + rep, then Parse.'
+                : 'File "${payload.fileName ?? "shared"}" loaded — pick team + rep, then Parse.',
+          ),
+          duration: const Duration(seconds: 4),
+        ),
+      );
+    }
   }
 
   Future<void> _loadForTeam(String team) async {

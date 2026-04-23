@@ -11,6 +11,7 @@ import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'services/cart_service.dart';
 import 'services/offline_service.dart';
+import 'services/smart_import_share_service.dart';
 import 'services/supabase_service.dart';
 import 'services/session_service.dart';
 import 'services/update_service.dart';
@@ -67,6 +68,12 @@ Future<void> main() async {
   await OfflineService.instance.init(); // open offline_orders Hive box
   if (!kIsWeb) {
     OfflineService.instance.startMonitoring(); // connectivity watch + 1-hr cache refresh
+
+    // Android-only: listen for shares from WhatsApp / gallery / files apps
+    // that target MAJAA Sales via the system share sheet. The payload
+    // lands on SmartImportShareService.pendingShare; the admin panel +
+    // Smart Import tab pick it up. No-op on iOS / desktop / web.
+    await SmartImportShareService.init();
 
     // Initialize WorkManager for background Drive sync (every 24 hours)
     await Workmanager().initialize(_workManagerCallbackDispatcher);

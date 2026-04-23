@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 
 import '../../routes/app_routes.dart';
+import '../../services/smart_import_share_service.dart';
 import '../../services/supabase_service.dart';
 import '../../theme/app_theme.dart';
 
@@ -78,6 +79,7 @@ class _AdminPanelScreenState extends State<AdminPanelScreen>
         });
         _setupOrderListener();
         _listenForDriveAuthError();
+        _listenForShareIntent();
         // Auto-sync bill photos to Google Drive on admin login
         DriveSyncService.instance.syncAll();
         // Check if admin needs selfie
@@ -163,6 +165,40 @@ class _AdminPanelScreenState extends State<AdminPanelScreen>
     DriveSyncService.instance.authError.addListener(_onDriveAuthError);
   }
 
+  void _listenForShareIntent() {
+    SmartImportShareService.pendingShare.addListener(_onShareIntent);
+    // If a share already landed (cold-start via share sheet) BEFORE this
+    // screen mounted, kick the handler once on first frame so the nudge
+    // fires on first admin-panel build.
+    WidgetsBinding.instance.addPostFrameCallback((_) => _onShareIntent());
+  }
+
+  void _onShareIntent() {
+    final payload = SmartImportShareService.pendingShare.value;
+    if (payload == null || !payload.hasPayload || !mounted) return;
+    // If admin is already on the New Order tab (index 4), the Smart Import
+    // sub-tab will consume the payload itself — no nudge needed.
+    if (_tabController.index == 4) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(children: [
+          const Icon(Icons.share_rounded, color: Colors.white, size: 18),
+          const SizedBox(width: 8),
+          const Expanded(
+            child: Text('Shared content received — open Smart Import to use it'),
+          ),
+        ]),
+        backgroundColor: AppTheme.primary,
+        duration: const Duration(seconds: 6),
+        action: SnackBarAction(
+          label: 'OPEN',
+          textColor: Colors.white,
+          onPressed: () => _tabController.animateTo(4),
+        ),
+      ),
+    );
+  }
+
   void _onDriveAuthError() {
     final error = DriveSyncService.instance.authError.value;
     if (error == null || !mounted) return;
@@ -193,6 +229,7 @@ class _AdminPanelScreenState extends State<AdminPanelScreen>
   @override
   void dispose() {
     DriveSyncService.instance.authError.removeListener(_onDriveAuthError);
+    SmartImportShareService.pendingShare.removeListener(_onShareIntent);
     _tabController.dispose();
     _orderSubscription?.cancel();
     super.dispose();
