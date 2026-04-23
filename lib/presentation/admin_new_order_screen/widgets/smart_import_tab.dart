@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 
 import '../../../core/pricing.dart';
+import '../../../core/search_utils.dart';
 import '../../../services/auth_service.dart';
 import '../../../services/offline_service.dart';
 import '../../../services/smart_import_service.dart';
@@ -951,27 +952,68 @@ class _SmartImportTabState extends State<SmartImportTab> {
           Text('Detected: "${_draft?.customerNameAsWritten ?? ""}"',
               style: GoogleFonts.manrope(fontSize: 12, color: Colors.black54)),
           const SizedBox(height: 8),
-          DropdownButtonFormField<CustomerModel?>(
-            initialValue: _chosenCustomer,
-            isExpanded: true,
-            decoration: _fieldDecoration(
-                hint: hasMatch ? null : 'No match — pick a candidate or change input'),
-            items: [
-              for (final c in (resolved?.candidates ?? <CustomerModel>[]))
-                DropdownMenuItem<CustomerModel?>(
-                  value: c,
-                  child: Text('${c.name}  ·  ${c.phone.isEmpty ? "—" : c.phone}',
-                      overflow: TextOverflow.ellipsis),
-                ),
-            ],
-            onChanged: (c) {
-              setState(() => _chosenCustomer = c);
-              _recomputeAllCsds();
-            },
+          // Candidates from the resolver. If this list is empty (no fuzzy
+          // hits) the dropdown is useless alone — see the "Search all
+          // customers" button below which always works.
+          if ((resolved?.candidates ?? const []).isNotEmpty)
+            DropdownButtonFormField<CustomerModel?>(
+              initialValue: _chosenCustomer,
+              isExpanded: true,
+              decoration: _fieldDecoration(
+                  hint: 'Pick a suggested match or search below'),
+              items: [
+                for (final c in (resolved?.candidates ?? <CustomerModel>[]))
+                  DropdownMenuItem<CustomerModel?>(
+                    value: c,
+                    child: Text('${c.name}  ·  ${c.phone.isEmpty ? "—" : c.phone}',
+                        overflow: TextOverflow.ellipsis),
+                  ),
+              ],
+              onChanged: (c) {
+                setState(() => _chosenCustomer = c);
+                _recomputeAllCsds();
+              },
+            ),
+          const SizedBox(height: 8),
+          // Always-available full search — covers the case where the
+          // resolver produced 0 candidates, or none of the 3 candidates is
+          // the right one. Opens a search sheet over every team customer.
+          OutlinedButton.icon(
+            icon: const Icon(Icons.search_rounded, size: 16),
+            label: Text(
+              _chosenCustomer == null
+                  ? 'Search all customers'
+                  : 'Change customer',
+              style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700),
+            ),
+            onPressed: _pickCustomerFromCatalog,
+            style: OutlinedButton.styleFrom(
+              minimumSize: const Size.fromHeight(40),
+            ),
           ),
         ],
       ),
     );
+  }
+
+  Future<void> _pickCustomerFromCatalog() async {
+    final all = await SupabaseService.instance.getCustomers();
+    final teamCustomers = all.where((c) => c.belongsToTeam(_team)).toList();
+    if (!mounted) return;
+    final picked = await showModalBottomSheet<CustomerModel>(
+      context: context,
+      isScrollControlled: true,
+      builder: (_) => _SearchSheet<CustomerModel>(
+        title: 'Search customers · $_team',
+        items: teamCustomers,
+        displayTitle: (c) => c.name,
+        displaySubtitle: (c) => c.phone.isEmpty ? '—' : c.phone,
+        searchFields: (c) => [c.name, c.phone, c.address],
+      ),
+    );
+    if (picked == null) return;
+    setState(() => _chosenCustomer = picked);
+    _recomputeAllCsds();
   }
 
   String _matchLabel(String? how) {
@@ -1070,32 +1112,53 @@ class _SmartImportTabState extends State<SmartImportTab> {
               ),
             ]),
             const SizedBox(height: 4),
-            DropdownButtonFormField<ProductModel?>(
-              initialValue: line.chosen,
-              isExpanded: true,
-              decoration: _fieldDecoration(
-                  hint: line.chosen == null ? 'Pick a product…' : null),
-              items: [
-                if (line.chosen != null &&
-                    !line.resolved.candidates.map((p) => p.id).contains(line.chosen!.id))
-                  DropdownMenuItem<ProductModel?>(
-                    value: line.chosen,
-                    child: Text('${line.chosen!.name} (picked)',
-                        overflow: TextOverflow.ellipsis),
-                  ),
-                for (final p in line.resolved.candidates)
-                  DropdownMenuItem<ProductModel?>(
-                    value: p,
-                    child: Text(p.name, overflow: TextOverflow.ellipsis),
-                  ),
-              ],
-              onChanged: (p) {
-                setState(() {
-                  line.chosen = p;
-                  if (p != null) line.confirmed = true;
-                });
-                _recomputeCsds(line);
-              },
+            // Candidates from the resolver. Only rendered when there's
+            // something to pick — empty candidate list was the lock-in bug
+            // (admin stranded with no UI to choose a product).
+            if (line.resolved.candidates.isNotEmpty ||
+                (line.chosen != null &&
+                    !line.resolved.candidates.map((p) => p.id).contains(line.chosen!.id)))
+              DropdownButtonFormField<ProductModel?>(
+                initialValue: line.chosen,
+                isExpanded: true,
+                decoration: _fieldDecoration(
+                    hint: line.chosen == null ? 'Pick a suggestion…' : null),
+                items: [
+                  if (line.chosen != null &&
+                      !line.resolved.candidates.map((p) => p.id).contains(line.chosen!.id))
+                    DropdownMenuItem<ProductModel?>(
+                      value: line.chosen,
+                      child: Text('${line.chosen!.name} (picked)',
+                          overflow: TextOverflow.ellipsis),
+                    ),
+                  for (final p in line.resolved.candidates)
+                    DropdownMenuItem<ProductModel?>(
+                      value: p,
+                      child: Text(p.name, overflow: TextOverflow.ellipsis),
+                    ),
+                ],
+                onChanged: (p) {
+                  setState(() {
+                    line.chosen = p;
+                    if (p != null) line.confirmed = true;
+                  });
+                  _recomputeCsds(line);
+                },
+              ),
+            const SizedBox(height: 4),
+            // Always-available full catalog search. Critical when the
+            // resolver returned 0 candidates OR the right product isn't
+            // in the top 3. Previously admin was stuck on "No match".
+            OutlinedButton.icon(
+              icon: const Icon(Icons.search_rounded, size: 16),
+              label: Text(
+                line.chosen == null ? 'Search catalog' : 'Change product',
+                style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700),
+              ),
+              onPressed: () => _pickProductForLine(line),
+              style: OutlinedButton.styleFrom(
+                minimumSize: const Size.fromHeight(38),
+              ),
             ),
             const SizedBox(height: 6),
             // Badge row
@@ -1161,6 +1224,32 @@ class _SmartImportTabState extends State<SmartImportTab> {
         ),
       ),
     );
+  }
+
+  Future<void> _pickProductForLine(_ReviewLine line) async {
+    final products = await SupabaseService.instance.getProducts(teamId: _team);
+    if (!mounted) return;
+    final picked = await showModalBottomSheet<ProductModel>(
+      context: context,
+      isScrollControlled: true,
+      builder: (_) => _SearchSheet<ProductModel>(
+        title: 'Search catalog · $_team',
+        items: products,
+        // Seed the pre-typed query with what was parsed — admin usually
+        // wants to refine the parsed text, not start from zero.
+        initialQuery: line.draft.nameAsWritten,
+        displayTitle: (p) => p.name,
+        displaySubtitle: (p) => '${p.sku} · ${p.category} · ₹${p.unitPrice.toStringAsFixed(2)}',
+        searchFields: (p) => [p.name, p.sku, p.category, p.company],
+      ),
+    );
+    if (picked == null) return;
+    setState(() {
+      line.chosen = picked;
+      // Picking manually implies the admin has verified this line.
+      line.confirmed = true;
+    });
+    _recomputeCsds(line);
   }
 
   Widget _buildTotalsPanel() {
@@ -1342,5 +1431,134 @@ class _ReviewLine {
     }
     if (freeQty > 0) m['free_qty'] = freeQty;
     return m;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Generic bottom-sheet search over a list. Unblocks the review screen
+// when the Gemini resolver produced 0 or wrong candidates: admin can now
+// search the full team catalog (customers or products) and pick manually.
+// ─────────────────────────────────────────────────────────────────────────
+class _SearchSheet<T> extends StatefulWidget {
+  final String title;
+  final List<T> items;
+  final String Function(T) displayTitle;
+  final String Function(T) displaySubtitle;
+  final List<String?> Function(T) searchFields;
+  final String? initialQuery;
+
+  const _SearchSheet({
+    required this.title,
+    required this.items,
+    required this.displayTitle,
+    required this.displaySubtitle,
+    required this.searchFields,
+    this.initialQuery,
+  });
+
+  @override
+  State<_SearchSheet<T>> createState() => _SearchSheetState<T>();
+}
+
+class _SearchSheetState<T> extends State<_SearchSheet<T>> {
+  late final TextEditingController _ctl;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctl = TextEditingController(text: widget.initialQuery ?? '');
+  }
+
+  @override
+  void dispose() {
+    _ctl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final q = _ctl.text;
+    final matches = q.trim().isEmpty
+        ? widget.items.take(50).toList()
+        : widget.items.where((it) => tokenMatch(q, widget.searchFields(it))).take(100).toList();
+    final viewInsets = MediaQuery.of(context).viewInsets;
+    return Padding(
+      padding: EdgeInsets.only(bottom: viewInsets.bottom),
+      child: DraggableScrollableSheet(
+        expand: false,
+        initialChildSize: 0.75,
+        maxChildSize: 0.95,
+        builder: (_, scroll) => Column(
+          children: [
+            Container(
+              padding: const EdgeInsets.fromLTRB(16, 12, 12, 8),
+              child: Row(children: [
+                Expanded(
+                  child: Text(widget.title,
+                      style: GoogleFonts.manrope(fontSize: 15, fontWeight: FontWeight.w800)),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.close_rounded),
+                  onPressed: () => Navigator.pop(context),
+                ),
+              ]),
+            ),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: TextField(
+                controller: _ctl,
+                autofocus: true,
+                onChanged: (_) => setState(() {/* refilter */}),
+                decoration: InputDecoration(
+                  hintText: 'Type to filter',
+                  prefixIcon: const Icon(Icons.search_rounded, size: 18),
+                  isDense: true,
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+                  suffixIcon: _ctl.text.isEmpty
+                      ? null
+                      : IconButton(
+                          icon: const Icon(Icons.close_rounded, size: 16),
+                          onPressed: () => setState(() => _ctl.clear()),
+                        ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 4),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+              child: Row(children: [
+                Text('${matches.length} result${matches.length == 1 ? "" : "s"}',
+                    style: GoogleFonts.manrope(fontSize: 11, color: Colors.black54)),
+              ]),
+            ),
+            Expanded(
+              child: matches.isEmpty
+                  ? Center(
+                      child: Text(
+                        'No matches. Try fewer or different words.',
+                        style: GoogleFonts.manrope(fontSize: 12, color: Colors.black45),
+                      ),
+                    )
+                  : ListView.separated(
+                      controller: scroll,
+                      itemCount: matches.length,
+                      separatorBuilder: (_, __) => const Divider(height: 1),
+                      itemBuilder: (_, i) {
+                        final it = matches[i];
+                        return ListTile(
+                          dense: true,
+                          title: Text(widget.displayTitle(it),
+                              style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.w600)),
+                          subtitle: Text(widget.displaySubtitle(it),
+                              style: GoogleFonts.manrope(fontSize: 11, color: Colors.black54)),
+                          onTap: () => Navigator.pop(context, it),
+                        );
+                      },
+                    ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }
