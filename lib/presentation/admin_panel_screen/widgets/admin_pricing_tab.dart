@@ -1,8 +1,11 @@
 import 'package:flutter/material.dart';
+import 'package:fluttertoast/fluttertoast.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../../core/pricing.dart';
+import '../../../services/billing_rules_service.dart';
+import '../../../services/supabase_service.dart';
 import '../../../theme/app_theme.dart';
 
 /// Catalog → Pricing sub-tab. Per-team CSDS (customer discount schemes)
@@ -31,23 +34,89 @@ class _AdminPricingTabState extends State<AdminPricingTab> {
   }
 
   Future<void> _load() async {
-    final prefs = await SharedPreferences.getInstance();
+    // One-shot migration: copy legacy SharedPreferences toggles into the
+    // billing_rules table so the very first admin to open this tab after
+    // upgrading carries forward whatever they had set locally. After the
+    // copy the SharedPreferences keys are cleared so we never read them
+    // again. Best-effort — if the user lacks super_admin write access
+    // (regular admin), the upsert silently fails and we fall through to
+    // reading whatever billing_rules already has.
+    await _migrateSharedPrefsToDb();
+
+    final ja = await BillingRulesService.instance.isCsdsEnabled('JA');
+    final ma = await BillingRulesService.instance.isCsdsEnabled('MA');
     if (!mounted) return;
     setState(() {
-      _ja = prefs.getBool('csds_enabled_JA') ?? false;
-      _ma = prefs.getBool('csds_enabled_MA') ?? false;
+      _ja = ja;
+      _ma = ma;
       _loading = false;
     });
   }
 
-  Future<void> _set(String team, bool value) async {
+  Future<void> _migrateSharedPrefsToDb() async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool('csds_enabled_$team', value);
-    if (!mounted) return;
-    setState(() {
-      if (team == 'JA') _ja = value;
-      if (team == 'MA') _ma = value;
-    });
+    final localJa = prefs.getBool('csds_enabled_JA');
+    final localMa = prefs.getBool('csds_enabled_MA');
+    if (localJa == null && localMa == null) return; // nothing to migrate
+    try {
+      final rows = <Map<String, dynamic>>[
+        if (localJa != null)
+          {
+            'category': 'pricing',
+            'rule_key': 'pricing_csds_enabled',
+            'scope_type': 'team',
+            'scope_id': 'JA',
+            'value': localJa,
+          },
+        if (localMa != null)
+          {
+            'category': 'pricing',
+            'rule_key': 'pricing_csds_enabled',
+            'scope_type': 'team',
+            'scope_id': 'MA',
+            'value': localMa,
+          },
+      ];
+      for (final r in rows) {
+        await SupabaseService.instance.client
+            .from('billing_rules')
+            .upsert(r, onConflict: 'rule_key,scope_type,scope_id');
+      }
+      BillingRulesService.instance.invalidate();
+      await prefs.remove('csds_enabled_JA');
+      await prefs.remove('csds_enabled_MA');
+    } catch (_) {
+      // Non-super-admin or table missing — leave SharedPreferences in
+      // place so a super_admin can complete the migration on their next
+      // open.
+    }
+  }
+
+  Future<void> _set(String team, bool value) async {
+    try {
+      await SupabaseService.instance.client
+          .from('billing_rules')
+          .upsert({
+        'category': 'pricing',
+        'rule_key': 'pricing_csds_enabled',
+        'scope_type': 'team',
+        'scope_id': team,
+        'value': value,
+      }, onConflict: 'rule_key,scope_type,scope_id');
+      BillingRulesService.instance.invalidate();
+      if (!mounted) return;
+      setState(() {
+        if (team == 'JA') _ja = value;
+        if (team == 'MA') _ma = value;
+      });
+      Fluttertoast.showToast(msg: 'Saved for all admins. Takes effect on next order.');
+    } catch (e) {
+      if (!mounted) return;
+      Fluttertoast.showToast(
+        msg: 'Save failed (super_admin required): $e',
+        toastLength: Toast.LENGTH_LONG,
+      );
+    }
   }
 
   @override

@@ -4,12 +4,12 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:fluttertoast/fluttertoast.dart';
 import 'package:google_fonts/google_fonts.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../../core/pricing.dart';
 import '../../services/supabase_service.dart';
 import '../../services/auth_service.dart';
+import '../../services/billing_rules_service.dart';
 import '../../services/cart_service.dart';
 import '../../services/offline_service.dart';
 import '../../theme/app_theme.dart';
@@ -213,10 +213,9 @@ class _OrderCreationScreenState extends State<OrderCreationScreen> {
 
     // Load the per-team CSDS flag once and flip the global switch so every
     // priceFor() in this submission uses the same setting. Default OFF (safe);
-    // admin enables per team from Settings once smoke-tested.
-    final prefs = await SharedPreferences.getInstance();
-    CsdsPricing.enabled =
-        prefs.getBool('csds_enabled_${AuthService.currentTeam}') ?? false;
+    // admin enables per team from the Rules tab once smoke-tested.
+    CsdsPricing.enabled = await BillingRulesService.instance
+        .isCsdsEnabled(AuthService.currentTeam);
 
     // Build line items. When CsdsPricing.enabled is true we route each line
     // through priceFor() so the customer's DUA-synced discount cascade is
@@ -789,10 +788,10 @@ class _CsdsPreSaveHintState extends State<_CsdsPreSaveHint> {
   }
 
   Future<void> _load() async {
-    final prefs = await SharedPreferences.getInstance();
+    final on = await BillingRulesService.instance
+        .isCsdsEnabled(AuthService.currentTeam);
     if (!mounted) return;
-    setState(() =>
-        _on = prefs.getBool('csds_enabled_${AuthService.currentTeam}') ?? false);
+    setState(() => _on = on);
   }
 
   @override

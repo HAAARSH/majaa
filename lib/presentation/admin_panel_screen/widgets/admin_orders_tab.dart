@@ -6,6 +6,7 @@ import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:printing/printing.dart';
 
+import '../../../services/billing_rules_service.dart';
 import '../../../services/supabase_service.dart';
 import '../../../theme/app_theme.dart';
 import '../../../widgets/empty_state_widget.dart';
@@ -301,6 +302,11 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
     // Phase E: mutable sink for the order ids that had at least one line
     // written. Needed as the RPC's p_order_ids parameter.
     Set<String>? writtenOrderIdsSink,
+    // Rules engine: how to group orders into invoices for this CSV.
+    // Defaults to splitByRepRole so callers that haven't migrated (and
+    // tests) get the legacy behaviour. New code should pass the value
+    // from a BillingRulesSnapshot so per-team configuration applies.
+    MergingStrategy mergingStrategy = MergingStrategy.splitByRepRole,
   }) {
     final buffer = StringBuffer();
     const t = '\t';
@@ -360,18 +366,32 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
     String cleanNotes(String? raw) =>
         (raw ?? '').replaceAll(RegExp(r'[\r\n\t]+'), ' ').trim();
 
-    // ── Phase D: split orders by the ROLE of the rep who booked them ──
-    // brand_rep orders merge per-customer. sales_rep orders (and anything
-    // without a known role) keep one-invoice-per-order.
+    // ── Route orders to the per-order path or the merge path based on
+    // the configured merging strategy. The merge path = brandRepOrders
+    // bucket; per-order path = salesRepOrders bucket.
+    //   • splitByRepRole (legacy / JA): brand_rep merges per customer,
+    //     sales_rep stays one-invoice-per-order.
+    //   • mergeAllByCustomer: every order merges per customer.
+    //   • noMerge: every order stays one-invoice-per-order.
     final salesRepOrders = <OrderModel>[];
     final brandRepOrders = <OrderModel>[];
     for (final o in orders) {
-      final uid = o.userId;
-      final role = (uid != null && userRoleMap != null) ? userRoleMap[uid] : null;
-      if (role == 'brand_rep') {
-        brandRepOrders.add(o);
-      } else {
-        salesRepOrders.add(o);
+      switch (mergingStrategy) {
+        case MergingStrategy.mergeAllByCustomer:
+          brandRepOrders.add(o);
+          break;
+        case MergingStrategy.noMerge:
+          salesRepOrders.add(o);
+          break;
+        case MergingStrategy.splitByRepRole:
+          final uid = o.userId;
+          final role = (uid != null && userRoleMap != null) ? userRoleMap[uid] : null;
+          if (role == 'brand_rep') {
+            brandRepOrders.add(o);
+          } else {
+            salesRepOrders.add(o);
+          }
+          break;
       }
     }
 
@@ -465,6 +485,32 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
       final orderIdList = orderIds.join(',');
       final notesStr = noteParts.join('; ');
 
+      // Rep-name on the merged invoice. For the legacy splitByRepRole
+      // strategy this path only ever ran for brand_rep orders, so the
+      // historical literal "Brand Rep" stays correct. Under
+      // mergeAllByCustomer (MA's new behaviour) the group can contain
+      // sales_rep + brand_rep + multiple distinct reps — keep commission
+      // visibility by using the rep's name when it's a single rep, and
+      // "Multiple" when it isn't.
+      String mergedRepName;
+      if (mergingStrategy == MergingStrategy.mergeAllByCustomer) {
+        final uniqueRepNames = group
+            .map((o) => o.userId)
+            .where((id) => id != null && id.isNotEmpty)
+            .map((id) => userNameMap[id!] ?? '')
+            .where((n) => n.isNotEmpty)
+            .toSet();
+        if (uniqueRepNames.length == 1) {
+          mergedRepName = uniqueRepNames.first;
+        } else if (uniqueRepNames.isEmpty) {
+          mergedRepName = 'Brand Rep';
+        } else {
+          mergedRepName = 'Multiple';
+        }
+      } else {
+        mergedRepName = 'Brand Rep';
+      }
+
       for (final line in combined) {
         final item = line.representative;
         final mrp = item.mrp > 0
@@ -481,7 +527,7 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
             ? line.lineTotalSum
             : line.quantitySum * unitPrice;
         buffer.writeln(
-          '$invoiceNo$t$orderIdList$t$dateStr$t$customerName$t${line.quantitySum}${t}Brand Rep$t$itemName$t${mrp.toStringAsFixed(2)}$t${unitPrice.toStringAsFixed(2)}${t}0.00${t}0.00$t${grossAmount.toStringAsFixed(2)}$t$notesStr',
+          '$invoiceNo$t$orderIdList$t$dateStr$t$customerName$t${line.quantitySum}$t$mergedRepName$t$itemName$t${mrp.toStringAsFixed(2)}$t${unitPrice.toStringAsFixed(2)}${t}0.00${t}0.00$t${grossAmount.toStringAsFixed(2)}$t$notesStr',
         );
       }
     }
@@ -1048,6 +1094,11 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
     int jaWrittenOrderCount = 0;
     int maWrittenOrderCount = 0;
 
+    // Snapshot the rules engine ONCE for this export so a mid-build cache
+    // expiry can't shift JA's strategy halfway through MA's CSV (or vice
+    // versa). Both teams' merging strategies come from this single read.
+    final rulesSnapshot = await BillingRulesService.instance.snapshotForExport();
+
     if (buildJa && jaOrderCount > 0) {
       final jaLineSink = <String>[];
       final jaOrderSink = <String>{};
@@ -1069,6 +1120,7 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
         customerAccCodeForCsvTeam: jaAccCodeByCustomer,
         writtenLineItemIdsSink: jaLineSink,
         writtenOrderIdsSink: jaOrderSink,
+        mergingStrategy: rulesSnapshot.mergingFor('JA'),
       );
       filesToDownload.add(MapEntry(jaFileName, csv));
       writtenLineItemIds.addAll(jaLineSink);
@@ -1096,6 +1148,7 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
         customerAccCodeForCsvTeam: maAccCodeByCustomer,
         writtenLineItemIdsSink: maLineSink,
         writtenOrderIdsSink: maOrderSink,
+        mergingStrategy: rulesSnapshot.mergingFor('MA'),
       );
       filesToDownload.add(MapEntry(maFileName, csv));
       writtenLineItemIds.addAll(maLineSink);
@@ -1210,6 +1263,7 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
       brandName: _organicIndiaBrandName,
       customerIds: customerIds,
     );
+    final rulesSnapshot = await BillingRulesService.instance.snapshotForExport();
 
     // Sort by customer name for stable presentation.
     final sortedCustomers = customerIds
@@ -1227,7 +1281,7 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
 
     final decisions = <String, String>{
       for (final c in sortedCustomers)
-        c.id: remembered[c.id] ?? _defaultOrganicIndiaTeam(c),
+        c.id: remembered[c.id] ?? rulesSnapshot.organicIndiaDefaultFor(c.type),
     };
     bool rememberChoices = true;
 
@@ -1375,11 +1429,6 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
     }
     return decisions;
   }
-
-  /// Default OI billing team when nothing is remembered. Pharmacy → JA
-  /// (business rule from plan); everything else → MA.
-  String _defaultOrganicIndiaTeam(CustomerModel c) =>
-      c.type.toLowerCase() == 'pharmacy' ? 'JA' : 'MA';
 
   /// Phase E: label like "INV420..INV453" for display. On 0 orders returns
   /// just the starting value so admin isn't confused.

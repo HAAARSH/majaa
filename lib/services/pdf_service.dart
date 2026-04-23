@@ -15,6 +15,17 @@ class PdfService {
   static final PdfColor secondaryColor = PdfColor.fromHex('#1E3A8A'); // Darker Blue
   static final PdfColor lightBgColor = PdfColor.fromHex('#F3F4F6'); // Light Gray
 
+  // The Outstanding sheet is printed today but used by the rep on the next
+  // working day for collection. So the header date should be that day, not
+  // today. Friday/Saturday/Sunday prints all roll forward to Monday.
+  static DateTime _nextWorkingDay() {
+    var d = DateTime.now().add(const Duration(days: 1));
+    while (d.weekday == DateTime.saturday || d.weekday == DateTime.sunday) {
+      d = d.add(const Duration(days: 1));
+    }
+    return d;
+  }
+
   // Cached fonts for Unicode support (₹ symbol etc.)
   static pw.Font? _regularFont;
   static pw.Font? _boldFont;
@@ -552,7 +563,7 @@ class PdfService {
     // (share preview, WhatsApp, Drive) — users see "can't open". Render a
     // visible fallback so the file is always valid.
     if (!primaryAdded && !crossAdded) {
-      final today = DateFormat('dd.MM.yyyy').format(DateTime.now());
+      final printedFor = DateFormat('dd.MM.yyyy').format(_nextWorkingDay());
       final teamName = teamId == 'JA' ? 'JAGANNATH ASSOCIATES' : 'MADHAV ASSOCIATES';
       pdf.addPage(pw.Page(
         theme: baseTheme,
@@ -562,7 +573,7 @@ class PdfService {
           children: [
             pw.Text(teamName,
                 style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 13, color: primaryColor)),
-            pw.Text('CUSTOMER OUTSTANDING  PRINTED ON $today',
+            pw.Text('CUSTOMER OUTSTANDING  FOR $printedFor',
                 style: const pw.TextStyle(fontSize: 9)),
             if (beatNames != null && beatNames.isNotEmpty)
               pw.Padding(
@@ -599,7 +610,7 @@ class PdfService {
     List<Map<String, dynamic>>? advances,
     List<Map<String, dynamic>>? creditNotes,
   }) {
-    final today = DateFormat('dd.MM.yyyy').format(DateTime.now());
+    final printedFor = DateFormat('dd.MM.yyyy').format(_nextWorkingDay());
     final teamName = teamId == 'JA' ? 'JAGANNATH ASSOCIATES' : 'MADHAV ASSOCIATES';
     final fs = pw.TextStyle(fontSize: 8);
     final fsBold = pw.TextStyle(fontSize: 8, fontWeight: pw.FontWeight.bold);
@@ -675,7 +686,7 @@ class PdfService {
             pw.Text(teamName, style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 13, color: primaryColor)),
             pw.Text('Page ${context.pageNumber}', style: const pw.TextStyle(fontSize: 8)),
           ]),
-          pw.Text('CUSTOMER OUTSTANDING  PRINTED ON $today', style: const pw.TextStyle(fontSize: 9)),
+          pw.Text('CUSTOMER OUTSTANDING  FOR $printedFor', style: const pw.TextStyle(fontSize: 9)),
           // Beat names below title
           if (beatNames != null && beatNames.isNotEmpty)
             pw.Padding(
@@ -968,7 +979,7 @@ class PdfService {
     List<String>? beatNames,
   }) async {
     final pdf = pw.Document();
-    final today = DateFormat('dd.MM.yyyy').format(DateTime.now());
+    final printedFor = DateFormat('dd.MM.yyyy').format(_nextWorkingDay());
     final teamName = teamId == 'JA' ? 'JAGANNATH ASSOCIATES' : 'MADHAV ASSOCIATES';
     final regular = await regularFont;
     final bold = await boldFont;
@@ -1036,7 +1047,7 @@ class PdfService {
             pw.Text(teamName, style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 13, color: PdfColors.white)),
             pw.Text('Page ${context.pageNumber}', style: const pw.TextStyle(fontSize: 8, color: PdfColors.white)),
           ]),
-          pw.Text('CUSTOMER OUTSTANDING  PRINTED ON $today', style: const pw.TextStyle(fontSize: 9, color: PdfColors.white)),
+          pw.Text('CUSTOMER OUTSTANDING  FOR $printedFor', style: const pw.TextStyle(fontSize: 9, color: PdfColors.white)),
           if (beatNames != null && beatNames.isNotEmpty)
             pw.Padding(
               padding: const pw.EdgeInsets.only(top: 2),

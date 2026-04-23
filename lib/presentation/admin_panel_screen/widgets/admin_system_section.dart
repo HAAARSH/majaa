@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'admin_section_wrapper.dart';
 import 'admin_users_tab.dart';
 import 'admin_error_management_tab.dart';
+import 'admin_rules_tab.dart';
 import 'admin_settings_tab.dart';
 import '../../../services/drive_sync_service.dart';
 
@@ -54,6 +55,11 @@ class _AdminSystemSectionState extends State<AdminSystemSection> {
           label: 'Settings',
           icon: Icons.settings_rounded,
           child: AdminSettingsTab(isSuperAdmin: widget.isSuperAdmin),
+        ),
+        AdminSectionItem(
+          label: 'Rules',
+          icon: Icons.rule_rounded,
+          child: AdminRulesTab(isSuperAdmin: widget.isSuperAdmin),
         ),
         const AdminSectionItem(
           label: 'Users',
