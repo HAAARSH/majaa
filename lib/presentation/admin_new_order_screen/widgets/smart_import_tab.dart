@@ -265,25 +265,20 @@ class _SmartImportTabState extends State<SmartImportTab> {
       final effectiveTextType = _textInputType ??
           SmartImportService.classifyTextInput(raw);
 
-      final draft = hasFile
-          ? await SmartImportService.instance.parseFromBytes(
+      final result = hasFile
+          ? await SmartImportService.instance.parseFromBytesDetailed(
               bytes: _pickedBytes!,
               mimeType: _pickedMime!,
               inputType: _pickedInputType!,
             )
-          : await SmartImportService.instance.parseText(raw, effectiveTextType);
+          : await SmartImportService.instance.parseTextDetailed(raw, effectiveTextType);
+      final draft = result.draft;
       if (draft == null) {
         if (!mounted) return;
         setState(() => _parsing = false);
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: const Text('Parse failed. Check your Gemini key or try a smaller paste.'),
-            backgroundColor: Colors.red.shade700,
-          ),
-        );
+        _showParseError(result.reason, result.detail);
         return;
       }
-
       // Resolve customer.
       final svc = SmartImportService.instance;
       final resolvedCust = await svc.resolveCustomer(
@@ -336,6 +331,82 @@ class _SmartImportTabState extends State<SmartImportTab> {
         SnackBar(content: Text('Parse error: $e'), backgroundColor: Colors.red),
       );
     }
+  }
+
+  /// Blocks the UI with a clear message per failure mode so admin doesn't
+  /// just sit staring at a spinner after a timeout. Previously a SnackBar
+  /// auto-dismissed on mobile before admin noticed.
+  void _showParseError(String reason, String? detail) {
+    String title;
+    String body;
+    switch (reason) {
+      case 'no_key':
+        title = 'Gemini API key missing';
+        body = 'GEMINI_API_KEY is not set in env.json. Add it and rebuild '
+            'the app. Contact the developer if you do not have one.';
+        break;
+      case 'timeout':
+        title = 'Gemini timed out (${detail ?? "—"})';
+        body = 'The model took longer than the allowed window. Common '
+            'causes:\n'
+            '  • Network is slow or offline — retry on stronger signal.\n'
+            '  • Paste is very long — try splitting into two smaller '
+            'imports.\n'
+            '  • Gemini service itself is throttled — wait a minute and '
+            'retry.';
+        break;
+      case 'network':
+        title = 'Network error';
+        body = 'Could not reach Gemini. Check your internet connection.\n\n'
+            '${detail ?? ""}';
+        break;
+      case 'empty':
+        title = 'Gemini returned nothing';
+        body = 'The model responded but produced no text. Usually means '
+            'the input had no recognisable order lines. Check the paste '
+            'or image and try again.';
+        break;
+      case 'bad_json':
+        title = 'Could not read model output';
+        body = 'Gemini returned content that was not valid JSON. This is '
+            'rare — try again, and if it keeps happening, simplify the '
+            'input (one order at a time).\n\n'
+            'Raw output (truncated):\n${detail ?? "—"}';
+        break;
+      case 'internal':
+        title = 'Unexpected parse error';
+        body = 'Something went wrong in the client. Share this with the '
+            'developer:\n\n${detail ?? "—"}';
+        break;
+      default:
+        // http_NNN
+        if (reason.startsWith('http_')) {
+          final code = reason.substring(5);
+          title = 'Gemini API error ($code)';
+          body = 'The Gemini service returned status $code. Likely '
+              'causes:\n'
+              '  • 400 — input rejected (check paste length / mime type).\n'
+              '  • 401 / 403 — API key invalid or out of quota.\n'
+              '  • 429 — rate-limited. Wait a minute.\n'
+              '  • 5xx — Gemini is down. Try again shortly.\n\n'
+              'Response (truncated):\n${detail ?? "—"}';
+        } else {
+          title = 'Parse failed';
+          body = 'Reason: $reason\n\n${detail ?? ""}';
+        }
+    }
+    showDialog<void>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: Text(title),
+        content: SingleChildScrollView(
+          child: Text(body, style: const TextStyle(fontSize: 13, height: 1.35)),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('OK')),
+        ],
+      ),
+    );
   }
 
   void _showDupDialog(Map<String, dynamic> dup) {

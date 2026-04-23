@@ -647,17 +647,39 @@ RULES:
 - JSON only. No commentary.
 ''';
 
+  /// Return shape for parseText / parseFromBytes. Lets the UI distinguish
+  /// a timeout from a missing key from malformed JSON so the admin sees a
+  /// useful message instead of a vague "parse failed".
+  ///
+  /// `draft == null` on every non-success outcome; `reason` is one of:
+  ///   'no_key'     — GEMINI_API_KEY missing from env.json
+  ///   'timeout'    — HTTP call exceeded the per-type timeout
+  ///   'network'    — other transport error (DNS, offline, TLS)
+  ///   'http_{n}'   — Gemini responded with a non-200 status (body logged)
+  ///   'empty'      — Gemini returned no text part
+  ///   'bad_json'   — Gemini response wasn't parseable as JSON
+  ///   'internal'   — unexpected exception during parse
+  ///   'ok'         — draft is non-null
+  // (Kept as strings rather than an enum so existing callers can adopt
+  // incrementally.)
+
   /// Parse a text paste into a structured draft. [inputType] picks the
   /// prompt: 'brand_software_text' (GUBB/SCO structured) or 'whatsapp_text'
   /// (casual mixed-language). Anything else falls back to whatsapp_text.
   ///
-  /// Returns null if Gemini is unreachable / API key missing / response
-  /// unparseable. The caller surfaces an admin-facing error.
+  /// Back-compat: returns null on any failure (same contract as before).
+  /// Callers that want a useful error message should use [parseTextDetailed].
   Future<SmartImportDraft?> parseText(String rawText, String inputType) async {
+    final r = await parseTextDetailed(rawText, inputType);
+    return r.draft;
+  }
+
+  Future<({SmartImportDraft? draft, String reason, String? detail})>
+      parseTextDetailed(String rawText, String inputType) async {
     final key = await _getGeminiKey();
     if (key.isEmpty) {
       debugPrint('[SmartImport] GEMINI_API_KEY missing');
-      return null;
+      return (draft: null, reason: 'no_key', detail: null);
     }
     final prompt = switch (inputType) {
       'brand_software_text' => _brandSoftwarePrompt,
@@ -680,30 +702,39 @@ RULES:
       },
     });
 
+    // Text can be long (GUBB pastes routinely run to 100+ lines). 60s gives
+    // Gemini enough headroom; when we hit this, it's almost always network.
+    const timeout = Duration(seconds: 60);
     http.Response resp;
     try {
       resp = await http.post(
         Uri.parse('$_geminiEndpoint?key=$key'),
         headers: {'Content-Type': 'application/json'},
         body: body,
-      ).timeout(const Duration(seconds: 30));
+      ).timeout(timeout);
     } on TimeoutException {
-      debugPrint('[SmartImport] Gemini timed out');
-      return null;
+      debugPrint('[SmartImport] Gemini timed out after ${timeout.inSeconds}s');
+      return (draft: null, reason: 'timeout', detail: '${timeout.inSeconds}s');
     } catch (e) {
-      debugPrint('[SmartImport] Gemini http error: $e');
-      return null;
+      debugPrint('[SmartImport] Gemini network error: $e');
+      return (draft: null, reason: 'network', detail: e.toString());
     }
     if (resp.statusCode != 200) {
       debugPrint('[SmartImport] Gemini ${resp.statusCode}: ${resp.body}');
-      return null;
+      return (
+        draft: null,
+        reason: 'http_${resp.statusCode}',
+        detail: _truncate(resp.body, 400),
+      );
     }
 
     try {
       final data = jsonDecode(resp.body) as Map<String, dynamic>;
       final text = ((data['candidates'] as List?)?.firstOrNull?['content']
               ?['parts'] as List?)?.firstOrNull?['text'] as String?;
-      if (text == null || text.isEmpty) return null;
+      if (text == null || text.isEmpty) {
+        return (draft: null, reason: 'empty', detail: null);
+      }
 
       final cleaned = text
           .replaceAll('```json', '')
@@ -715,8 +746,14 @@ RULES:
       } catch (_) {
         final s = cleaned.indexOf('{');
         final e = cleaned.lastIndexOf('}');
-        if (s == -1 || e == -1 || e < s) return null;
-        json = jsonDecode(cleaned.substring(s, e + 1)) as Map<String, dynamic>;
+        if (s == -1 || e == -1 || e < s) {
+          return (draft: null, reason: 'bad_json', detail: _truncate(cleaned, 200));
+        }
+        try {
+          json = jsonDecode(cleaned.substring(s, e + 1)) as Map<String, dynamic>;
+        } catch (_) {
+          return (draft: null, reason: 'bad_json', detail: _truncate(cleaned, 200));
+        }
       }
 
       final cust = (json['customer'] as Map?) ?? {};
@@ -731,7 +768,7 @@ RULES:
         );
       }).where((l) => l.nameAsWritten.isNotEmpty && l.quantity > 0).toList();
 
-      return SmartImportDraft(
+      final draft = SmartImportDraft(
         customerNameAsWritten: (cust['name_as_written'] as String? ?? '').trim(),
         customerPhoneFromInput: cust['phone_if_present'] as String?,
         deliveryDateHint: json['delivery_date_hint'] as String?,
@@ -739,11 +776,15 @@ RULES:
         lines: lines,
         overallConfidence: (json['overall_parse_confidence'] as num?)?.toDouble() ?? 0.7,
       );
+      return (draft: draft, reason: 'ok', detail: null);
     } catch (e) {
       debugPrint('[SmartImport] Gemini parse failed: $e');
-      return null;
+      return (draft: null, reason: 'internal', detail: e.toString());
     }
   }
+
+  static String _truncate(String s, int max) =>
+      s.length <= max ? s : '${s.substring(0, max)}…';
 
   // ─── GEMINI PARSE (pdf + image screenshot) ───────────────────────────
 
@@ -819,12 +860,20 @@ RULES:
 - JSON only.
 ''';
 
-  /// Parse an image screenshot OR a PDF. Returns null on failure; the UI
-  /// must surface an admin-facing error. [mimeType] must be one of
-  /// 'application/pdf', 'image/jpeg', 'image/png'. [inputType] picks the
-  /// prompt — 'pdf' | 'image_screenshot'. (Handwritten photos land in
-  /// Phase 4 with a stricter review flow.)
+  /// Parse an image screenshot OR a PDF. Returns null on failure. Callers
+  /// that want a reason for the failure should use [parseFromBytesDetailed].
   Future<SmartImportDraft?> parseFromBytes({
+    required Uint8List bytes,
+    required String mimeType,
+    required String inputType,
+  }) async {
+    final r = await parseFromBytesDetailed(
+      bytes: bytes, mimeType: mimeType, inputType: inputType);
+    return r.draft;
+  }
+
+  Future<({SmartImportDraft? draft, String reason, String? detail})>
+      parseFromBytesDetailed({
     required Uint8List bytes,
     required String mimeType,
     required String inputType,
@@ -832,7 +881,7 @@ RULES:
     final key = await _getGeminiKey();
     if (key.isEmpty) {
       debugPrint('[SmartImport] GEMINI_API_KEY missing');
-      return null;
+      return (draft: null, reason: 'no_key', detail: null);
     }
     final prompt = switch (inputType) {
       'pdf' => _pdfPrompt,
@@ -862,31 +911,39 @@ RULES:
       },
     });
 
+    // PDFs + high-res images legitimately take longer than text. 120s
+    // so a 30-page PO has time to return.
+    const timeout = Duration(seconds: 120);
     http.Response resp;
     try {
       resp = await http.post(
         Uri.parse('$_geminiEndpoint?key=$key'),
         headers: {'Content-Type': 'application/json'},
         body: body,
-        // PDFs + high-res images legitimately take longer than a text paste.
-      ).timeout(const Duration(seconds: 90));
+      ).timeout(timeout);
     } on TimeoutException {
-      debugPrint('[SmartImport] Gemini file parse timed out');
-      return null;
+      debugPrint('[SmartImport] Gemini file timed out after ${timeout.inSeconds}s');
+      return (draft: null, reason: 'timeout', detail: '${timeout.inSeconds}s');
     } catch (e) {
-      debugPrint('[SmartImport] Gemini file http error: $e');
-      return null;
+      debugPrint('[SmartImport] Gemini file network error: $e');
+      return (draft: null, reason: 'network', detail: e.toString());
     }
     if (resp.statusCode != 200) {
       debugPrint('[SmartImport] Gemini file ${resp.statusCode}: ${resp.body}');
-      return null;
+      return (
+        draft: null,
+        reason: 'http_${resp.statusCode}',
+        detail: _truncate(resp.body, 400),
+      );
     }
 
     try {
       final data = jsonDecode(resp.body) as Map<String, dynamic>;
       final text = ((data['candidates'] as List?)?.firstOrNull?['content']
               ?['parts'] as List?)?.firstOrNull?['text'] as String?;
-      if (text == null || text.isEmpty) return null;
+      if (text == null || text.isEmpty) {
+        return (draft: null, reason: 'empty', detail: null);
+      }
 
       final cleaned = text
           .replaceAll('```json', '')
@@ -898,8 +955,14 @@ RULES:
       } catch (_) {
         final s = cleaned.indexOf('{');
         final e = cleaned.lastIndexOf('}');
-        if (s == -1 || e == -1 || e < s) return null;
-        json = jsonDecode(cleaned.substring(s, e + 1)) as Map<String, dynamic>;
+        if (s == -1 || e == -1 || e < s) {
+          return (draft: null, reason: 'bad_json', detail: _truncate(cleaned, 200));
+        }
+        try {
+          json = jsonDecode(cleaned.substring(s, e + 1)) as Map<String, dynamic>;
+        } catch (_) {
+          return (draft: null, reason: 'bad_json', detail: _truncate(cleaned, 200));
+        }
       }
 
       final cust = (json['customer'] as Map?) ?? {};
@@ -914,7 +977,7 @@ RULES:
         );
       }).where((l) => l.nameAsWritten.isNotEmpty && l.quantity > 0).toList();
 
-      return SmartImportDraft(
+      final draft = SmartImportDraft(
         customerNameAsWritten: (cust['name_as_written'] as String? ?? '').trim(),
         customerPhoneFromInput: cust['phone_if_present'] as String?,
         deliveryDateHint: json['delivery_date_hint'] as String?,
@@ -922,9 +985,10 @@ RULES:
         lines: lines,
         overallConfidence: (json['overall_parse_confidence'] as num?)?.toDouble() ?? 0.7,
       );
+      return (draft: draft, reason: 'ok', detail: null);
     } catch (e) {
       debugPrint('[SmartImport] Gemini file parse failed: $e');
-      return null;
+      return (draft: null, reason: 'internal', detail: e.toString());
     }
   }
 
