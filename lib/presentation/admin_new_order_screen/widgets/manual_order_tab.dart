@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 
+import '../../../core/pricing.dart';
 import '../../../core/search_utils.dart';
 import '../../../services/auth_service.dart';
 import '../../../services/offline_service.dart';
@@ -258,6 +259,8 @@ class _ManualOrderTabState extends State<ManualOrderTab> {
           _buildCartSection(),
           const SizedBox(height: 20),
           _buildTotalsPanel(),
+          const SizedBox(height: 12),
+          _buildLowStockSummary(),
           const SizedBox(height: 16),
           _buildSaveButton(),
           const SizedBox(height: 32),
@@ -357,6 +360,8 @@ class _ManualOrderTabState extends State<ManualOrderTab> {
                       _selectedCustomer = c;
                       _customerSearchCtl.clear();
                     });
+                    // Customer drives CSDS rule lookup — recompute every line.
+                    _recomputeAllLines();
                   },
                 );
               },
@@ -529,14 +534,49 @@ class _ManualOrderTabState extends State<ManualOrderTab> {
   }
 
   void _addProduct(ProductModel p) {
+    final line = _CartLine(product: p, qty: 1, overridePrice: null);
     setState(() {
-      _lines.add(_CartLine(
-        product: p,
-        qty: 1,
-        overridePrice: null,
-      ));
+      _lines.add(line);
       _productSearchCtl.clear();
     });
+    _recomputeLine(line);
+  }
+
+  /// Recompute CSDS breakdown for a single line. Safe no-op when CSDS is
+  /// disabled (kForcedOff OR !enabled) — priceFor returns a no-rule
+  /// breakdown with netRate == baseRate.
+  Future<void> _recomputeLine(_CartLine line) async {
+    // If no customer, skip: CSDS rules are customer-keyed. Clear any stale
+    // breakdown so UI falls back to catalog rate cleanly.
+    if (_selectedCustomer == null) {
+      if (mounted) setState(() => line.breakdown = null);
+      return;
+    }
+    try {
+      final brand = line.product.category.isNotEmpty
+          ? line.product.category
+          : (line.product.company ?? '');
+      final breakdown = await CsdsPricing.priceFor(
+        baseRate: line.product.unitPrice,
+        qty: line.qty,
+        taxPercent: line.product.gstRate * 100,
+        customerId: _selectedCustomer!.id,
+        company: brand,
+        itemGroup: line.product.itemGroup ?? '',
+        teamId: _team,
+      );
+      if (!mounted) return;
+      setState(() => line.breakdown = breakdown);
+    } catch (e) {
+      // CSDS lookup failed — fall through to catalog pricing. Don't block save.
+      debugPrint('[ManualOrderTab] CSDS recompute failed for ${line.product.id}: $e');
+    }
+  }
+
+  Future<void> _recomputeAllLines() async {
+    for (final l in _lines) {
+      await _recomputeLine(l);
+    }
   }
 
   Widget _buildCartSection() {
@@ -562,8 +602,6 @@ class _ManualOrderTabState extends State<ManualOrderTab> {
   }
 
   Widget _buildLineEditor(int index, _CartLine line) {
-    final priceOverridden = line.overridePrice != null &&
-        line.overridePrice! != line.product.unitPrice;
     return Card(
       margin: const EdgeInsets.only(bottom: 8),
       child: Padding(
@@ -576,23 +614,35 @@ class _ManualOrderTabState extends State<ManualOrderTab> {
                 child: Text(line.product.name,
                     style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.w700)),
               ),
-              if (priceOverridden)
-                Container(
-                  margin: const EdgeInsets.only(right: 6),
-                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                  decoration: BoxDecoration(
-                    color: Colors.orange.shade100,
-                    borderRadius: BorderRadius.circular(6),
-                  ),
-                  child: Text('OVERRIDDEN',
-                      style: GoogleFonts.manrope(fontSize: 9, fontWeight: FontWeight.w800, color: Colors.orange.shade900)),
-                ),
               IconButton(
                 icon: const Icon(Icons.close_rounded, size: 18),
                 tooltip: 'Remove line',
                 onPressed: () => setState(() => _lines.removeAt(index)),
               ),
             ]),
+            // Badge row — only shows if any flag is active.
+            if (line.isPriceOverridden || line.hasScheme || line.hasRule || line.isLowStock)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: Wrap(
+                  spacing: 6,
+                  runSpacing: 4,
+                  children: [
+                    if (line.isLowStock)
+                      _lineBadge(
+                        'LOW STOCK (${line.product.stockQty} available)',
+                        Colors.red.shade100, Colors.red.shade900,
+                      ),
+                    if (line.isPriceOverridden)
+                      _lineBadge('OVERRIDDEN', Colors.orange.shade100, Colors.orange.shade900),
+                    if (line.hasScheme)
+                      _lineBadge('+${line.freeQty} FREE',
+                          Colors.green.shade100, Colors.green.shade900),
+                    if (line.hasRule && !line.isPriceOverridden)
+                      _lineBadge('CSDS', Colors.blue.shade100, Colors.blue.shade900),
+                  ],
+                ),
+              ),
             const SizedBox(height: 6),
             Row(children: [
               Expanded(
@@ -601,9 +651,11 @@ class _ManualOrderTabState extends State<ManualOrderTab> {
                   keyboardType: TextInputType.number,
                   inputFormatters: [FilteringTextInputFormatter.digitsOnly],
                   decoration: _fieldDecoration(label: 'Qty'),
-                  onChanged: (v) => setState(() {
-                    line.qty = int.tryParse(v) ?? 0;
-                  }),
+                  onChanged: (v) {
+                    setState(() => line.qty = int.tryParse(v) ?? 0);
+                    // Qty affects scheme free_qty thresholds in CSDS.
+                    _recomputeLine(line);
+                  },
                 ),
               ),
               const SizedBox(width: 8),
@@ -682,6 +734,44 @@ class _ManualOrderTabState extends State<ManualOrderTab> {
     );
   }
 
+  Widget _buildLowStockSummary() {
+    final lowLines = _lines.where((l) => l.isLowStock).toList();
+    if (lowLines.isEmpty) return const SizedBox.shrink();
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.red.shade50,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.red.shade300),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(Icons.warning_amber_rounded, size: 18, color: Colors.red.shade800),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '${lowLines.length} line${lowLines.length == 1 ? '' : 's'} exceed available stock',
+                  style: GoogleFonts.manrope(
+                      fontSize: 12, fontWeight: FontWeight.w800, color: Colors.red.shade900),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  'You can still save — the office may fulfil on short stock. '
+                  'Reduce the qty on low-stock lines if you want to hold the order.',
+                  style: GoogleFonts.manrope(fontSize: 11, color: Colors.red.shade900, height: 1.3),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildSaveButton() {
     return FilledButton.icon(
       onPressed: _canSave ? _save : null,
@@ -696,6 +786,13 @@ class _ManualOrderTabState extends State<ManualOrderTab> {
       ),
     );
   }
+
+  Widget _lineBadge(String text, Color bg, Color fg) => Container(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+        decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(6)),
+        child: Text(text,
+            style: GoogleFonts.manrope(fontSize: 9, fontWeight: FontWeight.w800, color: fg)),
+      );
 
   InputDecoration _fieldDecoration({String? hint, String? label, IconData? prefixIcon}) {
     return InputDecoration(
@@ -712,27 +809,71 @@ class _ManualOrderTabState extends State<ManualOrderTab> {
 // ─────────────────────────────────────────────────────────────────────────
 // Internal: in-memory cart line. Mirrors the payload order_creation_screen
 // builds — so the server-side schema expectations are identical.
+//
+// Priority for unit_price: overridePrice > CSDS netRate > catalog unitPrice.
+// When CSDS is OFF (kForcedOff==true OR !enabled OR no customer) the
+// breakdown falls back to catalog rate with no discount — same as the rep
+// flow. Admin can still override per-line.
 // ─────────────────────────────────────────────────────────────────────────
 class _CartLine {
   final ProductModel product;
   int qty;
-  double? overridePrice; // NULL = use catalog unitPrice
+  double? overridePrice;          // NULL = use CSDS netRate or catalog
+  CsdsPriceBreakdown? breakdown;  // async-populated; null until computed
 
   _CartLine({required this.product, required this.qty, this.overridePrice});
 
-  double get unitPrice => overridePrice ?? product.unitPrice;
-  double get lineTotal => unitPrice * qty;
-  double get gstAmount => lineTotal * product.gstRate;
+  /// Effective per-unit rate. Override wins; otherwise CSDS netRate;
+  /// otherwise catalog unit price.
+  double get unitPrice {
+    if (overridePrice != null) return overridePrice!;
+    if (breakdown != null) return breakdown!.netRate;
+    return product.unitPrice;
+  }
 
-  Map<String, dynamic> toJson(String orderId) => {
-        'order_id': orderId,
-        'product_id': product.id,
-        'product_name': product.name,
-        'sku': product.sku,
-        'quantity': qty,
-        'unit_price': unitPrice,
-        'mrp': product.mrp,
-        'line_total': lineTotal,
-        'gst_rate': product.gstRate,
-      };
+  double get lineTotal => unitPrice * qty;
+
+  /// Use CSDS tax if breakdown present AND admin didn't override price
+  /// (tax is on the discounted taxable). If price is overridden, tax on
+  /// override × qty × gstRate.
+  double get gstAmount {
+    if (overridePrice == null && breakdown != null) return breakdown!.tax;
+    return lineTotal * product.gstRate;
+  }
+
+  /// Free qty from matched CSDS scheme rule (0 if no rule or CSDS off).
+  int get freeQty => breakdown?.freeQty ?? 0;
+
+  bool get hasScheme => freeQty > 0;
+  bool get hasRule => breakdown?.rule != null;
+  bool get isPriceOverridden =>
+      overridePrice != null && overridePrice! != product.unitPrice;
+  bool get isLowStock => qty > product.stockQty;
+
+  Map<String, dynamic> toJson(String orderId) {
+    final m = <String, dynamic>{
+      'order_id': orderId,
+      'product_id': product.id,
+      'product_name': product.name,
+      'sku': product.sku,
+      'quantity': qty,
+      'unit_price': unitPrice,
+      'mrp': product.mrp,
+      'line_total': lineTotal,
+      'gst_rate': product.gstRate,
+    };
+    // Mirror order_creation_screen's CSDS metadata — only write when the
+    // CSDS rule actually contributed (i.e. admin didn't force a different
+    // price via override). Same rule the analytics/export pipeline reads.
+    if (overridePrice == null && breakdown?.rule != null) {
+      final r = breakdown!.rule!;
+      m['csds_disc_per'] = r.discPer;
+      m['csds_disc_per_3'] = r.discPer3;
+      m['csds_disc_per_5'] = r.discPer5;
+    }
+    if (overridePrice == null && freeQty > 0) {
+      m['free_qty'] = freeQty;
+    }
+    return m;
+  }
 }
