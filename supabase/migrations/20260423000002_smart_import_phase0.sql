@@ -14,6 +14,16 @@
 -- ─────────────────────────────────────────────────────────────────────────
 
 -- ═════════════════════════════════════════════════════════════════════════
+-- 0. Prerequisite extension (re-runnable)
+-- An earlier migration (20260401000002_additional_indexes.sql) also
+-- installs this, but may not have been applied to the target DB.
+-- Idempotent — no-op if already installed.
+-- ═════════════════════════════════════════════════════════════════════════
+
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+
+-- ═════════════════════════════════════════════════════════════════════════
 -- 1. product_alias_learning
 -- ═════════════════════════════════════════════════════════════════════════
 
