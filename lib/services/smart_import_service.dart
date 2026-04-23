@@ -984,6 +984,162 @@ RULES:
     await _client.from('customer_alias_learning').delete().eq('id', id);
   }
 
+  // ─── CSV EXPORT / IMPORT (Phase 6) ───────────────────────────────────
+
+  /// Returns CSV rows (header first) for the product-alias table in [teamId].
+  /// Ready to hand to csv.ListToCsvConverter().convert(rows).
+  Future<List<List<String>>> exportProductAliasRows(String teamId) async {
+    final resp = await _client
+        .from('product_alias_learning')
+        .select('alias_text, customer_id, matched_product_id, '
+            'confidence_score, last_used_at, '
+            'products(name, sku), customers(name)')
+        .eq('team_id', teamId);
+    final rows = <List<String>>[
+      ['alias_text', 'customer_id', 'customer_name',
+       'matched_product_id', 'matched_product_name', 'matched_product_sku',
+       'confidence_score', 'last_used_at'],
+    ];
+    for (final r in resp as List) {
+      final m = Map<String, dynamic>.from(r);
+      final prod = (m['products'] as Map?) ?? {};
+      final cust = (m['customers'] as Map?);
+      rows.add([
+        (m['alias_text'] ?? '').toString(),
+        (m['customer_id'] ?? '').toString(),
+        (cust?['name'] ?? '').toString(),
+        (m['matched_product_id'] ?? '').toString(),
+        (prod['name'] ?? '').toString(),
+        (prod['sku'] ?? '').toString(),
+        (m['confidence_score'] ?? 1).toString(),
+        (m['last_used_at'] ?? '').toString(),
+      ]);
+    }
+    return rows;
+  }
+
+  Future<List<List<String>>> exportCustomerAliasRows(String teamId) async {
+    final resp = await _client
+        .from('customer_alias_learning')
+        .select('alias_text, matched_customer_id, confidence_score, '
+            'last_used_at, customers(name, phone)')
+        .eq('team_id', teamId);
+    final rows = <List<String>>[
+      ['alias_text', 'matched_customer_id', 'matched_customer_name',
+       'matched_customer_phone', 'confidence_score', 'last_used_at'],
+    ];
+    for (final r in resp as List) {
+      final m = Map<String, dynamic>.from(r);
+      final cust = (m['customers'] as Map?) ?? {};
+      rows.add([
+        (m['alias_text'] ?? '').toString(),
+        (m['matched_customer_id'] ?? '').toString(),
+        (cust['name'] ?? '').toString(),
+        (cust['phone'] ?? '').toString(),
+        (m['confidence_score'] ?? 1).toString(),
+        (m['last_used_at'] ?? '').toString(),
+      ]);
+    }
+    return rows;
+  }
+
+  /// Import rows into product_alias_learning. Uses writeProductAlias under
+  /// the hood so the 23505-bump behavior is consistent with online writes.
+  /// Returns (inserted, skipped, errorMessages).
+  Future<({int inserted, int skipped, List<String> errors})>
+      importProductAliasRows({
+    required List<List<dynamic>> rows,
+    required String teamId,
+    required String adminUserId,
+  }) async {
+    if (rows.isEmpty) return (inserted: 0, skipped: 0, errors: <String>[]);
+    // Accept rows whose first row is the header — drop it.
+    var body = rows;
+    final header = rows.first.map((c) => c.toString().trim().toLowerCase()).toList();
+    if (header.contains('alias_text')) body = rows.sublist(1);
+
+    int inserted = 0;
+    int skipped = 0;
+    final errors = <String>[];
+
+    for (var i = 0; i < body.length; i++) {
+      final r = body[i];
+      if (r.length < 4) {
+        skipped++;
+        errors.add('row ${i + 2}: expected ≥4 columns, got ${r.length}');
+        continue;
+      }
+      final alias = r[0].toString().trim();
+      final rawCustId = r[1].toString().trim();
+      final customerId = rawCustId.isEmpty ? null : rawCustId;
+      final productId = r[3].toString().trim();
+      if (alias.isEmpty || productId.isEmpty) {
+        skipped++;
+        errors.add('row ${i + 2}: alias_text and matched_product_id required');
+        continue;
+      }
+      try {
+        await writeProductAlias(
+          customerId: customerId,
+          aliasText: alias,
+          productId: productId,
+          teamId: teamId,
+          createdByUserId: adminUserId,
+        );
+        inserted++;
+      } catch (e) {
+        skipped++;
+        errors.add('row ${i + 2}: $e');
+      }
+    }
+    return (inserted: inserted, skipped: skipped, errors: errors);
+  }
+
+  Future<({int inserted, int skipped, List<String> errors})>
+      importCustomerAliasRows({
+    required List<List<dynamic>> rows,
+    required String teamId,
+    required String adminUserId,
+  }) async {
+    if (rows.isEmpty) return (inserted: 0, skipped: 0, errors: <String>[]);
+    var body = rows;
+    final header = rows.first.map((c) => c.toString().trim().toLowerCase()).toList();
+    if (header.contains('alias_text')) body = rows.sublist(1);
+
+    int inserted = 0;
+    int skipped = 0;
+    final errors = <String>[];
+
+    for (var i = 0; i < body.length; i++) {
+      final r = body[i];
+      if (r.length < 2) {
+        skipped++;
+        errors.add('row ${i + 2}: expected ≥2 columns, got ${r.length}');
+        continue;
+      }
+      final alias = r[0].toString().trim();
+      final customerId = r[1].toString().trim();
+      if (alias.isEmpty || customerId.isEmpty) {
+        skipped++;
+        errors.add('row ${i + 2}: alias_text and matched_customer_id required');
+        continue;
+      }
+      try {
+        await writeCustomerAlias(
+          aliasText: alias,
+          customerId: customerId,
+          teamId: teamId,
+          createdByUserId: adminUserId,
+        );
+        inserted++;
+      } catch (e) {
+        skipped++;
+        errors.add('row ${i + 2}: $e');
+      }
+    }
+    return (inserted: inserted, skipped: skipped, errors: errors);
+  }
+
   // ─── HELPERS ─────────────────────────────────────────────────────────
 
   String _normalizeAlias(String raw) {

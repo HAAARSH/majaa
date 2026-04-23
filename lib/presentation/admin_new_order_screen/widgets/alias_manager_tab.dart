@@ -1,9 +1,16 @@
+import 'dart:io';
+
+import 'package:csv/csv.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart' show Uint8List;
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
 import '../../../services/auth_service.dart';
 import '../../../services/smart_import_service.dart';
+import '../../../services/supabase_service.dart';
 import '../../../theme/app_theme.dart';
+import '../../admin_panel_screen/widgets/admin_orders_download_stub.dart';
 
 /// Third sub-tab under the admin "New Order" section: alias manager.
 ///
@@ -104,6 +111,120 @@ class _AliasManagerTabState extends State<AliasManagerTab> {
     }
   }
 
+  Future<void> _exportCsv() async {
+    final isProducts = _view == _View.products;
+    try {
+      final rows = isProducts
+          ? await SmartImportService.instance.exportProductAliasRows(_team)
+          : await SmartImportService.instance.exportCustomerAliasRows(_team);
+      if (rows.length <= 1) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Nothing to export — no aliases yet.')),
+        );
+        return;
+      }
+      final csv = const ListToCsvConverter().convert(rows);
+      final now = DateTime.now();
+      final stamp = '${now.year}${now.month.toString().padLeft(2, '0')}'
+          '${now.day.toString().padLeft(2, '0')}';
+      final filename =
+          'aliases_${isProducts ? "products" : "customers"}_${_team}_$stamp.csv';
+      await triggerCsvDownload(csv, filename);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Export failed: $e'), backgroundColor: Colors.red),
+      );
+    }
+  }
+
+  Future<void> _importCsv() async {
+    // Pick .csv.
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['csv'],
+      withData: true,
+    );
+    if (result == null || result.files.isEmpty) return;
+    final f = result.files.first;
+    final Uint8List bytes;
+    if (f.bytes != null) {
+      bytes = f.bytes!;
+    } else if (f.path != null) {
+      bytes = await File(f.path!).readAsBytes();
+    } else {
+      return;
+    }
+
+    final text = String.fromCharCodes(bytes);
+    final parsed = const CsvToListConverter(eol: '\n').convert(text);
+    if (parsed.isEmpty) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('CSV is empty.')),
+      );
+      return;
+    }
+
+    final adminId =
+        SupabaseService.instance.client.auth.currentUser?.id ?? '';
+    final isProducts = _view == _View.products;
+    try {
+      final res = isProducts
+          ? await SmartImportService.instance.importProductAliasRows(
+              rows: parsed, teamId: _team, adminUserId: adminId)
+          : await SmartImportService.instance.importCustomerAliasRows(
+              rows: parsed, teamId: _team, adminUserId: adminId);
+      if (!mounted) return;
+      final msg = '${res.inserted} imported'
+          '${res.skipped > 0 ? ", ${res.skipped} skipped" : ""}';
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(msg),
+          backgroundColor: res.skipped == 0 ? Colors.green : Colors.orange,
+          action: res.errors.isEmpty
+              ? null
+              : SnackBarAction(
+                  label: 'DETAILS',
+                  textColor: Colors.white,
+                  onPressed: () => _showImportErrors(res.errors),
+                ),
+        ),
+      );
+      _reload();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Import failed: $e'), backgroundColor: Colors.red),
+      );
+    }
+  }
+
+  void _showImportErrors(List<String> errors) {
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Skipped rows'),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: ListView.builder(
+            shrinkWrap: true,
+            itemCount: errors.length,
+            itemBuilder: (_, i) => Padding(
+              padding: const EdgeInsets.symmetric(vertical: 2),
+              child: Text(errors[i],
+                  style: GoogleFonts.manrope(fontSize: 11, color: Colors.black87)),
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('OK')),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Column(
@@ -135,7 +256,34 @@ class _AliasManagerTabState extends State<AliasManagerTab> {
                   },
                 ),
               ),
-            const SizedBox(width: 12),
+            const SizedBox(width: 8),
+            PopupMenuButton<String>(
+              tooltip: 'CSV tools',
+              icon: const Icon(Icons.more_vert_rounded),
+              onSelected: (v) {
+                if (v == 'export') _exportCsv();
+                if (v == 'import') _importCsv();
+              },
+              itemBuilder: (_) => const [
+                PopupMenuItem(
+                  value: 'export',
+                  child: Row(children: [
+                    Icon(Icons.download_rounded, size: 16),
+                    SizedBox(width: 8),
+                    Text('Export current view'),
+                  ]),
+                ),
+                PopupMenuItem(
+                  value: 'import',
+                  child: Row(children: [
+                    Icon(Icons.upload_rounded, size: 16),
+                    SizedBox(width: 8),
+                    Text('Import CSV'),
+                  ]),
+                ),
+              ],
+            ),
+            const SizedBox(width: 4),
             Expanded(
               child: SegmentedButton<_View>(
                 segments: const [
