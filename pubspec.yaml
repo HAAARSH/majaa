@@ -36,6 +36,10 @@ dependencies:
   file_picker: ^8.0.0
   csv: ^6.0.0
   workmanager: ^0.9.0
+  # Smart Import (NEW_ORDER_TAB_PLAN) — added ahead of Phase 3 / Phase 5 so
+  # pub conflicts surface now, not mid-build. Dormant until wired.
+  google_generative_ai: ^0.4.0           # Phase 3: PDF parsing via Gemini SDK
+  receive_sharing_intent: ^1.8.0         # Phase 5: Android WhatsApp share-intent
 
 dev_dependencies:
   flutter_test:
