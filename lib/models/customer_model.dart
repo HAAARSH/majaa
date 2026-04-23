@@ -115,6 +115,17 @@ class CustomerTeamProfile {
         'order_beat_name_ja': orderBeatNameJa,
         'order_beat_id_ma': orderBeatIdMa,
         'order_beat_name_ma': orderBeatNameMa,
+        // 2026-04-24 order-block fields. Missing from toJson earlier
+        // meant any profile round-trip (fromJson → toJson → upsert)
+        // would silently clear the block flags. Covered now.
+        'order_blocked_ja': orderBlockedJa,
+        'order_blocked_ma': orderBlockedMa,
+        'order_block_reason_ja': orderBlockReasonJa,
+        'order_block_reason_ma': orderBlockReasonMa,
+        'order_block_set_at_ja': orderBlockSetAtJa?.toIso8601String(),
+        'order_block_set_at_ma': orderBlockSetAtMa?.toIso8601String(),
+        'order_block_set_by_ja': orderBlockSetByJa,
+        'order_block_set_by_ma': orderBlockSetByMa,
       };
 
   /// Helper: does this customer belong to a given team?
