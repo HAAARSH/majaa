@@ -36,5 +36,23 @@ bool tokenMatch(String query, List<String?> fields) {
 bool tokenMatchSingle(String query, String? field) =>
     tokenMatch(query, [field]);
 
+/// Loose match: returns true if AT LEAST ONE token in [query] is a
+/// substring of any field. Useful as a fallback when the strict
+/// every-token match returns nothing — lets a misspelled / over-typed
+/// query like "vishal kumar enterprises" still surface a customer named
+/// just "Kumar Stores".
+bool tokenMatchAny(String query, List<String?> fields) {
+  final tokens = _tokenize(query);
+  if (tokens.isEmpty) return true;
+  final haystacks =
+      fields.map((f) => (f ?? '').toLowerCase()).toList(growable: false);
+  for (final token in tokens) {
+    for (final h in haystacks) {
+      if (h.contains(token)) return true;
+    }
+  }
+  return false;
+}
+
 /// Tokens of a query — useful for callers that build custom matchers.
 List<String> searchTokens(String query) => _tokenize(query);

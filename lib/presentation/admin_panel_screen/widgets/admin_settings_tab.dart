@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:hive_flutter/hive_flutter.dart';
@@ -30,6 +31,8 @@ class _AdminSettingsTabState extends State<AdminSettingsTab> {
   bool _stockSyncing = false;
   bool _isGoogleSignedIn = false;
   String? _googleEmail;
+  // Web-only: admin-picked Drive folder ID. Null on mobile and when unset.
+  String? _webDriveFolderId;
 
   @override
   void initState() {
@@ -38,6 +41,92 @@ class _AdminSettingsTabState extends State<AdminSettingsTab> {
     _isGoogleSignedIn = GoogleDriveAuthService.instance.isSignedIn;
     _googleEmail = GoogleDriveAuthService.instance.userEmail;
     DriveSyncService.instance.authError.addListener(_onDriveAuthError);
+    if (kIsWeb) _loadWebDriveFolder();
+  }
+
+  Future<void> _loadWebDriveFolder() async {
+    try {
+      final box = Hive.isBoxOpen('app_settings')
+          ? Hive.box('app_settings')
+          : await Hive.openBox('app_settings');
+      if (!mounted) return;
+      setState(() {
+        _webDriveFolderId = box.get('web_drive_upload_folder_id') as String?;
+      });
+    } catch (_) {}
+  }
+
+  /// Extract a Drive folder ID from either a bare ID or a Drive folders URL
+  /// like `https://drive.google.com/drive/folders/<ID>?usp=sharing`.
+  String _extractFolderId(String input) {
+    final trimmed = input.trim();
+    final match = RegExp(r'folders/([A-Za-z0-9_-]+)').firstMatch(trimmed);
+    if (match != null) return match.group(1)!;
+    return trimmed;
+  }
+
+  /// Prompt admin for a Drive folder ID / URL. Returns the extracted ID or
+  /// null if cancelled. Pre-fills [initial] when editing an existing choice.
+  Future<String?> _promptForDriveFolder({String? initial}) async {
+    final ctrl = TextEditingController(text: initial ?? '');
+    final scaffoldMessenger = ScaffoldMessenger.of(context);
+    final picked = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Text('Drive upload folder',
+            style: GoogleFonts.manrope(fontWeight: FontWeight.w800)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Paste the Google Drive folder link or ID where the billing software uploads CSVs (ITMRP*, ITTR*, ACMAST*, etc.).',
+              style: GoogleFonts.manrope(fontSize: 12, color: AppTheme.onSurfaceVariant),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: ctrl,
+              autofocus: true,
+              decoration: const InputDecoration(
+                labelText: 'Folder link or ID',
+                hintText: 'https://drive.google.com/drive/folders/…',
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          FilledButton(
+            onPressed: () {
+              final id = _extractFolderId(ctrl.text);
+              if (id.isEmpty) {
+                scaffoldMessenger.showSnackBar(
+                  const SnackBar(content: Text('Folder link or ID is required'), backgroundColor: Colors.red),
+                );
+                return;
+              }
+              Navigator.pop(ctx, id);
+            },
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    ctrl.dispose();
+    return picked;
+  }
+
+  Future<void> _changeWebDriveFolder() async {
+    final id = await _promptForDriveFolder(initial: _webDriveFolderId);
+    if (id == null) return;
+    await DriveSyncService.setWebUploadFolderId(id);
+    if (!mounted) return;
+    setState(() => _webDriveFolderId = id);
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('Drive upload folder set'), backgroundColor: Colors.green),
+    );
   }
 
   void _onDriveAuthError() {
@@ -118,6 +207,18 @@ class _AdminSettingsTabState extends State<AdminSettingsTab> {
   }
 
   Future<void> _syncFromDrive() async {
+    // Web: no DRIVE_FOLDER_DATA_UPLOAD is shipped in the bundle. Force the
+    // admin to pick the folder before we hit Drive, and persist the choice.
+    if (kIsWeb) {
+      final folderId = DriveSyncService.webUploadFolderId;
+      if (folderId == null || folderId.isEmpty) {
+        final picked = await _promptForDriveFolder(initial: _webDriveFolderId);
+        if (picked == null) return; // admin cancelled
+        await DriveSyncService.setWebUploadFolderId(picked);
+        if (!mounted) return;
+        setState(() => _webDriveFolderId = picked);
+      }
+    }
     setState(() => _stockSyncing = true);
     // Structured per-step summary. Each entry:
     //   { 'step': 'CRN', 'status': 'ok'|'error', 'detail': '...', 'ms': 1234 }
@@ -156,7 +257,10 @@ class _AdminSettingsTabState extends State<AdminSettingsTab> {
       summary.add({
         'step': 'Stock (ITMRP)',
         'status': stockResult.hasError ? 'error' : 'ok',
-        'detail': stockResult.hasError ? stockResult.error : '${stockResult.updated} updated',
+        'detail': stockResult.hasError
+            ? stockResult.error
+            : '${stockResult.updated} updated'
+                '${stockResult.parseSkipped > 0 ? " · ${stockResult.parseSkipped} rows skipped (bad qty)" : ""}',
         'ms': DateTime.now().difference(stockT).inMilliseconds,
       });
 
@@ -661,6 +765,50 @@ class _AdminSettingsTabState extends State<AdminSettingsTab> {
             ),
           ]),
           if (widget.isSuperAdmin) ...[
+            if (kIsWeb) ...[
+              const SizedBox(height: 12),
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: AppTheme.primary.withValues(alpha: 0.05),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: AppTheme.outlineVariant),
+                ),
+                child: Row(children: [
+                  Icon(Icons.folder_rounded, color: AppTheme.primary, size: 18),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('Drive upload folder',
+                            style: GoogleFonts.manrope(fontWeight: FontWeight.w700, fontSize: 12)),
+                        const SizedBox(height: 2),
+                        Text(
+                          (_webDriveFolderId == null || _webDriveFolderId!.isEmpty)
+                              ? 'Not set — choose a folder before syncing'
+                              : _webDriveFolderId!,
+                          style: GoogleFonts.manrope(
+                            fontSize: 10,
+                            color: (_webDriveFolderId == null || _webDriveFolderId!.isEmpty)
+                                ? Colors.orange.shade800
+                                : AppTheme.onSurfaceVariant,
+                          ),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ],
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: _changeWebDriveFolder,
+                    child: Text(
+                      (_webDriveFolderId == null || _webDriveFolderId!.isEmpty) ? 'Choose' : 'Change',
+                      style: GoogleFonts.manrope(fontWeight: FontWeight.w600, fontSize: 12),
+                    ),
+                  ),
+                ]),
+              ),
+            ],
             const SizedBox(height: 10),
             SizedBox(
               width: double.infinity,

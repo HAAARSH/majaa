@@ -107,7 +107,7 @@ class LoginFormWidget extends StatelessWidget {
             autocorrect: false,
             enableSuggestions: false,
             textCapitalization: TextCapitalization.none,
-            autofillHints: [AutofillHints.email],
+            autofillHints: const [AutofillHints.username, AutofillHints.email],
             style:
                 GoogleFonts.manrope(fontSize: 15, fontWeight: FontWeight.w500),
             decoration: _inputDecoration(

@@ -7,6 +7,7 @@ import 'package:google_fonts/google_fonts.dart';
 import '../../../core/pricing.dart';
 import '../../../core/search_utils.dart';
 import '../../../services/auth_service.dart';
+import '../../../services/bill_extraction_service.dart';
 import '../../../services/offline_service.dart';
 import '../../../services/smart_import_service.dart';
 import '../../../services/smart_import_share_service.dart';
@@ -36,7 +37,11 @@ import '../../../theme/app_theme.dart';
 ///   7. Save → createOrder (source='office', overrideUserId=rep) → alias
 ///      writes → smart_import_history audit row.
 class SmartImportTab extends StatefulWidget {
-  const SmartImportTab({super.key});
+  /// Gates the "Revoke & re-import" action in the duplicate dialog. Admins
+  /// see a read-only dup dialog; super_admins get the override.
+  final bool isSuperAdmin;
+
+  const SmartImportTab({super.key, this.isSuperAdmin = false});
 
   @override
   State<SmartImportTab> createState() => _SmartImportTabState();
@@ -44,37 +49,143 @@ class SmartImportTab extends StatefulWidget {
 
 enum _Stage { compose, reviewing }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Attachment + queue types for the multi-attachment / multi-order flow.
+//
+// Compose stage piles up [_Attachment]s (1..N pastes/images/PDFs).
+// Parse fans out one Gemini call per attachment; each call returns
+// 1..M orders which are materialized as a flat [_QueuedDraft] list.
+// Review stage walks the queue one draft at a time — the existing
+// single-draft UI renders `_queue[_queueIdx]` so we don't fragment the
+// line-editing experience into a card-stack.
+// ─────────────────────────────────────────────────────────────────────────
+
+enum _AttachmentKind { paste, image, pdf }
+enum _AttachmentStatus { pending, parsing, ok, duplicate, error }
+enum _ParseOutcome { ok, duplicate, error }
+
+class _Attachment {
+  final String id;
+  final _AttachmentKind kind;
+  final Uint8List? bytes;
+  final String? text;
+  final String? fileName;
+  final String mime;
+  String inputType; // may flip between image_screenshot / image_handwritten
+  final String hash;
+  _AttachmentStatus status;
+  String? parseError;
+  Map<String, dynamic>? dupInfo;
+  /// Indices into the flat [_queue] this attachment contributed.
+  /// Filled after a successful parse; used when writing the audit row so
+  /// every order from this file/paste is linked back to one input_hash.
+  List<int> queueIndices = const [];
+
+  _Attachment({
+    required this.id,
+    required this.kind,
+    required this.bytes,
+    required this.text,
+    required this.fileName,
+    required this.mime,
+    required this.inputType,
+    required this.hash,
+  }) : status = _AttachmentStatus.pending;
+
+  String get displayLabel {
+    switch (kind) {
+      case _AttachmentKind.paste:
+        final t = (text ?? '').trim();
+        return t.length > 40 ? '${t.substring(0, 40)}…' : (t.isEmpty ? 'Paste' : t);
+      case _AttachmentKind.image:
+      case _AttachmentKind.pdf:
+        return fileName ?? (kind == _AttachmentKind.pdf ? 'PDF' : 'Image');
+    }
+  }
+
+  int get byteSize {
+    if (bytes != null) return bytes!.length;
+    return (text ?? '').length;
+  }
+}
+
+enum _QueueStatus { reviewing, saved, skipped, failed }
+
+class _QueuedDraft {
+  final String id;
+  /// Index into [_attachments] — lets save/skip route history writes to
+  /// the owning attachment.
+  final int attachmentIndex;
+  SmartImportDraft draft;
+  ResolvedCustomer? resolvedCust;
+  CustomerModel? chosenCust;
+  final List<_ReviewLine> reviewLines;
+  DateTime deliveryDate;
+  String notes;
+  _QueueStatus status;
+  String? savedOrderId;
+  String? saveError;
+
+  _QueuedDraft({
+    required this.id,
+    required this.attachmentIndex,
+    required this.draft,
+    required this.resolvedCust,
+    required this.chosenCust,
+    required this.reviewLines,
+    required this.deliveryDate,
+    required this.notes,
+  }) : status = _QueueStatus.reviewing;
+}
+
 class _SmartImportTabState extends State<SmartImportTab> {
   // ── Stage + entry UI state ──────────────────────────────────────────────
   _Stage _stage = _Stage.compose;
   String _team = 'JA';
   List<AppUserModel> _reps = [];
   AppUserModel? _selectedRep;
-  final TextEditingController _pasteCtl = TextEditingController();
 
-  // File-upload state. When non-null, parse routes to parseFromBytes() and
-  // the paste box is ignored. Mime + inputType are detected from extension.
-  Uint8List? _pickedBytes;
-  String? _pickedFileName;
-  String? _pickedMime;       // 'application/pdf' | 'image/jpeg' | 'image/png'
-  String? _pickedInputType;  // 'pdf' | 'image_screenshot' | 'image_handwritten'
+  /// Attachments piled up during compose. Each is one paste / image / PDF
+  /// that will be parsed independently. Gemini may return 1..N orders per
+  /// attachment; the flat [_queue] list interleaves all resulting drafts.
+  final List<_Attachment> _attachments = [];
+  int _attachmentIdCounter = 0;
 
-  /// Text-path classification — null until the paste box has non-empty text.
-  /// Admin can override via the dropdown next to the paste box.
-  String? _textInputType;
+  /// Parsed-draft queue. Each entry = one order to review + save. When a
+  /// single attachment yields multiple orders they land as adjacent entries
+  /// here. Review UI walks `_queue[_queueIdx]` one at a time.
+  final List<_QueuedDraft> _queue = [];
+  int _queueIdx = 0;
+  int _draftIdCounter = 0;
+
+  /// Progress during the bulk parse ("Parsing 3 of 5…"). Null when idle.
+  String? _parseProgress;
 
   bool _loading = true;
   bool _parsing = false;
+  /// Per-attachment busy flag for the "Treat as bill" single-bill check.
+  /// Keyed by [_Attachment.id] so removing other attachments mid-flight
+  /// doesn't shift the busy state onto the wrong card.
+  final Set<String> _billChecking = {};
 
-  // ── Review state ────────────────────────────────────────────────────────
+  // ── Current-draft review state ──────────────────────────────────────────
+  // These are a VIEW onto `_queue[_queueIdx]` that the existing review UI
+  // reads from. On save/skip they are flushed back into the queue entry
+  // and the next entry is hydrated.
   SmartImportDraft? _draft;
-  String? _inputHash;
   ResolvedCustomer? _resolvedCustomer;
   CustomerModel? _chosenCustomer;
   final List<_ReviewLine> _reviewLines = [];
   DateTime _deliveryDate = DateTime.now().add(const Duration(days: 1));
   final TextEditingController _notesCtl = TextEditingController();
   bool _submitting = false;
+
+  /// Paste composer controller (bottom-sheet "Add Paste" modal). Lives on
+  /// the State so the modal text survives rebuilds while open.
+  final TextEditingController _pasteCtl = TextEditingController();
+  /// Admin-picked text-input classification (null = auto) — used only
+  /// inside the paste composer modal.
+  String? _textInputType;
 
   @override
   void initState() {
@@ -97,9 +208,9 @@ class _SmartImportTabState extends State<SmartImportTab> {
     super.dispose();
   }
 
-  /// Drains the shared payload from the system share sheet into this tab's
-  /// input fields. Called from an initial post-frame callback AND whenever
-  /// a new share arrives via the notifier.
+  /// Drains the shared payload from the system share sheet as a new
+  /// attachment. Called from an initial post-frame callback AND whenever a
+  /// new share arrives via the notifier.
   void _onSharePayload() {
     final payload = SmartImportShareService.pendingShare.value;
     if (payload == null || !payload.hasPayload) return;
@@ -108,34 +219,74 @@ class _SmartImportTabState extends State<SmartImportTab> {
     // so they can go back and apply after.
     if (_stage != _Stage.compose) return;
 
-    setState(() {
-      if (payload.text != null && payload.text!.trim().isNotEmpty) {
-        _pasteCtl.text = payload.text!;
-        _textInputType = null; // let classifier re-run on this fresh text
-      } else if (payload.fileBytes != null) {
-        _pickedBytes = payload.fileBytes;
-        _pickedFileName = payload.fileName;
-        _pickedMime = payload.fileMime;
-        _pickedInputType = (payload.fileMime == 'application/pdf')
-            ? 'pdf'
-            : 'image_screenshot';
-        _pasteCtl.clear();
-      }
-    });
+    final added = <String>[];
+    if (payload.text != null && payload.text!.trim().isNotEmpty) {
+      final att = _pasteAttachment(
+        text: payload.text!,
+        inputType: SmartImportService.classifyTextInput(payload.text!),
+      );
+      setState(() => _attachments.add(att));
+      added.add('paste from share');
+    } else if (payload.fileBytes != null) {
+      final isPdf = payload.fileMime == 'application/pdf';
+      final att = _fileAttachment(
+        bytes: payload.fileBytes!,
+        fileName: payload.fileName ?? (isPdf ? 'shared.pdf' : 'shared.jpg'),
+        mime: payload.fileMime ?? (isPdf ? 'application/pdf' : 'image/jpeg'),
+        kind: isPdf ? _AttachmentKind.pdf : _AttachmentKind.image,
+        inputType: isPdf ? 'pdf' : 'image_screenshot',
+      );
+      setState(() => _attachments.add(att));
+      added.add('file "${att.fileName}"');
+    }
     SmartImportShareService.consume();
 
-    if (mounted) {
+    if (mounted && added.isNotEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            payload.text != null
-                ? 'Text from share loaded — pick team + rep, then Parse.'
-                : 'File "${payload.fileName ?? "shared"}" loaded — pick team + rep, then Parse.',
+            'Added ${added.join(", ")} — pile on more if you want, then Parse.',
           ),
           duration: const Duration(seconds: 4),
         ),
       );
     }
+  }
+
+  // ── Attachment factories ────────────────────────────────────────────────
+  _Attachment _pasteAttachment({
+    required String text,
+    required String inputType,
+  }) {
+    return _Attachment(
+      id: 'a${++_attachmentIdCounter}',
+      kind: _AttachmentKind.paste,
+      bytes: null,
+      text: text,
+      fileName: null,
+      mime: 'text/plain',
+      inputType: inputType,
+      hash: SmartImportService.computeInputHash(text),
+    );
+  }
+
+  _Attachment _fileAttachment({
+    required Uint8List bytes,
+    required String fileName,
+    required String mime,
+    required _AttachmentKind kind,
+    required String inputType,
+  }) {
+    return _Attachment(
+      id: 'a${++_attachmentIdCounter}',
+      kind: kind,
+      bytes: bytes,
+      text: null,
+      fileName: fileName,
+      mime: mime,
+      inputType: inputType,
+      hash: SmartImportService.computeFileHash(bytes),
+    );
   }
 
   Future<void> _loadForTeam(String team) async {
@@ -166,69 +317,180 @@ class _SmartImportTabState extends State<SmartImportTab> {
   }
 
   // ── File pick handlers ──────────────────────────────────────────────────
+  /// Multi-select PDFs. Each picked file becomes its own attachment.
   Future<void> _pickPdf() async {
     final result = await FilePicker.platform.pickFiles(
       type: FileType.custom,
       allowedExtensions: ['pdf'],
-      withData: true, // needed for web where .path is null
+      withData: true,
+      allowMultiple: true,
     );
-    await _acceptPicked(result, expectedInputType: 'pdf');
+    await _acceptPickedMulti(result, defaultInputType: 'pdf');
   }
 
+  /// Multi-select images. Each picked file becomes its own attachment.
+  /// Default input type is screenshot; admin can per-attachment flip to
+  /// handwritten in the compose list.
   Future<void> _pickImage() async {
     final result = await FilePicker.platform.pickFiles(
       type: FileType.custom,
       allowedExtensions: ['jpg', 'jpeg', 'png'],
       withData: true,
+      allowMultiple: true,
     );
-    await _acceptPicked(result, expectedInputType: 'image_screenshot');
+    await _acceptPickedMulti(result, defaultInputType: 'image_screenshot');
   }
 
-  Future<void> _acceptPicked(
-      FilePickerResult? result, {required String expectedInputType}) async {
+  Future<void> _acceptPickedMulti(
+      FilePickerResult? result, {required String defaultInputType}) async {
     if (result == null || result.files.isEmpty) return;
-    final file = result.files.first;
-    if (file.bytes == null && file.path == null) return;
-    try {
-      Uint8List bytes;
-      if (file.bytes != null) {
-        bytes = file.bytes!;
-      } else {
-        bytes = await File(file.path!).readAsBytes();
+    final added = <_Attachment>[];
+    final skipped = <String>[];
+    for (final file in result.files) {
+      if (file.bytes == null && file.path == null) {
+        skipped.add(file.name);
+        continue;
       }
-      final ext = (file.extension ?? '').toLowerCase();
-      final mime = switch (ext) {
-        'pdf' => 'application/pdf',
-        'png' => 'image/png',
-        _ => 'image/jpeg',
-      };
-      setState(() {
-        _pickedBytes = bytes;
-        _pickedFileName = file.name;
-        _pickedMime = mime;
-        _pickedInputType = expectedInputType;
-        // File supersedes any pasted text. Clear it so the user isn't
-        // confused about which source Parse will use.
-        _pasteCtl.clear();
-      });
-    } catch (e) {
-      if (!mounted) return;
+      try {
+        final Uint8List bytes = file.bytes ?? await File(file.path!).readAsBytes();
+        final ext = (file.extension ?? '').toLowerCase();
+        final isPdf = ext == 'pdf';
+        final mime = switch (ext) {
+          'pdf' => 'application/pdf',
+          'png' => 'image/png',
+          _ => 'image/jpeg',
+        };
+        final inputType = isPdf ? 'pdf' : defaultInputType;
+        final kind = isPdf ? _AttachmentKind.pdf : _AttachmentKind.image;
+        added.add(_fileAttachment(
+          bytes: bytes,
+          fileName: file.name,
+          mime: mime,
+          kind: kind,
+          inputType: inputType,
+        ));
+      } catch (e) {
+        skipped.add('${file.name} ($e)');
+      }
+    }
+    if (added.isNotEmpty) {
+      setState(() => _attachments.addAll(added));
+    }
+    if (!mounted) return;
+    if (skipped.isNotEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Could not read file: $e'), backgroundColor: Colors.red),
+        SnackBar(
+          content: Text('Could not read: ${skipped.join(", ")}'),
+          backgroundColor: Colors.red,
+        ),
       );
     }
   }
 
-  void _clearPickedFile() {
+  void _removeAttachment(int index) {
+    if (index < 0 || index >= _attachments.length) return;
+    setState(() => _attachments.removeAt(index));
+  }
+
+  /// Opens a bottom-sheet composer; on confirm, adds the typed text as a
+  /// new paste attachment. Keeps text + file attachments symmetric.
+  Future<void> _addPaste() async {
+    _pasteCtl.clear();
+    _textInputType = null;
+    final result = await showModalBottomSheet<_Attachment>(
+      context: context,
+      isScrollControlled: true,
+      builder: (_) => _PasteComposerSheet(
+        controller: _pasteCtl,
+        initialInputType: _textInputType,
+        build: (text, inputType) => _pasteAttachment(
+          text: text,
+          inputType: inputType,
+        ),
+      ),
+    );
+    if (result != null) {
+      setState(() => _attachments.add(result));
+    }
+  }
+
+  /// Run the bill-extraction pipeline on a single PDF/image attachment.
+  /// This bypasses the order-import flow — Gemini parses it as one or more
+  /// invoices (BillExtractionService), saves to bill_extractions, and runs
+  /// the same auto-match step the Bill Verification tab uses. On success
+  /// the attachment is removed so it isn't double-processed by Parse.
+  Future<void> _treatAsBill(int index) async {
+    if (index < 0 || index >= _attachments.length) return;
+    final a = _attachments[index];
+    if (a.kind != _AttachmentKind.pdf && a.kind != _AttachmentKind.image) return;
+    if (a.bytes == null || a.bytes!.isEmpty) return;
+    if (_billChecking.contains(a.id)) return;
+
+    setState(() => _billChecking.add(a.id));
+    final originalTeam = AuthService.currentTeam;
+    AuthService.currentTeam = _team;
+    try {
+      final bills = await BillExtractionService.instance.extractBillsFromImage(
+        a.bytes!,
+        mimeType: a.mime,
+      );
+      final saved = bills.isEmpty
+          ? 0
+          : await BillExtractionService.instance.saveExtractedBills(bills);
+      if (!mounted) return;
+      if (bills.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('No bills found in this attachment.'),
+            backgroundColor: Colors.orange,
+          ),
+        );
+      } else {
+        final dups = bills.length - saved;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Extracted ${bills.length} bill${bills.length == 1 ? "" : "s"}, '
+              'saved $saved${dups > 0 ? " ($dups already on file)" : ""}. '
+              'Verify in Admin → Bill Verification.',
+            ),
+            backgroundColor: Colors.green,
+          ),
+        );
+        setState(() => _attachments.removeWhere((x) => x.id == a.id));
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Bill check failed: $e'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    } finally {
+      AuthService.currentTeam = originalTeam;
+      if (mounted) setState(() => _billChecking.remove(a.id));
+    }
+  }
+
+  /// Toggle handwritten↔screenshot for an image attachment. The active
+  /// input type picks the Gemini prompt and controls review's auto-confirm.
+  void _toggleHandwritten(int index) {
+    if (index < 0 || index >= _attachments.length) return;
+    final a = _attachments[index];
+    if (a.kind != _AttachmentKind.image) return;
     setState(() {
-      _pickedBytes = null;
-      _pickedFileName = null;
-      _pickedMime = null;
-      _pickedInputType = null;
+      a.inputType = a.inputType == 'image_handwritten'
+          ? 'image_screenshot'
+          : 'image_handwritten';
     });
   }
 
   // ── Parse pipeline ──────────────────────────────────────────────────────
+  /// Bulk-parse every compose-stage attachment. Each attachment is
+  /// dedup-checked (by hash) and then sent to Gemini. A single attachment
+  /// may produce 1..N orders (multi-order prompt); all resulting orders
+  /// are flattened into [_queue] and reviewed one at a time.
   Future<void> _parse() async {
     if (_selectedRep == null) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -236,59 +498,157 @@ class _SmartImportTabState extends State<SmartImportTab> {
       );
       return;
     }
-
-    final hasFile = _pickedBytes != null;
-    final raw = _pasteCtl.text;
-    if (!hasFile && raw.trim().isEmpty) {
+    if (_attachments.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Paste text or upload a PDF / image first')),
+        const SnackBar(content: Text('Add at least one paste, image, or PDF first')),
       );
       return;
     }
-    setState(() => _parsing = true);
+
+    setState(() {
+      _parsing = true;
+      _parseProgress = 'Preparing…';
+      _queue.clear();
+      _queueIdx = 0;
+    });
+
+    int liveDups = 0;
+    int parseErrs = 0;
+    String? firstErrReason;
+    String? firstErrDetail;
 
     try {
-      // Hash + dedup guard identical for all input types.
-      final hash = hasFile
-          ? SmartImportService.computeFileHash(_pickedBytes!)
-          : SmartImportService.computeInputHash(raw);
-      final dup = await SmartImportService.instance.findImportByHash(hash, _team);
-      if (dup != null) {
+      for (int i = 0; i < _attachments.length; i++) {
         if (!mounted) return;
-        setState(() => _parsing = false);
-        _showDupDialog(dup);
+        setState(() {
+          _parseProgress = 'Parsing ${i + 1} of ${_attachments.length}…';
+        });
+        final outcome = await _parseOne(i);
+        if (outcome == _ParseOutcome.duplicate) liveDups++;
+        if (outcome == _ParseOutcome.error) {
+          parseErrs++;
+          final a = _attachments[i];
+          firstErrReason ??= a.parseError;
+          // _parseOne doesn't capture Gemini's free-form detail today — the
+          // reason code is enough for the error dialog.
+        }
+      }
+
+      if (!mounted) return;
+
+      if (_queue.isEmpty) {
+        setState(() {
+          _parsing = false;
+          _parseProgress = null;
+        });
+        if (liveDups > 0 && parseErrs == 0) {
+          // All attachments were duplicates. Show the first dup dialog,
+          // passing the attachment index so super_admin can revoke + retry.
+          final firstDupIdx = _attachments
+              .indexWhere((a) => a.status == _AttachmentStatus.duplicate);
+          final firstDup = firstDupIdx >= 0
+              ? _attachments[firstDupIdx].dupInfo
+              : null;
+          if (firstDup != null) {
+            _showDupDialog(firstDup, attachmentIndex: firstDupIdx);
+          }
+        } else if (firstErrReason != null) {
+          _showParseError(firstErrReason, firstErrDetail);
+        } else {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Gemini returned no orders for any attachment.')),
+          );
+        }
         return;
       }
 
-      // Resolve the effective input type for text. Admin may have overridden
-      // via the dropdown; otherwise we classify heuristically.
-      final effectiveTextType = _textInputType ??
-          SmartImportService.classifyTextInput(raw);
+      setState(() {
+        _stage = _Stage.reviewing;
+        _queueIdx = 0;
+        _parsing = false;
+        _parseProgress = null;
+      });
+      _hydrateCurrent();
 
-      final result = hasFile
-          ? await SmartImportService.instance.parseFromBytesDetailed(
-              bytes: _pickedBytes!,
-              mimeType: _pickedMime!,
-              inputType: _pickedInputType!,
-            )
-          : await SmartImportService.instance.parseTextDetailed(raw, effectiveTextType);
-      final draft = result.draft;
-      if (draft == null) {
-        if (!mounted) return;
-        setState(() => _parsing = false);
-        _showParseError(result.reason, result.detail);
-        return;
+      // Surface per-attachment issues via a single snackbar so admin knows
+      // some files were duplicates or failed but they can still review the
+      // successful ones.
+      if (mounted && (liveDups > 0 || parseErrs > 0)) {
+        final parts = <String>[];
+        if (liveDups > 0) parts.add('$liveDups duplicate');
+        if (parseErrs > 0) parts.add('$parseErrs failed');
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              '${parts.join(" · ")} out of ${_attachments.length} '
+              'attachment${_attachments.length == 1 ? "" : "s"} '
+              '— ${_queue.length} order${_queue.length == 1 ? "" : "s"} '
+              'ready to review.',
+            ),
+            backgroundColor: Colors.orange.shade800,
+            duration: const Duration(seconds: 5),
+          ),
+        );
       }
-      // Resolve customer.
-      final svc = SmartImportService.instance;
+
+      _recomputeAllCsds();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _parsing = false;
+        _parseProgress = null;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Parse error: $e'), backgroundColor: Colors.red),
+      );
+    }
+  }
+
+  /// Parse a single attachment end-to-end: dedup-check, Gemini call,
+  /// customer/product resolution. Mutates the attachment's status + any
+  /// queued drafts inline. Returns an outcome so [_parse] can tally.
+  Future<_ParseOutcome> _parseOne(int index) async {
+    if (index < 0 || index >= _attachments.length) {
+      return _ParseOutcome.error;
+    }
+    final a = _attachments[index];
+    setState(() => a.status = _AttachmentStatus.parsing);
+    final svc = SmartImportService.instance;
+
+    // Dedup — per attachment hash, per team.
+    final dup = await svc.findImportByHash(a.hash, _team);
+    if (dup != null) {
+      a.status = _AttachmentStatus.duplicate;
+      a.dupInfo = dup;
+      return _ParseOutcome.duplicate;
+    }
+
+    // Route to the right Gemini parser.
+    ({SmartImportBatch? batch, String reason, String? detail}) result;
+    if (a.kind == _AttachmentKind.paste) {
+      result = await svc.parseBatchTextDetailed(a.text ?? '', a.inputType);
+    } else {
+      result = await svc.parseBatchFromBytesDetailed(
+        bytes: a.bytes!,
+        mimeType: a.mime,
+        inputType: a.inputType,
+      );
+    }
+
+    if (result.batch == null || result.batch!.orders.isEmpty) {
+      a.status = _AttachmentStatus.error;
+      a.parseError = result.reason;
+      return _ParseOutcome.error;
+    }
+
+    final isHandwritten = a.inputType == 'image_handwritten';
+    final indices = <int>[];
+    for (final draft in result.batch!.orders) {
       final resolvedCust = await svc.resolveCustomer(
         extractedName: draft.customerNameAsWritten,
         extractedPhone: draft.customerPhoneFromInput,
         teamId: _team,
       );
-
-      // Resolve each product line.
-      final isHandwritten = _pickedInputType == 'image_handwritten';
       final lines = <_ReviewLine>[];
       for (final dl in draft.lines) {
         final rp = await svc.resolveProduct(
@@ -302,35 +662,176 @@ class _SmartImportTabState extends State<SmartImportTab> {
           resolved: rp,
           chosen: rp.match,
           qty: dl.quantity,
-          // Handwritten: NEVER pre-check. Admin must confirm every line.
-          // Other input types: pre-check only on strong matches.
           confirmed: !isHandwritten && rp.match != null && rp.confidence >= 0.85,
         ));
       }
-
-      if (!mounted) return;
-      setState(() {
-        _inputHash = hash;
-        _draft = draft;
-        _resolvedCustomer = resolvedCust;
-        _chosenCustomer = resolvedCust.match;
-        _reviewLines
-          ..clear()
-          ..addAll(lines);
-        _notesCtl.text = draft.notes ?? '';
-        _stage = _Stage.reviewing;
-        _parsing = false;
-      });
-
-      // Kick off CSDS recompute for each line now that we may have a customer.
-      _recomputeAllCsds();
-    } catch (e) {
-      if (!mounted) return;
-      setState(() => _parsing = false);
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Parse error: $e'), backgroundColor: Colors.red),
-      );
+      _queue.add(_QueuedDraft(
+        id: 'd${++_draftIdCounter}',
+        attachmentIndex: index,
+        draft: draft,
+        resolvedCust: resolvedCust,
+        chosenCust: resolvedCust.match,
+        reviewLines: lines,
+        deliveryDate: DateTime.now().add(const Duration(days: 1)),
+        notes: draft.notes ?? '',
+      ));
+      indices.add(_queue.length - 1);
     }
+    a.status = _AttachmentStatus.ok;
+    a.queueIndices = indices;
+    return _ParseOutcome.ok;
+  }
+
+  // ── Queue navigation ────────────────────────────────────────────────────
+  /// Copy `_queue[_queueIdx]` into the scalar review fields that the
+  /// existing review UI reads from. Called on transition to review and
+  /// whenever the admin advances to the next draft.
+  void _hydrateCurrent() {
+    if (_queueIdx < 0 || _queueIdx >= _queue.length) return;
+    final q = _queue[_queueIdx];
+    _draft = q.draft;
+    _resolvedCustomer = q.resolvedCust;
+    _chosenCustomer = q.chosenCust;
+    _reviewLines
+      ..clear()
+      ..addAll(q.reviewLines);
+    _deliveryDate = q.deliveryDate;
+    _notesCtl.text = q.notes;
+  }
+
+  /// Flush scalar review-state edits back into the current queue entry.
+  /// Called before save / skip / navigation so per-draft edits persist.
+  void _flushCurrentToQueue() {
+    if (_queueIdx < 0 || _queueIdx >= _queue.length) return;
+    final q = _queue[_queueIdx];
+    q.chosenCust = _chosenCustomer;
+    q.deliveryDate = _deliveryDate;
+    q.notes = _notesCtl.text;
+    // reviewLines list is shared by reference; edits already mutate it.
+  }
+
+  /// Pick the next not-yet-terminal draft. Returns -1 when none remain.
+  int _nextReviewIndex() {
+    for (int i = _queueIdx + 1; i < _queue.length; i++) {
+      if (_queue[i].status == _QueueStatus.reviewing) return i;
+    }
+    for (int i = 0; i < _queueIdx; i++) {
+      if (_queue[i].status == _QueueStatus.reviewing) return i;
+    }
+    return -1;
+  }
+
+  /// Advance to the next reviewing draft OR reset to compose when done.
+  /// Writes per-attachment audit rows as their last draft finalizes.
+  Future<void> _advanceOrFinish() async {
+    await _maybeFinalizeAttachmentAudit(_queue[_queueIdx].attachmentIndex);
+    final nxt = _nextReviewIndex();
+    if (nxt == -1) {
+      if (!mounted) return;
+      _showBatchSummary();
+      _resetAll();
+      return;
+    }
+    if (!mounted) return;
+    setState(() => _queueIdx = nxt);
+    _hydrateCurrent();
+    _recomputeAllCsds();
+  }
+
+  /// When every draft linked to [attIndex] has left the reviewing state,
+  /// write one smart_import_history row with all saved order IDs.
+  Future<void> _maybeFinalizeAttachmentAudit(int attIndex) async {
+    if (attIndex < 0 || attIndex >= _attachments.length) return;
+    final a = _attachments[attIndex];
+    if (a.status != _AttachmentStatus.ok) return;
+    final pending = a.queueIndices
+        .any((qi) => _queue[qi].status == _QueueStatus.reviewing);
+    if (pending) return;
+
+    final savedIds = a.queueIndices
+        .map((qi) => _queue[qi].savedOrderId)
+        .whereType<String>()
+        .toList();
+    final parsed = <String, dynamic>{
+      'orders': [
+        for (final qi in a.queueIndices)
+          {
+            'customer': {
+              'name_as_written': _queue[qi].draft.customerNameAsWritten,
+              'phone_if_present': _queue[qi].draft.customerPhoneFromInput,
+            },
+            'lines': _queue[qi].draft.lines
+                .map((l) => {
+                      'name_as_written': l.nameAsWritten,
+                      'quantity': l.quantity,
+                      'unit_hint': l.unitHint,
+                      'confidence': l.confidence,
+                    })
+                .toList(),
+            'overall_parse_confidence': _queue[qi].draft.overallConfidence,
+          }
+      ],
+    };
+    final corrections = <String, dynamic>{
+      'orders_saved': savedIds.length,
+      'orders_skipped': a.queueIndices
+          .where((qi) => _queue[qi].status == _QueueStatus.skipped)
+          .length,
+      'orders_failed': a.queueIndices
+          .where((qi) => _queue[qi].status == _QueueStatus.failed)
+          .length,
+    };
+    final svc = SmartImportService.instance;
+    final adminAuthId = svc.currentAdminUserId ?? '';
+    final preview = a.kind == _AttachmentKind.paste
+        ? (a.text ?? '')
+        : 'file: ${a.fileName ?? "—"} (${a.byteSize} bytes, ${a.mime})';
+    await svc.writeImportHistory(
+      inputType: a.inputType,
+      inputPreview: preview,
+      inputHash: a.hash,
+      parsedResult: parsed,
+      adminCorrections: corrections,
+      resultingOrderIds: savedIds,
+      teamId: _team,
+      attributedRepUserId: _selectedRep!.id,
+      importedByUserId: adminAuthId,
+      status: savedIds.isEmpty ? 'discarded' : 'saved',
+    );
+  }
+
+  void _showBatchSummary() {
+    final saved = _queue.where((q) => q.status == _QueueStatus.saved).toList();
+    final skipped = _queue.where((q) => q.status == _QueueStatus.skipped).length;
+    final failed = _queue.where((q) => q.status == _QueueStatus.failed).length;
+    showDialog<void>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Batch complete'),
+        content: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text('${saved.length} saved · $skipped skipped · $failed failed',
+                  style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.w700)),
+              if (saved.isNotEmpty) const SizedBox(height: 10),
+              for (final q in saved)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 4),
+                  child: Text(
+                    '• ${q.savedOrderId}  — ${q.chosenCust?.name ?? "(customer unknown)"}',
+                    style: GoogleFonts.manrope(fontSize: 12, color: Colors.black87),
+                  ),
+                ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('OK')),
+        ],
+      ),
+    );
   }
 
   /// Blocks the UI with a clear message per failure mode so admin doesn't
@@ -382,14 +883,21 @@ class _SmartImportTabState extends State<SmartImportTab> {
         // http_NNN
         if (reason.startsWith('http_')) {
           final code = reason.substring(5);
+          final codeNum = int.tryParse(code) ?? 0;
           title = 'Gemini API error ($code)';
-          body = 'The Gemini service returned status $code. Likely '
-              'causes:\n'
-              '  • 400 — input rejected (check paste length / mime type).\n'
-              '  • 401 / 403 — API key invalid or out of quota.\n'
-              '  • 429 — rate-limited. Wait a minute.\n'
-              '  • 5xx — Gemini is down. Try again shortly.\n\n'
-              'Response (truncated):\n${detail ?? "—"}';
+          final String cause;
+          if (codeNum == 400) {
+            cause = 'Input rejected — check paste length or image mime type.';
+          } else if (codeNum == 401 || codeNum == 403) {
+            cause = 'API key invalid or out of quota. Contact the developer.';
+          } else if (codeNum == 429) {
+            cause = 'Rate-limited. Wait a minute and retry.';
+          } else if (codeNum >= 500 && codeNum < 600) {
+            cause = 'Gemini service is temporarily down. Try again shortly.';
+          } else {
+            cause = 'Unexpected status from Gemini. Try again shortly.';
+          }
+          body = '$cause\n\nResponse (truncated):\n${detail ?? "—"}';
         } else {
           title = 'Parse failed';
           body = 'Reason: $reason\n\n${detail ?? ""}';
@@ -409,20 +917,161 @@ class _SmartImportTabState extends State<SmartImportTab> {
     );
   }
 
-  void _showDupDialog(Map<String, dynamic> dup) {
+  /// [attachmentIndex] is optional — when provided, super_admin gets a
+  /// "Revoke & re-import" button that clears the duplicate state for
+  /// that specific attachment and re-parses it. When null (e.g. opened
+  /// from a read-only inspector in the future), only the OK action is shown.
+  void _showDupDialog(Map<String, dynamic> dup, {int? attachmentIndex}) {
+    final rawIds = dup['resulting_order_ids'];
+    final ids = <String>[
+      if (rawIds is List) ...rawIds.map((e) => e.toString()),
+    ];
+    final when = dup['imported_at']?.toString();
+    final rowId = dup['id']?.toString();
+    final canRevoke = widget.isSuperAdmin &&
+        rowId != null &&
+        rowId.isNotEmpty &&
+        attachmentIndex != null;
     showDialog(
       context: context,
-      builder: (_) => AlertDialog(
+      builder: (ctx) => AlertDialog(
         title: const Text('Duplicate import'),
-        content: Text(
-          'This exact text was already imported${dup['imported_at'] != null ? ' at ${dup['imported_at']}' : ''}. '
-          '${dup['resulting_order_id'] != null ? 'Order ${dup['resulting_order_id']} was created from it.' : ''}',
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                when != null
+                    ? 'This exact input was already imported at $when.'
+                    : 'This exact input was already imported.',
+                style: GoogleFonts.manrope(fontSize: 13, height: 1.35),
+              ),
+              if (ids.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                Text(
+                  'Linked order${ids.length == 1 ? "" : "s"}:',
+                  style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700),
+                ),
+                const SizedBox(height: 4),
+                for (final id in ids)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 2),
+                    child: Text('• $id',
+                        style: GoogleFonts.manrope(fontSize: 12, color: Colors.black87)),
+                  ),
+              ],
+              if (canRevoke) ...[
+                const SizedBox(height: 12),
+                Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: Colors.purple.shade50,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: Colors.purple.shade200),
+                  ),
+                  child: Text(
+                    'Super_admin: "Revoke & re-import" unlocks this hash so '
+                    'the input can be parsed again. The linked order'
+                    '${ids.length == 1 ? "" : "s"} above stay${ids.length == 1 ? "s" : ""} — '
+                    'delete them separately via the Orders tab if the original was wrong.',
+                    style: GoogleFonts.manrope(
+                        fontSize: 11, color: Colors.purple.shade900, height: 1.35),
+                  ),
+                ),
+              ],
+            ],
+          ),
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text('OK')),
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('OK')),
+          if (canRevoke)
+            TextButton(
+              onPressed: () {
+                Navigator.pop(ctx);
+                _revokeAndRetry(attachmentIndex, rowId);
+              },
+              child: const Text('Revoke & re-import'),
+            ),
         ],
       ),
     );
+  }
+
+  /// Super_admin action: soft-delete the audit row that's blocking this
+  /// attachment's hash, then retry parsing just this one attachment.
+  /// Results get appended to any existing queue; transitions to review
+  /// if this produced the first queued drafts.
+  Future<void> _revokeAndRetry(int attachmentIndex, String historyRowId) async {
+    if (attachmentIndex < 0 || attachmentIndex >= _attachments.length) return;
+    final svc = SmartImportService.instance;
+    final uid = svc.currentAdminUserId ?? '';
+    if (uid.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Could not resolve your user id — re-login and retry.')),
+      );
+      return;
+    }
+    setState(() {
+      _parsing = true;
+      _parseProgress = 'Revoking audit row…';
+    });
+    final ok = await svc.revokeImportHistoryRow(
+      rowId: historyRowId,
+      revokedByUserId: uid,
+    );
+    if (!mounted) return;
+    if (!ok) {
+      setState(() {
+        _parsing = false;
+        _parseProgress = null;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Revoke failed. Check your permissions or connection.'),
+          backgroundColor: Colors.red,
+        ),
+      );
+      return;
+    }
+    // Reset attachment to pending so _parseOne treats it as fresh.
+    final a = _attachments[attachmentIndex];
+    setState(() {
+      a.status = _AttachmentStatus.pending;
+      a.dupInfo = null;
+      a.parseError = null;
+      a.queueIndices = const [];
+      _parseProgress = 'Re-parsing after revoke…';
+    });
+    await _parseOne(attachmentIndex);
+    if (!mounted) return;
+    setState(() {
+      _parsing = false;
+      _parseProgress = null;
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          a.status == _AttachmentStatus.ok
+              ? 'Revoked + re-parsed. ${a.queueIndices.length} order${a.queueIndices.length == 1 ? "" : "s"} queued.'
+              : 'Revoked, but re-parse did not produce orders (${a.parseError ?? a.status.name}).',
+        ),
+        backgroundColor: a.status == _AttachmentStatus.ok
+            ? Colors.green.shade700
+            : Colors.orange.shade800,
+        duration: const Duration(seconds: 4),
+      ),
+    );
+    if (a.status == _AttachmentStatus.ok && _queue.isNotEmpty && _stage == _Stage.compose) {
+      setState(() {
+        _stage = _Stage.reviewing;
+        _queueIdx = _queue
+            .indexWhere((q) => q.status == _QueueStatus.reviewing);
+        if (_queueIdx < 0) _queueIdx = 0;
+      });
+      _hydrateCurrent();
+      _recomputeAllCsds();
+    }
   }
 
   // ── CSDS recompute per review line ──────────────────────────────────────
@@ -458,12 +1107,17 @@ class _SmartImportTabState extends State<SmartImportTab> {
   }
 
   // ── Save pipeline ───────────────────────────────────────────────────────
+  /// Save the CURRENT queue draft. On success, marks the queue entry
+  /// saved and advances to the next reviewing draft. When the last draft
+  /// finalizes, writes the per-attachment audit row and resets to compose.
   Future<void> _save() async {
     if (!_canSave) return;
+    _flushCurrentToQueue();
     setState(() => _submitting = true);
     final originalTeam = AuthService.currentTeam;
     AuthService.currentTeam = _team;
 
+    final q = _queue[_queueIdx];
     final orderId = _generateOrderId();
     final itemsJson = _reviewLines
         .where((l) => l.chosen != null && l.qty > 0 && l.confirmed)
@@ -475,12 +1129,15 @@ class _SmartImportTabState extends State<SmartImportTab> {
     final grand = subtotal + gst;
     final units = _reviewLines.fold<int>(0, (a, l) => a + l.qty);
 
+    final resolvedBeatName = _chosenCustomer!.resolvedOrderBeatNameForTeam(_team);
+
+    bool savedOffline = false;
     try {
       await SupabaseService.instance.createOrder(
         orderId: orderId,
         customerId: _chosenCustomer!.id,
         customerName: _chosenCustomer!.name,
-        beat: '',
+        beat: resolvedBeatName,
         deliveryDate: _deliveryDate,
         subtotal: subtotal,
         vat: gst,
@@ -493,86 +1150,13 @@ class _SmartImportTabState extends State<SmartImportTab> {
         overrideUserId: _selectedRep!.id,
         source: 'office',
       );
-
-      // Alias writes — best-effort, do not block save.
-      final svc = SmartImportService.instance;
-      final adminAuthId = svc.currentAdminUserId ?? '';
-      try {
-        if (_draft != null &&
-            _chosenCustomer != null &&
-            _draft!.customerNameAsWritten.isNotEmpty &&
-            _draft!.customerNameAsWritten.toLowerCase() !=
-                _chosenCustomer!.name.toLowerCase()) {
-          await svc.writeCustomerAlias(
-            aliasText: _draft!.customerNameAsWritten,
-            customerId: _chosenCustomer!.id,
-            teamId: _team,
-            createdByUserId: adminAuthId,
-          );
-        }
-        for (final l in _reviewLines) {
-          if (l.chosen != null && l.draft.nameAsWritten.isNotEmpty) {
-            await svc.writeProductAlias(
-              customerId: _chosenCustomer?.id,
-              aliasText: l.draft.nameAsWritten,
-              productId: l.chosen!.id,
-              teamId: _team,
-              createdByUserId: adminAuthId,
-            );
-          }
-        }
-      } catch (e) {
-        debugPrint('[SmartImport] alias writes failed: $e');
-      }
-
-      // Audit row — record which input path created this order.
-      if (_inputHash != null && _draft != null) {
-        final historyInputType =
-            _pickedInputType ?? 'brand_software_text';
-        final historyPreview = _pickedFileName != null
-            ? 'file: $_pickedFileName (${_pickedBytes?.length ?? 0} bytes, $_pickedMime)'
-            : _pasteCtl.text;
-        await svc.writeImportHistory(
-          inputType: historyInputType,
-          inputPreview: historyPreview,
-          inputHash: _inputHash!,
-          parsedResult: {
-            'customer': {
-              'name_as_written': _draft!.customerNameAsWritten,
-              'phone_if_present': _draft!.customerPhoneFromInput,
-            },
-            'lines': _draft!.lines
-                .map((l) => {
-                      'name_as_written': l.nameAsWritten,
-                      'quantity': l.quantity,
-                      'unit_hint': l.unitHint,
-                      'confidence': l.confidence,
-                    })
-                .toList(),
-            'overall_parse_confidence': _draft!.overallConfidence,
-          },
-          adminCorrections: {
-            'customer_changed': _resolvedCustomer?.match?.id != _chosenCustomer?.id,
-            'line_count_saved': itemsJson.length,
-            'line_count_parsed': _draft!.lines.length,
-          },
-          resultingOrderId: orderId,
-          teamId: _team,
-          attributedRepUserId: _selectedRep!.id,
-          importedByUserId: adminAuthId,
-        );
-      }
-
-      if (!mounted) return;
-      _showSuccess(orderId, offline: false);
-      _resetAll();
-    } catch (e) {
+    } catch (_) {
       try {
         await OfflineService.instance.queueOperation('order', {
           'order_id': orderId,
           'customer_id': _chosenCustomer!.id,
           'customer_name': _chosenCustomer!.name,
-          'beat': '',
+          'beat': resolvedBeatName,
           'is_out_of_beat': false,
           'delivery_date': _deliveryDate.toIso8601String(),
           'subtotal': subtotal,
@@ -585,19 +1169,119 @@ class _SmartImportTabState extends State<SmartImportTab> {
           'override_user_id': _selectedRep!.id,
           'source': 'office',
         });
-        if (!mounted) return;
-        _showSuccess(orderId, offline: true);
-        _resetAll();
+        savedOffline = true;
       } catch (e2) {
+        // Total save failure — mark the queue entry failed so batch
+        // summary can surface it. Do NOT advance; admin may retry.
+        q.status = _QueueStatus.failed;
+        q.saveError = e2.toString();
+        AuthService.currentTeam = originalTeam;
         if (!mounted) return;
+        setState(() => _submitting = false);
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Save failed: $e2'), backgroundColor: Colors.red),
         );
+        return;
       }
-    } finally {
-      AuthService.currentTeam = originalTeam;
-      if (mounted) setState(() => _submitting = false);
     }
+
+    // Alias writes — best-effort, per saved order.
+    final svc = SmartImportService.instance;
+    final adminAuthId = svc.currentAdminUserId ?? '';
+    int aliasFailures = 0;
+    try {
+      if (_draft != null &&
+          _chosenCustomer != null &&
+          _draft!.customerNameAsWritten.isNotEmpty &&
+          _draft!.customerNameAsWritten.toLowerCase() !=
+              _chosenCustomer!.name.toLowerCase()) {
+        final ok = await svc.writeCustomerAlias(
+          aliasText: _draft!.customerNameAsWritten,
+          customerId: _chosenCustomer!.id,
+          teamId: _team,
+          createdByUserId: adminAuthId,
+        );
+        if (!ok) aliasFailures++;
+      }
+      for (final l in _reviewLines) {
+        if (l.chosen != null && l.draft.nameAsWritten.isNotEmpty) {
+          final ok = await svc.writeProductAlias(
+            customerId: _chosenCustomer?.id,
+            aliasText: l.draft.nameAsWritten,
+            productId: l.chosen!.id,
+            teamId: _team,
+            createdByUserId: adminAuthId,
+          );
+          if (!ok) aliasFailures++;
+        }
+      }
+    } catch (e) {
+      debugPrint('[SmartImport] alias writes failed: $e');
+      aliasFailures++;
+    }
+    if (aliasFailures > 0 && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Order saved. $aliasFailures alias write${aliasFailures == 1 ? '' : 's'} '
+            "failed — future imports won't benefit from this learning.",
+          ),
+          backgroundColor: Colors.orange.shade800,
+          duration: const Duration(seconds: 4),
+        ),
+      );
+    }
+
+    q.status = _QueueStatus.saved;
+    q.savedOrderId = orderId;
+
+    AuthService.currentTeam = originalTeam;
+    if (!mounted) return;
+    setState(() => _submitting = false);
+
+    final offlineNote = savedOffline ? ' (queued offline)' : '';
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('Order $orderId saved$offlineNote. '
+            '${_queue.where((x) => x.status == _QueueStatus.reviewing).length} left to review.'),
+        backgroundColor: savedOffline ? Colors.orange.shade800 : Colors.green.shade700,
+        duration: const Duration(seconds: 3),
+      ),
+    );
+
+    await _advanceOrFinish();
+  }
+
+  /// Discard the current draft without saving and advance. Records the
+  /// skip in the attachment audit on finalization.
+  Future<void> _skipCurrent() async {
+    if (_queueIdx < 0 || _queueIdx >= _queue.length) return;
+    final q = _queue[_queueIdx];
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Skip this order?'),
+        content: Text(
+          'The order for "${q.chosenCust?.name ?? q.draft.customerNameAsWritten}" '
+          'will be discarded. The attachment stays in the audit log as skipped.',
+          style: GoogleFonts.manrope(fontSize: 13, height: 1.35),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Skip'),
+          ),
+        ],
+      ),
+    );
+    if (confirm != true) return;
+    _flushCurrentToQueue();
+    q.status = _QueueStatus.skipped;
+    await _advanceOrFinish();
   }
 
   String _generateOrderId() {
@@ -619,42 +1303,60 @@ class _SmartImportTabState extends State<SmartImportTab> {
     return _reviewLines.every((l) => l.chosen != null && l.confirmed && l.qty > 0);
   }
 
-  void _showSuccess(String orderId, {required bool offline}) {
-    showDialog(
-      context: context,
-      builder: (_) => AlertDialog(
-        title: Row(children: [
-          Icon(offline ? Icons.cloud_off_rounded : Icons.check_circle_rounded,
-              color: offline ? Colors.orange : Colors.green),
-          const SizedBox(width: 8),
-          Text(offline ? 'Queued offline' : 'Order saved'),
-        ]),
-        content: Text(
-          offline
-              ? 'Order $orderId queued — will sync when online.'
-              : 'Order $orderId saved to $_team. Attributed to ${_selectedRep?.fullName ?? "—"}.',
-        ),
-        actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('OK'))],
-      ),
-    );
-  }
-
   void _resetAll() {
     setState(() {
       _stage = _Stage.compose;
       _pasteCtl.clear();
       _notesCtl.clear();
       _draft = null;
-      _inputHash = null;
-      _pickedBytes = null;
-      _pickedFileName = null;
-      _pickedMime = null;
-      _pickedInputType = null;
       _resolvedCustomer = null;
       _chosenCustomer = null;
       _reviewLines.clear();
       _deliveryDate = DateTime.now().add(const Duration(days: 1));
+      _attachments.clear();
+      _queue.clear();
+      _queueIdx = 0;
+      _parseProgress = null;
+      _textInputType = null;
     });
+  }
+
+  /// Abandon the whole batch mid-review. Writes "discarded" audit rows
+  /// for any attachment whose drafts have all finalized.
+  Future<void> _discardBatch() async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('Discard this batch?'),
+        content: Text(
+          'All unsaved drafts in this review session will be lost. '
+          'Already-saved orders stay saved.',
+          style: GoogleFonts.manrope(fontSize: 13, height: 1.35),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Keep reviewing'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Discard'),
+          ),
+        ],
+      ),
+    );
+    if (confirm != true) return;
+    // Mark every still-reviewing draft as skipped so audit rows reflect
+    // the admin's abandonment choice.
+    for (final q in _queue) {
+      if (q.status == _QueueStatus.reviewing) {
+        q.status = _QueueStatus.skipped;
+      }
+    }
+    for (int i = 0; i < _attachments.length; i++) {
+      await _maybeFinalizeAttachmentAudit(i);
+    }
+    _resetAll();
   }
 
   // ── Build ──────────────────────────────────────────────────────────────
@@ -667,6 +1369,11 @@ class _SmartImportTabState extends State<SmartImportTab> {
 
   // ── Compose view ───────────────────────────────────────────────────────
   Widget _buildCompose() {
+    final parseLabel = _parsing
+        ? (_parseProgress ?? 'Parsing…')
+        : _attachments.isEmpty
+            ? 'Parse with Gemini (add something first)'
+            : 'Parse ${_attachments.length} attachment${_attachments.length == 1 ? "" : "s"} with Gemini';
     return SingleChildScrollView(
       padding: const EdgeInsets.all(16),
       child: Column(
@@ -677,11 +1384,13 @@ class _SmartImportTabState extends State<SmartImportTab> {
             for (final t in ['JA', 'MA'])
               Padding(
                 padding: const EdgeInsets.only(right: 8),
-                child: ChoiceChip(
-                  label: Text(t == 'JA' ? 'Jagannath' : 'Madhav',
-                      style: GoogleFonts.manrope(fontWeight: FontWeight.w700)),
+                child: _TeamChoice(
+                  label: t == 'JA' ? 'Jagannath' : 'Madhav',
+                  color: t == 'JA'
+                      ? const Color(0xFF1D4ED8)
+                      : const Color(0xFFC2410C),
                   selected: _team == t,
-                  onSelected: (_) => _onTeamChanged(t),
+                  onTap: () => _onTeamChanged(t),
                 ),
               ),
           ]),
@@ -715,27 +1424,47 @@ class _SmartImportTabState extends State<SmartImportTab> {
             onChanged: (r) => setState(() => _selectedRep = r),
           ),
           const SizedBox(height: 16),
-          _sectionLabel('INPUT'),
-          if (_pickedBytes != null) _buildPickedFileCard() else _buildPasteBox(),
+          _sectionLabel('ATTACHMENTS (${_attachments.length})'),
+          if (_attachments.isEmpty)
+            Container(
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: Colors.grey.shade50,
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: Colors.grey.shade300, style: BorderStyle.solid),
+              ),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(Icons.inbox_rounded, size: 20, color: Colors.grey.shade600),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      'No attachments yet. Add any mix of pastes, images, or PDFs — '
+                      'each is parsed independently, and one attachment may produce '
+                      'multiple orders.',
+                      style: GoogleFonts.manrope(fontSize: 12, color: Colors.grey.shade800, height: 1.4),
+                    ),
+                  ),
+                ],
+              ),
+            )
+          else
+            for (int i = 0; i < _attachments.length; i++)
+              _buildAttachmentCard(i, _attachments[i]),
           const SizedBox(height: 10),
-          if (_pickedBytes == null) _buildUploadButtons(),
+          _buildAddButtons(),
           const SizedBox(height: 16),
           FilledButton.icon(
-            onPressed: _parsing ? null : _parse,
+            onPressed: (_parsing || _attachments.isEmpty) ? null : _parse,
             icon: _parsing
                 ? const SizedBox(
                     width: 16, height: 16,
                     child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
                   )
                 : const Icon(Icons.auto_awesome_rounded),
-            label: Text(
-              _parsing
-                  ? 'Parsing…'
-                  : (_pickedBytes != null
-                      ? 'Parse ${_pickedInputType == "pdf" ? "PDF" : "image"} with Gemini'
-                      : 'Parse text with Gemini'),
-              style: GoogleFonts.manrope(fontSize: 14, fontWeight: FontWeight.w800),
-            ),
+            label: Text(parseLabel,
+                style: GoogleFonts.manrope(fontSize: 14, fontWeight: FontWeight.w800)),
             style: FilledButton.styleFrom(
               minimumSize: const Size.fromHeight(48),
               backgroundColor: AppTheme.primary,
@@ -756,8 +1485,10 @@ class _SmartImportTabState extends State<SmartImportTab> {
                 const SizedBox(width: 8),
                 Expanded(
                   child: Text(
-                    'Duplicate guard: the same paste (normalized) can only be imported once per team. '
-                    'Nothing is saved until you review and confirm every line.',
+                    'Duplicate guard is per-attachment: each paste/file hash can be '
+                    'imported once per team. One attachment may contain multiple '
+                    'orders — Gemini detects distinct customer headers and emits '
+                    'one review card per order. Nothing saves until you review each.',
                     style: GoogleFonts.manrope(fontSize: 11, color: Colors.blue.shade900, height: 1.4),
                   ),
                 ),
@@ -769,155 +1500,219 @@ class _SmartImportTabState extends State<SmartImportTab> {
     );
   }
 
-  Widget _buildPasteBox() {
-    final text = _pasteCtl.text;
-    final hasText = text.trim().isNotEmpty;
-    final detected = hasText
-        ? (_textInputType ?? SmartImportService.classifyTextInput(text))
-        : null;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        TextField(
-          controller: _pasteCtl,
-          maxLines: 10,
-          decoration: _fieldDecoration(
-            hint: 'Paste brand-software text, WhatsApp message — or use the upload buttons below.',
-          ),
-          onChanged: (_) => setState(() {/* trigger classifier chip rebuild */}),
-        ),
-        if (hasText)
-          Padding(
-            padding: const EdgeInsets.only(top: 8),
-            child: Row(
-              children: [
-                Icon(Icons.auto_awesome_rounded, size: 14, color: Colors.black54),
-                const SizedBox(width: 6),
-                Text('Type:',
-                    style: GoogleFonts.manrope(fontSize: 11, color: Colors.black54, fontWeight: FontWeight.w600)),
-                const SizedBox(width: 8),
-                DropdownButton<String>(
-                  isDense: true,
-                  value: detected,
-                  items: const [
-                    DropdownMenuItem(value: 'brand_software_text', child: Text('Brand software (GUBB/SCO)')),
-                    DropdownMenuItem(value: 'whatsapp_text', child: Text('WhatsApp / casual')),
-                  ],
-                  onChanged: (v) => setState(() => _textInputType = v),
-                ),
-                const SizedBox(width: 6),
-                if (_textInputType == null)
-                  Text('(auto)',
-                      style: GoogleFonts.manrope(fontSize: 10, color: Colors.black38)),
-              ],
-            ),
-          ),
-      ],
-    );
-  }
-
-  Widget _buildPickedFileCard() {
-    final sizeKb = ((_pickedBytes?.length ?? 0) / 1024).toStringAsFixed(1);
-    final isPdf = _pickedInputType == 'pdf';
-    final isImage = !isPdf;
-    final isHandwritten = _pickedInputType == 'image_handwritten';
-    final icon = isPdf ? Icons.picture_as_pdf_rounded : Icons.image_rounded;
-    final accent = isPdf ? Colors.red.shade700 : Colors.teal.shade700;
+  Widget _buildAttachmentCard(int index, _Attachment a) {
+    final (icon, accent) = switch (a.kind) {
+      _AttachmentKind.pdf => (Icons.picture_as_pdf_rounded, Colors.red.shade700),
+      _AttachmentKind.image => (Icons.image_rounded, Colors.teal.shade700),
+      _AttachmentKind.paste => (Icons.notes_rounded, Colors.indigo.shade600),
+    };
+    final subtitle = switch (a.kind) {
+      _AttachmentKind.paste => '${(a.text ?? "").length} chars · ${a.inputType}',
+      _ => '${(a.byteSize / 1024).toStringAsFixed(1)} KB · ${a.mime}',
+    };
+    final isDup = a.status == _AttachmentStatus.duplicate;
+    final isErr = a.status == _AttachmentStatus.error;
+    final cardAccent = isDup
+        ? Colors.orange.shade700
+        : isErr
+            ? Colors.red.shade700
+            : accent;
     return Container(
-      padding: const EdgeInsets.all(12),
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
-        color: accent.withValues(alpha: 0.06),
+        color: cardAccent.withValues(alpha: 0.06),
         borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: accent.withValues(alpha: 0.4)),
+        border: Border.all(color: cardAccent.withValues(alpha: 0.35)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
-              Icon(icon, color: accent),
+              Icon(icon, color: cardAccent, size: 20),
               const SizedBox(width: 10),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(_pickedFileName ?? '—',
+                    Text(a.displayLabel,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
                         style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.w700)),
-                    Text('$sizeKb KB · $_pickedMime',
-                        style: GoogleFonts.manrope(fontSize: 11, color: Colors.black54)),
+                    Text(subtitle,
+                        style: GoogleFonts.manrope(fontSize: 10.5, color: Colors.black54)),
                   ],
                 ),
               ),
               IconButton(
-                icon: const Icon(Icons.close_rounded, size: 20),
-                tooltip: 'Remove file',
-                onPressed: _clearPickedFile,
+                icon: const Icon(Icons.close_rounded, size: 18),
+                tooltip: 'Remove',
+                onPressed: _parsing ? null : () => _removeAttachment(index),
               ),
             ],
           ),
-          if (isImage) ...[
-            const SizedBox(height: 8),
-            // Handwritten toggle — only meaningful for images. When ON, the
-            // parser switches to the handwritten prompt AND review pre-checks
-            // are disabled so admin must confirm every line.
-            Row(
-              children: [
-                Checkbox(
-                  value: isHandwritten,
-                  onChanged: (v) => setState(() {
-                    _pickedInputType = (v ?? false) ? 'image_handwritten' : 'image_screenshot';
-                  }),
-                ),
-                Text('Handwritten photo',
-                    style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w600)),
-                const SizedBox(width: 6),
-                Tooltip(
-                  message:
-                      'Tick when the image is a hand-written order slip (not a spreadsheet screenshot). '
-                      'Uses a stricter prompt and requires you to confirm every line on review.',
-                  child: Icon(Icons.help_outline_rounded, size: 14, color: Colors.black45),
-                ),
-              ],
+          if (isDup)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Row(
+                children: [
+                  Icon(Icons.content_copy_rounded,
+                      size: 14, color: Colors.orange.shade800),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      'Duplicate — already imported to this team.',
+                      style: GoogleFonts.manrope(
+                          fontSize: 11, color: Colors.orange.shade900),
+                    ),
+                  ),
+                  if (widget.isSuperAdmin && a.dupInfo != null)
+                    TextButton.icon(
+                      onPressed: _parsing
+                          ? null
+                          : () {
+                              final rowId = a.dupInfo!['id']?.toString();
+                              if (rowId != null && rowId.isNotEmpty) {
+                                _revokeAndRetry(index, rowId);
+                              }
+                            },
+                      icon: const Icon(Icons.lock_open_rounded, size: 14),
+                      label: Text('Revoke',
+                          style: GoogleFonts.manrope(
+                              fontSize: 11, fontWeight: FontWeight.w800)),
+                      style: TextButton.styleFrom(
+                        foregroundColor: Colors.purple.shade800,
+                        visualDensity: VisualDensity.compact,
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                      ),
+                    ),
+                ],
+              ),
             ),
-          ],
+          if (isErr)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Row(
+                children: [
+                  Icon(Icons.error_outline_rounded,
+                      size: 14, color: Colors.red.shade800),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      'Parse failed: ${a.parseError ?? "unknown"}',
+                      style: GoogleFonts.manrope(
+                          fontSize: 11, color: Colors.red.shade900),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          if (a.kind == _AttachmentKind.image)
+            Padding(
+              padding: const EdgeInsets.only(left: 2, top: 2),
+              child: Row(
+                children: [
+                  Checkbox(
+                    value: a.inputType == 'image_handwritten',
+                    onChanged: _parsing ? null : (_) => _toggleHandwritten(index),
+                    visualDensity: VisualDensity.compact,
+                  ),
+                  Text('Handwritten photo',
+                      style: GoogleFonts.manrope(fontSize: 11, fontWeight: FontWeight.w600)),
+                ],
+              ),
+            ),
+          if (a.kind == _AttachmentKind.pdf || a.kind == _AttachmentKind.image)
+            Padding(
+              padding: const EdgeInsets.only(left: 2, top: 4),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: OutlinedButton.icon(
+                  onPressed: (_parsing || _billChecking.contains(a.id))
+                      ? null
+                      : () => _treatAsBill(index),
+                  icon: _billChecking.contains(a.id)
+                      ? const SizedBox(
+                          width: 12, height: 12,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.receipt_long_rounded, size: 14),
+                  label: Text(
+                    _billChecking.contains(a.id) ? 'Checking…' : 'Treat as bill',
+                    style: GoogleFonts.manrope(
+                        fontSize: 11, fontWeight: FontWeight.w800),
+                  ),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.deepPurple.shade700,
+                    side: BorderSide(color: Colors.deepPurple.shade300),
+                    visualDensity: VisualDensity.compact,
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                    minimumSize: const Size(0, 28),
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
+                ),
+              ),
+            ),
         ],
       ),
     );
   }
 
-  Widget _buildUploadButtons() {
+  Widget _buildAddButtons() {
     return Row(
       children: [
         Expanded(
           child: OutlinedButton.icon(
-            onPressed: _pickPdf,
-            icon: const Icon(Icons.picture_as_pdf_rounded, size: 18),
-            label: Text('Upload PDF',
+            onPressed: _parsing ? null : _addPaste,
+            icon: const Icon(Icons.notes_rounded, size: 18),
+            label: Text('Add Paste',
                 style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700)),
-            style: OutlinedButton.styleFrom(
-              minimumSize: const Size.fromHeight(44),
-            ),
+            style: OutlinedButton.styleFrom(minimumSize: const Size.fromHeight(44)),
           ),
         ),
-        const SizedBox(width: 8),
+        const SizedBox(width: 6),
         Expanded(
           child: OutlinedButton.icon(
-            onPressed: _pickImage,
-            icon: const Icon(Icons.image_rounded, size: 18),
-            label: Text('Upload Image',
+            onPressed: _parsing ? null : _pickPdf,
+            icon: const Icon(Icons.picture_as_pdf_rounded, size: 18),
+            label: Text('Add PDF',
                 style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700)),
-            style: OutlinedButton.styleFrom(
-              minimumSize: const Size.fromHeight(44),
-            ),
+            style: OutlinedButton.styleFrom(minimumSize: const Size.fromHeight(44)),
+          ),
+        ),
+        const SizedBox(width: 6),
+        Expanded(
+          child: OutlinedButton.icon(
+            onPressed: _parsing ? null : _pickImage,
+            icon: const Icon(Icons.image_rounded, size: 18),
+            label: Text('Add Image',
+                style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700)),
+            style: OutlinedButton.styleFrom(minimumSize: const Size.fromHeight(44)),
           ),
         ),
       ],
     );
   }
 
+
   // ── Review view ────────────────────────────────────────────────────────
   Widget _buildReview() {
     final unresolved = _reviewLines.where((l) => l.chosen == null).length;
+    final currentQ = (_queueIdx >= 0 && _queueIdx < _queue.length)
+        ? _queue[_queueIdx]
+        : null;
+    final currentAtt = (currentQ != null &&
+            currentQ.attachmentIndex >= 0 &&
+            currentQ.attachmentIndex < _attachments.length)
+        ? _attachments[currentQ.attachmentIndex]
+        : null;
+    final isHandwritten = currentAtt?.inputType == 'image_handwritten';
+    final savedCount =
+        _queue.where((q) => q.status == _QueueStatus.saved).length;
+    final skippedCount =
+        _queue.where((q) => q.status == _QueueStatus.skipped).length;
     return SingleChildScrollView(
       padding: const EdgeInsets.all(16),
       child: Column(
@@ -925,13 +1720,19 @@ class _SmartImportTabState extends State<SmartImportTab> {
         children: [
           Row(children: [
             IconButton(
-              onPressed: _resetAll,
+              onPressed: _discardBatch,
               icon: const Icon(Icons.arrow_back_rounded),
-              tooltip: 'Back (discard draft)',
+              tooltip: 'Discard batch',
             ),
-            Text('Review Draft',
-                style: GoogleFonts.manrope(fontSize: 18, fontWeight: FontWeight.w800)),
+            Expanded(
+              child: Text('Review Draft',
+                  style: GoogleFonts.manrope(fontSize: 18, fontWeight: FontWeight.w800)),
+            ),
           ]),
+          if (_queue.length > 1) ...[
+            const SizedBox(height: 8),
+            _buildQueueProgress(savedCount, skippedCount),
+          ],
           const SizedBox(height: 8),
           _buildCustomerBlock(),
           const SizedBox(height: 12),
@@ -944,7 +1745,7 @@ class _SmartImportTabState extends State<SmartImportTab> {
             decoration: _fieldDecoration(hint: 'Admin notes'),
           ),
           const SizedBox(height: 16),
-          if (_pickedInputType == 'image_handwritten')
+          if (isHandwritten)
             Container(
               padding: const EdgeInsets.all(12),
               margin: const EdgeInsets.only(bottom: 12),
@@ -1395,19 +2196,102 @@ class _SmartImportTabState extends State<SmartImportTab> {
   }
 
   Widget _buildSaveButton() {
-    return FilledButton.icon(
-      onPressed: _canSave ? _save : null,
-      icon: _submitting
-          ? const SizedBox(
-              width: 16, height: 16,
-              child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
-            )
-          : const Icon(Icons.save_rounded),
-      label: Text(_submitting ? 'Saving…' : 'Save Order',
-          style: GoogleFonts.manrope(fontSize: 14, fontWeight: FontWeight.w800)),
-      style: FilledButton.styleFrom(
-        minimumSize: const Size.fromHeight(48),
-        backgroundColor: AppTheme.primary,
+    final hasMoreAfter = _queue.length > 1 &&
+        _queue.skip(_queueIdx + 1).any((q) => q.status == _QueueStatus.reviewing);
+    final saveLabel = _submitting
+        ? 'Saving…'
+        : hasMoreAfter
+            ? 'Save & Next'
+            : (_queue.length > 1 ? 'Save & Finish' : 'Save Order');
+    return Row(
+      children: [
+        if (_queue.length > 1)
+          Padding(
+            padding: const EdgeInsets.only(right: 8),
+            child: OutlinedButton.icon(
+              onPressed: _submitting ? null : _skipCurrent,
+              icon: const Icon(Icons.skip_next_rounded, size: 18),
+              label: Text('Skip',
+                  style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.w700)),
+              style: OutlinedButton.styleFrom(
+                minimumSize: const Size(0, 48),
+                padding: const EdgeInsets.symmetric(horizontal: 14),
+              ),
+            ),
+          ),
+        Expanded(
+          child: FilledButton.icon(
+            onPressed: _canSave ? _save : null,
+            icon: _submitting
+                ? const SizedBox(
+                    width: 16, height: 16,
+                    child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                  )
+                : const Icon(Icons.save_rounded),
+            label: Text(saveLabel,
+                style: GoogleFonts.manrope(fontSize: 14, fontWeight: FontWeight.w800)),
+            style: FilledButton.styleFrom(
+              minimumSize: const Size.fromHeight(48),
+              backgroundColor: AppTheme.primary,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildQueueProgress(int saved, int skipped) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: AppTheme.primary.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: AppTheme.primary.withValues(alpha: 0.25)),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.layers_rounded, size: 18, color: AppTheme.primary),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              'Order ${_queueIdx + 1} of ${_queue.length}'
+              '${saved > 0 || skipped > 0 ? "  ·  $saved saved · $skipped skipped" : ""}',
+              style: GoogleFonts.manrope(
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+                color: AppTheme.primary,
+              ),
+            ),
+          ),
+          if (_queue.length > 1) ...[
+            IconButton(
+              onPressed: _queueIdx > 0 && !_submitting
+                  ? () {
+                      _flushCurrentToQueue();
+                      setState(() => _queueIdx--);
+                      _hydrateCurrent();
+                      _recomputeAllCsds();
+                    }
+                  : null,
+              icon: const Icon(Icons.chevron_left_rounded),
+              tooltip: 'Previous draft',
+              visualDensity: VisualDensity.compact,
+            ),
+            IconButton(
+              onPressed: _queueIdx < _queue.length - 1 && !_submitting
+                  ? () {
+                      _flushCurrentToQueue();
+                      setState(() => _queueIdx++);
+                      _hydrateCurrent();
+                      _recomputeAllCsds();
+                    }
+                  : null,
+              icon: const Icon(Icons.chevron_right_rounded),
+              tooltip: 'Next draft',
+              visualDensity: VisualDensity.compact,
+            ),
+          ],
+        ],
       ),
     );
   }
@@ -1549,9 +2433,40 @@ class _SearchSheetState<T> extends State<_SearchSheet<T>> {
   @override
   Widget build(BuildContext context) {
     final q = _ctl.text;
-    final matches = q.trim().isEmpty
-        ? widget.items.take(50).toList()
-        : widget.items.where((it) => tokenMatch(q, widget.searchFields(it))).take(100).toList();
+    // Two-pass search for multi-word queries:
+    //   1. Strict (every token must hit a field) — highest-quality matches
+    //      shown first.
+    //   2. Loose (any one token hits) — only used as a fallback when the
+    //      query has 2+ words; appended after a divider so the user sees
+    //      "you typed 'vishal kumar enterprises' — here's the best fit
+    //      [strict], and here's everything that touched any of those words
+    //      [loose]."
+    // Single-word queries don't differ between strict/loose — skip pass 2.
+    final qTrim = q.trim();
+    final tokenCount = searchTokens(qTrim).length;
+    late final List<T> strictMatches;
+    late final List<T> looseOnly;
+    if (qTrim.isEmpty) {
+      strictMatches = widget.items.take(50).toList();
+      looseOnly = const [];
+    } else {
+      strictMatches = widget.items
+          .where((it) => tokenMatch(qTrim, widget.searchFields(it)))
+          .take(100)
+          .toList();
+      if (tokenCount >= 2) {
+        final strictSet = strictMatches.toSet();
+        looseOnly = widget.items
+            .where((it) =>
+                !strictSet.contains(it) &&
+                tokenMatchAny(qTrim, widget.searchFields(it)))
+            .take(100 - strictMatches.length)
+            .toList();
+      } else {
+        looseOnly = const [];
+      }
+    }
+    final matches = [...strictMatches, ...looseOnly];
     final viewInsets = MediaQuery.of(context).viewInsets;
     return Padding(
       padding: EdgeInsets.only(bottom: viewInsets.bottom),
@@ -1598,8 +2513,12 @@ class _SearchSheetState<T> extends State<_SearchSheet<T>> {
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
               child: Row(children: [
-                Text('${matches.length} result${matches.length == 1 ? "" : "s"}',
-                    style: GoogleFonts.manrope(fontSize: 11, color: Colors.black54)),
+                Text(
+                  looseOnly.isEmpty
+                      ? '${matches.length} result${matches.length == 1 ? "" : "s"}'
+                      : '${strictMatches.length} exact · ${looseOnly.length} loose',
+                  style: GoogleFonts.manrope(fontSize: 11, color: Colors.black54),
+                ),
               ]),
             ),
             Expanded(
@@ -1610,24 +2529,207 @@ class _SearchSheetState<T> extends State<_SearchSheet<T>> {
                         style: GoogleFonts.manrope(fontSize: 12, color: Colors.black45),
                       ),
                     )
-                  : ListView.separated(
+                  : ListView.builder(
                       controller: scroll,
-                      itemCount: matches.length,
-                      separatorBuilder: (_, __) => const Divider(height: 1),
-                      itemBuilder: (_, i) {
+                      // +1 for the loose-section header when any loose hits.
+                      itemCount: matches.length +
+                          (looseOnly.isNotEmpty ? 1 : 0),
+                      itemBuilder: (_, idx) {
+                        // Insert a section header between strict and loose.
+                        final headerSlot = strictMatches.length;
+                        if (looseOnly.isNotEmpty && idx == headerSlot) {
+                          return Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 16, vertical: 8),
+                            color: Colors.grey.shade100,
+                            child: Row(children: [
+                              Icon(Icons.search_rounded,
+                                  size: 12, color: Colors.grey.shade700),
+                              const SizedBox(width: 6),
+                              Text(
+                                'Looser matches (any word)',
+                                style: GoogleFonts.manrope(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w700,
+                                  color: Colors.grey.shade700,
+                                ),
+                              ),
+                            ]),
+                          );
+                        }
+                        final i = (looseOnly.isNotEmpty && idx > headerSlot)
+                            ? idx - 1
+                            : idx;
                         final it = matches[i];
-                        return ListTile(
-                          dense: true,
-                          title: Text(widget.displayTitle(it),
-                              style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.w600)),
-                          subtitle: Text(widget.displaySubtitle(it),
-                              style: GoogleFonts.manrope(fontSize: 11, color: Colors.black54)),
-                          onTap: () => Navigator.pop(context, it),
+                        return Column(
+                          children: [
+                            ListTile(
+                              dense: true,
+                              title: Text(widget.displayTitle(it),
+                                  style: GoogleFonts.manrope(
+                                      fontSize: 13, fontWeight: FontWeight.w600)),
+                              subtitle: Text(widget.displaySubtitle(it),
+                                  style: GoogleFonts.manrope(
+                                      fontSize: 11, color: Colors.black54)),
+                              onTap: () => Navigator.pop(context, it),
+                            ),
+                            const Divider(height: 1),
+                          ],
                         );
                       },
                     ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Bottom-sheet composer used by the "Add Paste" button. Separated from the
+/// main tab so the keyboard + dropdown state is scoped to the modal.
+class _PasteComposerSheet extends StatefulWidget {
+  final TextEditingController controller;
+  final String? initialInputType;
+  final _Attachment Function(String text, String inputType) build;
+
+  const _PasteComposerSheet({
+    required this.controller,
+    required this.initialInputType,
+    required this.build,
+  });
+
+  @override
+  State<_PasteComposerSheet> createState() => _PasteComposerSheetState();
+}
+
+class _PasteComposerSheetState extends State<_PasteComposerSheet> {
+  String? _override;
+
+  @override
+  void initState() {
+    super.initState();
+    _override = widget.initialInputType;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final text = widget.controller.text;
+    final hasText = text.trim().isNotEmpty;
+    final effective = _override ??
+        (hasText ? SmartImportService.classifyTextInput(text) : 'whatsapp_text');
+    final viewInsets = MediaQuery.of(context).viewInsets;
+    return Padding(
+      padding: EdgeInsets.only(bottom: viewInsets.bottom),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(children: [
+              Expanded(
+                child: Text('Add pasted order',
+                    style: GoogleFonts.manrope(fontSize: 15, fontWeight: FontWeight.w800)),
+              ),
+              IconButton(
+                icon: const Icon(Icons.close_rounded),
+                onPressed: () => Navigator.pop(context),
+              ),
+            ]),
+            TextField(
+              controller: widget.controller,
+              maxLines: 10,
+              autofocus: true,
+              onChanged: (_) => setState(() {/* reclassify */}),
+              decoration: InputDecoration(
+                hintText: 'Paste brand-software text, WhatsApp message, etc. '
+                    'Multiple orders in one paste are OK — Gemini splits them.',
+                isDense: true,
+                contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+              ),
+            ),
+            const SizedBox(height: 10),
+            if (hasText)
+              Row(
+                children: [
+                  Icon(Icons.auto_awesome_rounded, size: 14, color: Colors.black54),
+                  const SizedBox(width: 6),
+                  Text('Type:',
+                      style: GoogleFonts.manrope(
+                          fontSize: 11, color: Colors.black54, fontWeight: FontWeight.w600)),
+                  const SizedBox(width: 8),
+                  DropdownButton<String>(
+                    isDense: true,
+                    value: effective,
+                    items: const [
+                      DropdownMenuItem(
+                          value: 'brand_software_text', child: Text('Brand software (GUBB/SCO)')),
+                      DropdownMenuItem(
+                          value: 'whatsapp_text', child: Text('WhatsApp / casual')),
+                    ],
+                    onChanged: (v) => setState(() => _override = v),
+                  ),
+                  const SizedBox(width: 6),
+                  if (_override == null)
+                    Text('(auto)',
+                        style: GoogleFonts.manrope(fontSize: 10, color: Colors.black38)),
+                ],
+              ),
+            const SizedBox(height: 12),
+            FilledButton(
+              onPressed: hasText
+                  ? () => Navigator.pop(context, widget.build(text, effective))
+                  : null,
+              style: FilledButton.styleFrom(
+                minimumSize: const Size.fromHeight(46),
+              ),
+              child: Text('Add to batch',
+                  style: GoogleFonts.manrope(fontSize: 13, fontWeight: FontWeight.w800)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _TeamChoice extends StatelessWidget {
+  final String label;
+  final Color color;
+  final bool selected;
+  final VoidCallback onTap;
+
+  const _TeamChoice({
+    required this.label,
+    required this.color,
+    required this.selected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 180),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+        decoration: BoxDecoration(
+          color: selected ? color : color.withValues(alpha: 0.10),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(
+            color: selected ? color : color.withValues(alpha: 0.40),
+            width: selected ? 1.5 : 1,
+          ),
+        ),
+        child: Text(
+          label,
+          style: GoogleFonts.manrope(
+            fontSize: 13,
+            fontWeight: FontWeight.w700,
+            color: selected ? Colors.white : color,
+          ),
         ),
       ),
     );

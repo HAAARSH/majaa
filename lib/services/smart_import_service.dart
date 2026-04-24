@@ -14,6 +14,17 @@ import 'supabase_service.dart';
 // Data types — draft order shapes produced by Gemini and consumed by UI.
 // ─────────────────────────────────────────────────────────────────────────
 
+/// Multi-order Gemini output — one attachment may contain 1..N orders.
+class SmartImportBatch {
+  final List<SmartImportDraft> orders;
+  final double overallConfidence;
+
+  const SmartImportBatch({
+    required this.orders,
+    required this.overallConfidence,
+  });
+}
+
 /// Raw output of Gemini on a brand-software / WhatsApp / OCR input.
 class SmartImportDraft {
   /// Exact customer name as written in the input.
@@ -121,36 +132,93 @@ class SmartImportService {
 
   // ─── DUPLICATE GUARD ─────────────────────────────────────────────────
 
-  /// Returns the existing import row's resulting_order_id if this hash was
-  /// imported before in the same team. Null if not a duplicate.
+  /// Returns the existing import row if this hash is already represented by
+  /// an ACTIVE row in the same team. Null if not a duplicate.
+  ///
+  /// A row is "active" (blocks re-import) when ALL of:
+  ///   * revoked_at IS NULL                      (not super_admin-revoked)
+  ///   * status NOT IN ('discarded', 'failed')   (produced at least one saved order)
+  ///
+  /// Matches the partial unique index in migration 20260424000004.
+  /// Discarded, failed, or revoked rows are silently ignored so admins can
+  /// retry the same input without a manual override.
+  ///
+  /// The returned map always has a `resulting_order_ids: List<String>` key,
+  /// backfilled from the scalar `resulting_order_id` for rows written
+  /// before the multi-order migration.
   Future<Map<String, dynamic>?> findImportByHash(String hash, String teamId) async {
     try {
       final resp = await _client
           .from('smart_import_history')
-          .select('id, resulting_order_id, imported_at, status, input_preview')
+          .select('id, resulting_order_id, resulting_order_ids, imported_at, '
+              'status, input_preview, revoked_at')
           .eq('input_hash', hash)
           .eq('team_id', teamId)
+          .filter('revoked_at', 'is', null)
+          .not('status', 'in', '(discarded,failed)')
           .maybeSingle();
-      return resp == null ? null : Map<String, dynamic>.from(resp);
+      if (resp == null) return null;
+      final row = Map<String, dynamic>.from(resp);
+      final rawIds = row['resulting_order_ids'];
+      final ids = <String>[
+        if (rawIds is List)
+          ...rawIds.map((e) => e.toString()).where((s) => s.isNotEmpty)
+      ];
+      if (ids.isEmpty && row['resulting_order_id'] != null) {
+        ids.add(row['resulting_order_id'].toString());
+      }
+      row['resulting_order_ids'] = ids;
+      return row;
     } catch (e) {
       debugPrint('[SmartImport] findImportByHash failed: $e');
       return null;
     }
   }
 
+  /// Super_admin-only: soft-delete a smart_import_history row so its hash
+  /// stops blocking future imports of the same content. Does NOT touch the
+  /// created orders (if any) — admin manages those via the Orders tab.
+  ///
+  /// Returns true on success. Caller must enforce super_admin gating in
+  /// the UI; this method does not check the current role.
+  Future<bool> revokeImportHistoryRow({
+    required String rowId,
+    required String revokedByUserId,
+  }) async {
+    try {
+      await _client.from('smart_import_history').update({
+        'revoked_at': DateTime.now().toUtc().toIso8601String(),
+        'revoked_by_user_id': revokedByUserId,
+      }).eq('id', rowId);
+      return true;
+    } catch (e) {
+      debugPrint('[SmartImport] revokeImportHistoryRow failed: $e');
+      return false;
+    }
+  }
+
   // ─── HISTORY WRITE ───────────────────────────────────────────────────
 
-  /// Write an audit row after a successful save. Call from the save flow.
+  /// Write an audit row after an attachment's save flow completes. Accepts a
+  /// list of resulting order IDs because one attachment may produce multiple
+  /// orders (handwritten slip with 3 shops). Writes BOTH columns for
+  /// rollback safety during the multi-order migration window:
+  ///   * `resulting_order_ids` — full list (canonical post-migration).
+  ///   * `resulting_order_id`  — scalar, set to `ids.first` when non-empty.
+  ///
+  /// [status] is 'saved' when at least one order saved, 'discarded' when the
+  /// admin skipped every card.
   Future<void> writeImportHistory({
     required String inputType,
     required String inputPreview,
     required String inputHash,
     required Map<String, dynamic> parsedResult,
     required Map<String, dynamic> adminCorrections,
-    required String resultingOrderId,
+    required List<String> resultingOrderIds,
     required String teamId,
     required String attributedRepUserId,
     required String importedByUserId,
+    String status = 'saved',
   }) async {
     try {
       await _client.from('smart_import_history').insert({
@@ -162,9 +230,10 @@ class SmartImportService {
         'input_hash': inputHash,
         'parsed_result': parsedResult,
         'admin_corrections': adminCorrections,
-        'resulting_order_id': resultingOrderId,
+        'resulting_order_id': resultingOrderIds.isEmpty ? null : resultingOrderIds.first,
+        'resulting_order_ids': resultingOrderIds,
         'team_id': teamId,
-        'status': 'saved',
+        'status': status,
         'attributed_brand_rep_user_id': attributedRepUserId,
       });
     } catch (e) {
@@ -391,7 +460,12 @@ class SmartImportService {
 
   /// Insert or bump a product alias. If `customerId` is null → global alias
   /// (deduped by the partial unique index on (alias_text, team_id)).
-  Future<void> writeProductAlias({
+  /// Returns true on success (insert or 23505 bump), false on a real
+  /// failure (RLS reject, network, schema mismatch). Callers can ignore
+  /// the return value for fire-and-forget behavior; the Smart Import UI
+  /// aggregates false results into a post-save snackbar so admins know
+  /// when learning silently failed.
+  Future<bool> writeProductAlias({
     required String? customerId,
     required String aliasText,
     required String productId,
@@ -399,7 +473,7 @@ class SmartImportService {
     required String createdByUserId,
   }) async {
     final normalized = _normalizeAlias(aliasText);
-    if (normalized.isEmpty || productId.isEmpty) return;
+    if (normalized.isEmpty || productId.isEmpty) return true;
     try {
       // Try INSERT first; on unique violation, bump confidence + last_used.
       await _client.from('product_alias_learning').insert({
@@ -409,17 +483,20 @@ class SmartImportService {
         'team_id': teamId,
         'created_by_user_id': createdByUserId,
       });
+      return true;
     } on PostgrestException catch (e) {
       // 23505 = unique_violation — alias already exists, bump it.
       if (e.code == '23505') {
         await _bumpProductAlias(
           customerId: customerId, alias: normalized, teamId: teamId,
         );
-      } else {
-        debugPrint('[SmartImport] writeProductAlias failed: $e');
+        return true;
       }
+      debugPrint('[SmartImport] writeProductAlias failed: $e');
+      return false;
     } catch (e) {
       debugPrint('[SmartImport] writeProductAlias failed: $e');
+      return false;
     }
   }
 
@@ -455,14 +532,16 @@ class SmartImportService {
     }
   }
 
-  Future<void> writeCustomerAlias({
+  /// Returns true on success (insert or 23505 last_used_at bump), false
+  /// on real failure. See writeProductAlias for rationale.
+  Future<bool> writeCustomerAlias({
     required String aliasText,
     required String customerId,
     required String teamId,
     required String createdByUserId,
   }) async {
     final normalized = _normalizeAlias(aliasText);
-    if (normalized.isEmpty || customerId.isEmpty) return;
+    if (normalized.isEmpty || customerId.isEmpty) return true;
     try {
       await _client.from('customer_alias_learning').insert({
         'alias_text': normalized,
@@ -470,6 +549,7 @@ class SmartImportService {
         'team_id': teamId,
         'created_by_user_id': createdByUserId,
       });
+      return true;
     } on PostgrestException catch (e) {
       if (e.code == '23505') {
         try {
@@ -477,11 +557,13 @@ class SmartImportService {
             'last_used_at': DateTime.now().toIso8601String(),
           }).eq('alias_text', normalized).eq('team_id', teamId);
         } catch (_) {/* best-effort */}
-      } else {
-        debugPrint('[SmartImport] writeCustomerAlias failed: $e');
+        return true;
       }
+      debugPrint('[SmartImport] writeCustomerAlias failed: $e');
+      return false;
     } catch (e) {
       debugPrint('[SmartImport] writeCustomerAlias failed: $e');
+      return false;
     }
   }
 
@@ -533,33 +615,47 @@ class SmartImportService {
 
   static const String _whatsappPrompt = r'''
 You are a parsing assistant for a wholesale distributor's order system.
-The input is a casual WhatsApp message from a retailer. It is usually
-1-5 lines in mixed English / Hindi / Hinglish. Common patterns:
+The input is a casual WhatsApp message from one or more retailers. A
+SINGLE message may contain MULTIPLE independent orders (different shop
+names, or clearly separated order blocks). 1-5 lines per order, mixed
+English / Hindi / Hinglish. Common patterns:
   - "S.D store (9897477269) omkar road / Hakka noodles - 6pc / Origano - 2ladi"
   - "Send 10 maggi + 5 dal to apollo pharma tomorrow"
   - "Aaj 20 box kurkure bhej dena"
 
 OUTPUT FORMAT — STRICT JSON, NO PROSE, NO MARKDOWN FENCES:
 {
-  "customer": {
-    "name_as_written": "best guess from message, or empty string",
-    "phone_if_present": "10-digit phone if visible, or null"
-  },
-  "delivery_date_hint": "today | tomorrow | aaj | kal | DD/MM/YYYY | null",
-  "notes": "greetings, thank-yous, payment remarks not tied to items",
-  "line_items": [
+  "orders": [
     {
-      "name_as_written": "exact product nickname from message",
-      "ean_code": null,
-      "quantity": 6,
-      "unit_hint": "pc | pcs | ladi | box | ctn | kg | ml | null",
-      "confidence": 0.75
+      "customer": {
+        "name_as_written": "best guess from message, or empty string",
+        "phone_if_present": "10-digit phone if visible, or null"
+      },
+      "delivery_date_hint": "today | tomorrow | aaj | kal | DD/MM/YYYY | null",
+      "notes": "greetings, thank-yous, payment remarks not tied to items",
+      "line_items": [
+        {
+          "name_as_written": "exact product nickname from message",
+          "ean_code": null,
+          "quantity": 6,
+          "unit_hint": "pc | pcs | ladi | box | ctn | kg | ml | null",
+          "confidence": 0.75
+        }
+      ],
+      "overall_parse_confidence": 0.7
     }
-  ],
-  "overall_parse_confidence": 0.7
+  ]
 }
 
-RULES:
+SPLITTING INTO MULTIPLE ORDERS:
+- If the message clearly lists 2+ distinct shops/customers each with
+  their own item list, emit one element per shop in "orders".
+- Signals of a new order: a new shop name line, a blank line followed
+  by another header, "For X shop:" / "Also send to Y:" style labels.
+- If it is a single order, emit a 1-element "orders" array.
+- NEVER merge two different shops into one "customer" — prefer splitting.
+
+LINE RULES (apply per order):
 - Numbers right next to a product name / abbreviation are the quantity.
 - "ladi" / "strip" = unit_hint 'ladi'. Do NOT multiply — our system
   resolves the strip size later.
@@ -569,37 +665,53 @@ RULES:
 - Emojis, "thanks", "please", "kal bhej dena" → notes, NOT a line item.
 - If quantity is ambiguous (e.g. "thoda" / "some" / "kuch"), SKIP the
   line — do not invent a number.
-- If the message is a question or complaint with no order, return an
-  empty line_items list and set overall_parse_confidence low.
+- If the message is a question or complaint with no order, emit a
+  1-element "orders" array with an empty line_items list and low
+  overall_parse_confidence.
 - JSON only.
 ''';
 
   static const String _handwrittenPrompt = r'''
 You are a parsing assistant for a wholesale distributor's order system.
-The input is a PHOTO of a handwritten order slip. Handwriting is often
+The input is a PHOTO of one or more handwritten order slips. A single
+photo may contain MULTIPLE independent orders (different shop names
+stacked vertically, each with its own item list). Handwriting is often
 rushed, slanted, and may contain smudges or strikethroughs.
 
 OUTPUT FORMAT — STRICT JSON, NO PROSE, NO MARKDOWN FENCES:
 {
-  "customer": {
-    "name_as_written": "shop name from the header if visible, else empty",
-    "phone_if_present": "10-digit phone if visible, else null"
-  },
-  "delivery_date_hint": "string or null",
-  "notes": "anything not a line item",
-  "line_items": [
+  "orders": [
     {
-      "name_as_written": "exact text as written; use ? for illegible characters",
-      "ean_code": null,
-      "quantity": 5,
-      "unit_hint": "pc | pcs | ladi | box | null",
-      "confidence": 0.55
+      "customer": {
+        "name_as_written": "shop name from the header if visible, else empty",
+        "phone_if_present": "10-digit phone if visible, else null"
+      },
+      "delivery_date_hint": "string or null",
+      "notes": "anything not a line item",
+      "line_items": [
+        {
+          "name_as_written": "exact text as written; use ? for illegible characters",
+          "ean_code": null,
+          "quantity": 5,
+          "unit_hint": "pc | pcs | ladi | box | null",
+          "confidence": 0.55
+        }
+      ],
+      "overall_parse_confidence": 0.55
     }
-  ],
-  "overall_parse_confidence": 0.55
+  ]
 }
 
-RULES:
+SPLITTING INTO MULTIPLE ORDERS:
+- Each distinct customer/shop header + its block of items = one order.
+- Signals of a new order: a horizontal divider line, a new shop name /
+  "To:" header, a phone number on its own line, a blank region between
+  item blocks, a totals line closing one block.
+- If the page contains a single order (one header + items), emit a
+  1-element "orders" array.
+- Never merge two shops into one "customer" — prefer splitting.
+
+LINE RULES (apply per order):
 - If a character is illegible, use '?' in name_as_written and DROP the
   line's confidence to 0.3-0.5.
 - Rows with a strikethrough are CANCELLED — SKIP them entirely.
@@ -612,32 +724,44 @@ RULES:
 
   static const String _brandSoftwarePrompt = r'''
 You are a parsing assistant for a wholesale distributor's order system.
-Your job is to extract structured order data from a customer order pasted
-from brand-software output (e.g. GUBB, SCO). The text is semi-structured,
-typically contains the customer / beat / one line per product with quantity
-and possibly order value.
+Your job is to extract structured order data from one or more orders
+pasted from brand-software output (e.g. GUBB, SCO). A single paste MAY
+contain multiple orders (different customers separated by blank lines
+or a new customer header). Each order typically contains the customer /
+beat / one line per product with quantity and possibly order value.
 
 OUTPUT FORMAT — STRICT JSON, NO PROSE, NO MARKDOWN FENCES:
 {
-  "customer": {
-    "name_as_written": "exact text from input",
-    "phone_if_present": "string or null"
-  },
-  "delivery_date_hint": "tomorrow | monday | 25/04/2026 | null",
-  "notes": "any freeform text not tied to a line item, or null",
-  "line_items": [
+  "orders": [
     {
-      "name_as_written": "exact product nickname from input",
-      "ean_code": "string or null",
-      "quantity": 5,
-      "unit_hint": "pc | pcs | ladi | box | kg | ml | null",
-      "confidence": 0.95
+      "customer": {
+        "name_as_written": "exact text from input",
+        "phone_if_present": "string or null"
+      },
+      "delivery_date_hint": "tomorrow | monday | 25/04/2026 | null",
+      "notes": "any freeform text not tied to a line item, or null",
+      "line_items": [
+        {
+          "name_as_written": "exact product nickname from input",
+          "ean_code": "string or null",
+          "quantity": 5,
+          "unit_hint": "pc | pcs | ladi | box | kg | ml | null",
+          "confidence": 0.95
+        }
+      ],
+      "overall_parse_confidence": 0.88
     }
-  ],
-  "overall_parse_confidence": 0.88
+  ]
 }
 
-RULES:
+SPLITTING INTO MULTIPLE ORDERS:
+- If the paste clearly contains 2+ distinct customers (new header rows,
+  blank-line separators, totals closing each block), emit one element
+  per customer in "orders".
+- If the paste is a single order, emit a 1-element "orders" array.
+- Never merge two customers into one "customer" field.
+
+LINE RULES (apply per order):
 - DO NOT invent products. Only emit items present in the input.
 - DO NOT do product matching — our system matches name_as_written to the catalog.
 - Numbers next to items with '%' are discounts/schemes; IGNORE them as quantity.
@@ -663,12 +787,13 @@ RULES:
   // (Kept as strings rather than an enum so existing callers can adopt
   // incrementally.)
 
-  /// Parse a text paste into a structured draft. [inputType] picks the
-  /// prompt: 'brand_software_text' (GUBB/SCO structured) or 'whatsapp_text'
-  /// (casual mixed-language). Anything else falls back to whatsapp_text.
+  /// Parse a text paste into a structured draft. Returns the FIRST order
+  /// from Gemini's response for back-compat with callers that still expect
+  /// a single draft. Multi-order callers should use [parseBatchTextDetailed].
   ///
-  /// Back-compat: returns null on any failure (same contract as before).
-  /// Callers that want a useful error message should use [parseTextDetailed].
+  /// [inputType] picks the prompt: 'brand_software_text' (GUBB/SCO
+  /// structured) or 'whatsapp_text' (casual mixed-language). Anything
+  /// else falls back to whatsapp_text.
   Future<SmartImportDraft?> parseText(String rawText, String inputType) async {
     final r = await parseTextDetailed(rawText, inputType);
     return r.draft;
@@ -676,10 +801,22 @@ RULES:
 
   Future<({SmartImportDraft? draft, String reason, String? detail})>
       parseTextDetailed(String rawText, String inputType) async {
+    final r = await parseBatchTextDetailed(rawText, inputType);
+    final draft = (r.batch == null || r.batch!.orders.isEmpty)
+        ? null
+        : r.batch!.orders.first;
+    return (draft: draft, reason: r.reason, detail: r.detail);
+  }
+
+  /// Multi-order text parse. Returns a [SmartImportBatch] whose `orders`
+  /// list has 1..N entries. Callers should iterate and present each as a
+  /// separate draft card.
+  Future<({SmartImportBatch? batch, String reason, String? detail})>
+      parseBatchTextDetailed(String rawText, String inputType) async {
     final key = await _getGeminiKey();
     if (key.isEmpty) {
       debugPrint('[SmartImport] GEMINI_API_KEY missing');
-      return (draft: null, reason: 'no_key', detail: null);
+      return (batch: null, reason: 'no_key', detail: null);
     }
     final prompt = switch (inputType) {
       'brand_software_text' => _brandSoftwarePrompt,
@@ -698,13 +835,24 @@ RULES:
       ],
       'generationConfig': {
         'temperature': 0.1,
-        'maxOutputTokens': 16384,
+        // Multi-order prompts can legitimately run longer. Doubled from 16k
+        // to leave headroom for 5-order handwritten slips.
+        'maxOutputTokens': 32768,
       },
     });
 
     // Text can be long (GUBB pastes routinely run to 100+ lines). 60s gives
     // Gemini enough headroom; when we hit this, it's almost always network.
     const timeout = Duration(seconds: 60);
+    return _callGeminiAndBuildBatch(body, timeout);
+  }
+
+  /// Shared HTTP + JSON + batch-construction path used by both the text and
+  /// bytes parse flows. [body] is the pre-encoded Gemini request body;
+  /// [timeout] is the per-request wall clock.
+  Future<({SmartImportBatch? batch, String reason, String? detail})>
+      _callGeminiAndBuildBatch(String body, Duration timeout) async {
+    final key = await _getGeminiKey();
     http.Response resp;
     try {
       resp = await http.post(
@@ -714,15 +862,15 @@ RULES:
       ).timeout(timeout);
     } on TimeoutException {
       debugPrint('[SmartImport] Gemini timed out after ${timeout.inSeconds}s');
-      return (draft: null, reason: 'timeout', detail: '${timeout.inSeconds}s');
+      return (batch: null, reason: 'timeout', detail: '${timeout.inSeconds}s');
     } catch (e) {
       debugPrint('[SmartImport] Gemini network error: $e');
-      return (draft: null, reason: 'network', detail: e.toString());
+      return (batch: null, reason: 'network', detail: e.toString());
     }
     if (resp.statusCode != 200) {
       debugPrint('[SmartImport] Gemini ${resp.statusCode}: ${resp.body}');
       return (
-        draft: null,
+        batch: null,
         reason: 'http_${resp.statusCode}',
         detail: _truncate(resp.body, 400),
       );
@@ -733,54 +881,99 @@ RULES:
       final text = ((data['candidates'] as List?)?.firstOrNull?['content']
               ?['parts'] as List?)?.firstOrNull?['text'] as String?;
       if (text == null || text.isEmpty) {
-        return (draft: null, reason: 'empty', detail: null);
+        return (batch: null, reason: 'empty', detail: null);
       }
 
-      final cleaned = text
-          .replaceAll('```json', '')
-          .replaceAll('```', '')
-          .trim();
-      Map<String, dynamic> json;
-      try {
-        json = jsonDecode(cleaned) as Map<String, dynamic>;
-      } catch (_) {
-        final s = cleaned.indexOf('{');
-        final e = cleaned.lastIndexOf('}');
-        if (s == -1 || e == -1 || e < s) {
-          return (draft: null, reason: 'bad_json', detail: _truncate(cleaned, 200));
-        }
-        try {
-          json = jsonDecode(cleaned.substring(s, e + 1)) as Map<String, dynamic>;
-        } catch (_) {
-          return (draft: null, reason: 'bad_json', detail: _truncate(cleaned, 200));
-        }
+      final parsed = _parseLooseJson(text);
+      if (parsed == null) {
+        return (batch: null, reason: 'bad_json', detail: _truncate(text, 200));
       }
-
-      final cust = (json['customer'] as Map?) ?? {};
-      final lines = (json['line_items'] as List? ?? []).map((l) {
-        final m = l as Map;
-        return SmartImportDraftLine(
-          nameAsWritten: (m['name_as_written'] as String? ?? '').trim(),
-          eanCode: m['ean_code'] as String?,
-          quantity: (m['quantity'] as num?)?.toInt() ?? 0,
-          unitHint: m['unit_hint'] as String?,
-          confidence: (m['confidence'] as num?)?.toDouble() ?? 0.7,
-        );
-      }).where((l) => l.nameAsWritten.isNotEmpty && l.quantity > 0).toList();
-
-      final draft = SmartImportDraft(
-        customerNameAsWritten: (cust['name_as_written'] as String? ?? '').trim(),
-        customerPhoneFromInput: cust['phone_if_present'] as String?,
-        deliveryDateHint: json['delivery_date_hint'] as String?,
-        notes: json['notes'] as String?,
-        lines: lines,
-        overallConfidence: (json['overall_parse_confidence'] as num?)?.toDouble() ?? 0.7,
-      );
-      return (draft: draft, reason: 'ok', detail: null);
+      final batch = _unwrapBatch(parsed);
+      if (batch.orders.isEmpty) {
+        // Genuine parse but Gemini decided nothing was an order (e.g. a
+        // question / thank-you message). Return an empty batch — the UI
+        // surfaces "no orders detected" to the admin.
+        return (batch: batch, reason: 'ok', detail: null);
+      }
+      return (batch: batch, reason: 'ok', detail: null);
     } catch (e) {
       debugPrint('[SmartImport] Gemini parse failed: $e');
-      return (draft: null, reason: 'internal', detail: e.toString());
+      return (batch: null, reason: 'internal', detail: e.toString());
     }
+  }
+
+  /// Strip Markdown fences + pull the first JSON object out of Gemini's
+  /// reply. Returns null on unrecoverable malformed output.
+  static Map<String, dynamic>? _parseLooseJson(String raw) {
+    final cleaned = raw
+        .replaceAll('```json', '')
+        .replaceAll('```', '')
+        .trim();
+    try {
+      return jsonDecode(cleaned) as Map<String, dynamic>;
+    } catch (_) {
+      final s = cleaned.indexOf('{');
+      final e = cleaned.lastIndexOf('}');
+      if (s == -1 || e == -1 || e < s) return null;
+      try {
+        return jsonDecode(cleaned.substring(s, e + 1)) as Map<String, dynamic>;
+      } catch (_) {
+        return null;
+      }
+    }
+  }
+
+  /// Build a [SmartImportBatch] from Gemini's parsed JSON. Handles BOTH:
+  ///   * new shape: `{"orders": [ {customer, line_items, ...}, ... ]}`
+  ///   * legacy shape (single order): `{"customer": {...}, "line_items": [...], ...}`
+  ///     — wrapped into a 1-element batch for back-compat during the prompt
+  ///     rollout window.
+  static SmartImportBatch _unwrapBatch(Map<String, dynamic> json) {
+    final rawOrders = json['orders'];
+    final orderMaps = <Map>[];
+    if (rawOrders is List) {
+      for (final o in rawOrders) {
+        if (o is Map) orderMaps.add(o);
+      }
+    } else {
+      // Legacy single-order shape — the prompt pre-rewrite contract.
+      orderMaps.add(json);
+    }
+    final drafts = orderMaps.map(_draftFromMap).toList();
+    // Batch confidence: prefer an explicit batch-level value, else average.
+    final explicit = (json['overall_parse_confidence'] as num?)?.toDouble();
+    final avg = drafts.isEmpty
+        ? 0.0
+        : drafts.map((d) => d.overallConfidence).reduce((a, b) => a + b) /
+            drafts.length;
+    return SmartImportBatch(
+      orders: drafts,
+      overallConfidence: explicit ?? avg,
+    );
+  }
+
+  /// Construct a single [SmartImportDraft] from one per-order map.
+  static SmartImportDraft _draftFromMap(Map order) {
+    final cust = (order['customer'] as Map?) ?? {};
+    final lines = (order['line_items'] as List? ?? []).map((l) {
+      final m = l as Map;
+      return SmartImportDraftLine(
+        nameAsWritten: (m['name_as_written'] as String? ?? '').trim(),
+        eanCode: m['ean_code'] as String?,
+        quantity: (m['quantity'] as num?)?.toInt() ?? 0,
+        unitHint: m['unit_hint'] as String?,
+        confidence: (m['confidence'] as num?)?.toDouble() ?? 0.7,
+      );
+    }).where((l) => l.nameAsWritten.isNotEmpty && l.quantity > 0).toList();
+    return SmartImportDraft(
+      customerNameAsWritten: (cust['name_as_written'] as String? ?? '').trim(),
+      customerPhoneFromInput: cust['phone_if_present'] as String?,
+      deliveryDateHint: order['delivery_date_hint'] as String?,
+      notes: order['notes'] as String?,
+      lines: lines,
+      overallConfidence:
+          (order['overall_parse_confidence'] as num?)?.toDouble() ?? 0.7,
+    );
   }
 
   static String _truncate(String s, int max) =>
@@ -790,30 +983,41 @@ RULES:
 
   static const String _pdfPrompt = r'''
 You are a parsing assistant for a wholesale distributor's order system.
-You are given a purchase-order PDF from a large customer. Extract the
-structured order.
+You are given a purchase-order PDF. Usually ONE order per PDF, but some
+PDFs bundle 2+ POs for different stores (e.g. chain store central POs
+split by outlet). Extract each order separately.
 
 OUTPUT FORMAT — STRICT JSON, NO PROSE, NO MARKDOWN FENCES:
 {
-  "customer": {
-    "name_as_written": "exact text from header",
-    "phone_if_present": "string or null"
-  },
-  "delivery_date_hint": "string or null",
-  "notes": "freeform PO notes, or null",
-  "line_items": [
+  "orders": [
     {
-      "name_as_written": "product name / description as printed",
-      "ean_code": "13-digit EAN if a barcode or EAN column is shown, else null",
-      "quantity": 10,
-      "unit_hint": "pc | pcs | box | ctn | null",
-      "confidence": 0.95
+      "customer": {
+        "name_as_written": "exact text from header",
+        "phone_if_present": "string or null"
+      },
+      "delivery_date_hint": "string or null",
+      "notes": "freeform PO notes, or null",
+      "line_items": [
+        {
+          "name_as_written": "product name / description as printed",
+          "ean_code": "13-digit EAN if a barcode or EAN column is shown, else null",
+          "quantity": 10,
+          "unit_hint": "pc | pcs | box | ctn | null",
+          "confidence": 0.95
+        }
+      ],
+      "overall_parse_confidence": 0.9
     }
-  ],
-  "overall_parse_confidence": 0.9
+  ]
 }
 
-RULES:
+SPLITTING INTO MULTIPLE ORDERS:
+- If the PDF has 2+ distinct "Ship To" / "Store" sections each with
+  their own line items, emit one element per store in "orders".
+- Otherwise (the overwhelmingly common case) emit a 1-element array.
+- Never merge two stores into one "customer".
+
+LINE RULES (apply per order):
 - EAN / barcode column is gold — always extract it when present. Our
   system does exact EAN matching before falling back to name matching.
 - Do NOT invent items. Only rows present in the PO.
@@ -827,29 +1031,41 @@ RULES:
   static const String _screenshotPrompt = r'''
 You are a parsing assistant for a wholesale distributor's order system.
 You are given a screenshot of a spreadsheet or brand-software table
-exported by the customer. Extract the order lines.
+exported by the customer. A single screenshot may cover ONE order or
+MULTIPLE orders (e.g. multi-store rollup with customer rows separated
+by subtotal lines). Extract each order separately.
 
 OUTPUT FORMAT — STRICT JSON, NO PROSE, NO MARKDOWN FENCES:
 {
-  "customer": {
-    "name_as_written": "best guess from header/visible context, or empty string",
-    "phone_if_present": "string or null"
-  },
-  "delivery_date_hint": "string or null",
-  "notes": "any freeform context seen (scheme %, due date, etc.), or null",
-  "line_items": [
+  "orders": [
     {
-      "name_as_written": "exact product nickname / description",
-      "ean_code": "string or null",
-      "quantity": 5,
-      "unit_hint": "pc | pcs | ladi | box | null",
-      "confidence": 0.85
+      "customer": {
+        "name_as_written": "best guess from header/visible context, or empty string",
+        "phone_if_present": "string or null"
+      },
+      "delivery_date_hint": "string or null",
+      "notes": "any freeform context seen (scheme %, due date, etc.), or null",
+      "line_items": [
+        {
+          "name_as_written": "exact product nickname / description",
+          "ean_code": "string or null",
+          "quantity": 5,
+          "unit_hint": "pc | pcs | ladi | box | null",
+          "confidence": 0.85
+        }
+      ],
+      "overall_parse_confidence": 0.8
     }
-  ],
-  "overall_parse_confidence": 0.8
+  ]
 }
 
-RULES:
+SPLITTING INTO MULTIPLE ORDERS:
+- If the screenshot shows 2+ distinct customer rows each with its own
+  set of lines (or a pivot-style multi-customer rollup), emit one
+  element per customer in "orders".
+- Otherwise emit a 1-element "orders" array.
+
+LINE RULES (apply per order):
 - Identify the ORDER quantity column. Common headers: Order / Qty /
   Ordered / To Ship. IGNORE "Stock", "Balance", "On Hand" columns —
   those are NOT order quantities.
@@ -860,8 +1076,8 @@ RULES:
 - JSON only.
 ''';
 
-  /// Parse an image screenshot OR a PDF. Returns null on failure. Callers
-  /// that want a reason for the failure should use [parseFromBytesDetailed].
+  /// Parse an image screenshot OR a PDF. Returns the FIRST order for
+  /// back-compat; multi-order callers should use [parseBatchFromBytesDetailed].
   Future<SmartImportDraft?> parseFromBytes({
     required Uint8List bytes,
     required String mimeType,
@@ -878,10 +1094,27 @@ RULES:
     required String mimeType,
     required String inputType,
   }) async {
+    final r = await parseBatchFromBytesDetailed(
+      bytes: bytes, mimeType: mimeType, inputType: inputType);
+    final draft = (r.batch == null || r.batch!.orders.isEmpty)
+        ? null
+        : r.batch!.orders.first;
+    return (draft: draft, reason: r.reason, detail: r.detail);
+  }
+
+  /// Multi-order parse from image/PDF bytes. Returns a [SmartImportBatch]
+  /// whose `orders` list has 1..N entries. A handwritten slip with 3
+  /// distinct customers → 3 orders here.
+  Future<({SmartImportBatch? batch, String reason, String? detail})>
+      parseBatchFromBytesDetailed({
+    required Uint8List bytes,
+    required String mimeType,
+    required String inputType,
+  }) async {
     final key = await _getGeminiKey();
     if (key.isEmpty) {
       debugPrint('[SmartImport] GEMINI_API_KEY missing');
-      return (draft: null, reason: 'no_key', detail: null);
+      return (batch: null, reason: 'no_key', detail: null);
     }
     final prompt = switch (inputType) {
       'pdf' => _pdfPrompt,
@@ -914,82 +1147,7 @@ RULES:
     // PDFs + high-res images legitimately take longer than text. 120s
     // so a 30-page PO has time to return.
     const timeout = Duration(seconds: 120);
-    http.Response resp;
-    try {
-      resp = await http.post(
-        Uri.parse('$_geminiEndpoint?key=$key'),
-        headers: {'Content-Type': 'application/json'},
-        body: body,
-      ).timeout(timeout);
-    } on TimeoutException {
-      debugPrint('[SmartImport] Gemini file timed out after ${timeout.inSeconds}s');
-      return (draft: null, reason: 'timeout', detail: '${timeout.inSeconds}s');
-    } catch (e) {
-      debugPrint('[SmartImport] Gemini file network error: $e');
-      return (draft: null, reason: 'network', detail: e.toString());
-    }
-    if (resp.statusCode != 200) {
-      debugPrint('[SmartImport] Gemini file ${resp.statusCode}: ${resp.body}');
-      return (
-        draft: null,
-        reason: 'http_${resp.statusCode}',
-        detail: _truncate(resp.body, 400),
-      );
-    }
-
-    try {
-      final data = jsonDecode(resp.body) as Map<String, dynamic>;
-      final text = ((data['candidates'] as List?)?.firstOrNull?['content']
-              ?['parts'] as List?)?.firstOrNull?['text'] as String?;
-      if (text == null || text.isEmpty) {
-        return (draft: null, reason: 'empty', detail: null);
-      }
-
-      final cleaned = text
-          .replaceAll('```json', '')
-          .replaceAll('```', '')
-          .trim();
-      Map<String, dynamic> json;
-      try {
-        json = jsonDecode(cleaned) as Map<String, dynamic>;
-      } catch (_) {
-        final s = cleaned.indexOf('{');
-        final e = cleaned.lastIndexOf('}');
-        if (s == -1 || e == -1 || e < s) {
-          return (draft: null, reason: 'bad_json', detail: _truncate(cleaned, 200));
-        }
-        try {
-          json = jsonDecode(cleaned.substring(s, e + 1)) as Map<String, dynamic>;
-        } catch (_) {
-          return (draft: null, reason: 'bad_json', detail: _truncate(cleaned, 200));
-        }
-      }
-
-      final cust = (json['customer'] as Map?) ?? {};
-      final lines = (json['line_items'] as List? ?? []).map((l) {
-        final m = l as Map;
-        return SmartImportDraftLine(
-          nameAsWritten: (m['name_as_written'] as String? ?? '').trim(),
-          eanCode: m['ean_code'] as String?,
-          quantity: (m['quantity'] as num?)?.toInt() ?? 0,
-          unitHint: m['unit_hint'] as String?,
-          confidence: (m['confidence'] as num?)?.toDouble() ?? 0.7,
-        );
-      }).where((l) => l.nameAsWritten.isNotEmpty && l.quantity > 0).toList();
-
-      final draft = SmartImportDraft(
-        customerNameAsWritten: (cust['name_as_written'] as String? ?? '').trim(),
-        customerPhoneFromInput: cust['phone_if_present'] as String?,
-        deliveryDateHint: json['delivery_date_hint'] as String?,
-        notes: json['notes'] as String?,
-        lines: lines,
-        overallConfidence: (json['overall_parse_confidence'] as num?)?.toDouble() ?? 0.7,
-      );
-      return (draft: draft, reason: 'ok', detail: null);
-    } catch (e) {
-      debugPrint('[SmartImport] Gemini file parse failed: $e');
-      return (draft: null, reason: 'internal', detail: e.toString());
-    }
+    return _callGeminiAndBuildBatch(body, timeout);
   }
 
   // ─── ALIAS ADMIN (list + delete) ─────────────────────────────────────

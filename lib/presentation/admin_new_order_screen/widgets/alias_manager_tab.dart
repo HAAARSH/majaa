@@ -248,15 +248,29 @@ class _AliasManagerTabState extends State<AliasManagerTab> {
               Padding(
                 padding: const EdgeInsets.only(right: 6),
                 child: ChoiceChip(
-                  label: Text(t, style: GoogleFonts.manrope(fontWeight: FontWeight.w700)),
+                  label: Text(
+                    t,
+                    style: GoogleFonts.manrope(
+                      fontWeight: FontWeight.w800,
+                      color: _team == t ? Colors.white : AppTheme.onSurface,
+                      fontSize: 13,
+                    ),
+                  ),
                   selected: _team == t,
+                  selectedColor: AppTheme.primary,
+                  backgroundColor: Colors.white,
+                  side: BorderSide(
+                    color: _team == t ? AppTheme.primary : Colors.black26,
+                    width: 1.2,
+                  ),
+                  showCheckmark: false,
                   onSelected: (_) {
                     setState(() => _team = t);
                     _reload();
                   },
                 ),
               ),
-            const SizedBox(width: 8),
+            const Spacer(),
             PopupMenuButton<String>(
               tooltip: 'CSV tools',
               icon: const Icon(Icons.more_vert_rounded),
@@ -283,30 +297,31 @@ class _AliasManagerTabState extends State<AliasManagerTab> {
                 ),
               ],
             ),
-            const SizedBox(width: 4),
-            Expanded(
-              child: SegmentedButton<_View>(
-                segments: const [
-                  ButtonSegment<_View>(
-                    value: _View.products,
-                    label: Text('Product aliases'),
-                    icon: Icon(Icons.inventory_2_rounded, size: 16),
-                  ),
-                  ButtonSegment<_View>(
-                    value: _View.customers,
-                    label: Text('Customer aliases'),
-                    icon: Icon(Icons.person_rounded, size: 16),
-                  ),
-                ],
-                selected: {_view},
-                showSelectedIcon: false,
-                onSelectionChanged: (s) {
-                  setState(() => _view = s.first);
-                  _reload();
-                },
-              ),
-            ),
           ]),
+          const SizedBox(height: 8),
+          SizedBox(
+            width: double.infinity,
+            child: SegmentedButton<_View>(
+              segments: const [
+                ButtonSegment<_View>(
+                  value: _View.products,
+                  label: Text('Products'),
+                  icon: Icon(Icons.inventory_2_rounded, size: 16),
+                ),
+                ButtonSegment<_View>(
+                  value: _View.customers,
+                  label: Text('Customers'),
+                  icon: Icon(Icons.person_rounded, size: 16),
+                ),
+              ],
+              selected: {_view},
+              showSelectedIcon: false,
+              onSelectionChanged: (s) {
+                setState(() => _view = s.first);
+                _reload();
+              },
+            ),
+          ),
           const SizedBox(height: 10),
           TextField(
             controller: _searchCtl,

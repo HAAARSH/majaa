@@ -264,8 +264,8 @@ class _CategoryManagementDialogState extends State<CategoryManagementDialog> {
         }
         // Delete products
         await client.from('products').delete().eq('category', cat.name).eq('team_id', AuthService.currentTeam);
-        // Delete category
-        await client.from('product_categories').delete().eq('id', catId);
+        // Delete category + cascade user_brand_access (shared path with single-delete)
+        await SupabaseService.instance.deleteProductCategory(catId);
       }
       _selectedIds.clear();
       final updated = await SupabaseService.instance.getAllProductCategories();

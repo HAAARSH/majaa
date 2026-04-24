@@ -621,12 +621,27 @@ class _AdminProductsTabState extends State<AdminProductsTab>
                                       _loadProducts(forceRefresh: true);
                                     }
                                   });
+                                  // When isEdit and the live refetch returned
+                                  // null (RLS, team_id mismatch, network),
+                                  // the DB succeeded but the on-screen row
+                                  // would go stale. Tell the admin rather
+                                  // than showing a misleading green "Product
+                                  // updated!" with an unchanged badge.
+                                  final refreshFailed =
+                                      isEdit && updatedProduct == null;
                                   messenger.showSnackBar(
                                     SnackBar(
-                                      content: Text(isEdit
-                                          ? 'Product updated!'
-                                          : 'Product added!'),
-                                      backgroundColor: Colors.green,
+                                      content: Text(
+                                        refreshFailed
+                                            ? 'Saved, but list refresh failed '
+                                                '— pull to refresh to see the change.'
+                                            : (isEdit
+                                                ? 'Product updated!'
+                                                : 'Product added!'),
+                                      ),
+                                      backgroundColor: refreshFailed
+                                          ? Colors.orange.shade800
+                                          : Colors.green,
                                     ),
                                   );
                                 } catch (e) {

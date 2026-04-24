@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:fluttertoast/fluttertoast.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:sizer/sizer.dart';
 
 import '../../../core/pricing.dart';
+import '../../../core/search_utils.dart';
 import '../../../services/billing_rules_service.dart';
 import '../../../services/supabase_service.dart';
 import '../../../theme/app_theme.dart';
@@ -637,135 +639,241 @@ class _AdminRulesTabState extends State<AdminRulesTab>
   }
 
   /// Editor for a JSON string list — today used only for
-  /// no_merge_customer_ids. Renders current IDs as removable chips, with
-  /// a picker at the bottom to add more from the team's customer roster.
+  /// no_merge_customer_ids. Full-screen-ish Dialog: scrollable chip wrap
+  /// for current selections on top, tokenized search + full paginated
+  /// roster below with tap-to-toggle.
   Future<void> _editStringList(Map<String, dynamic> rule) async {
     final current = List<String>.from(
         (rule['value'] as List).map((e) => e.toString()));
     final scopeTeam = rule['scope_id']?.toString();
     final reasonCtrl = TextEditingController();
+    final pickerCtrl = TextEditingController();
 
-    // Load the team's customer roster for the autocomplete.
     List<CustomerModel> roster;
     try {
       final all = await SupabaseService.instance.getCustomers();
       roster = scopeTeam == null
-          ? all
+          ? all.toList()
           : all.where((c) => c.belongsToTeam(scopeTeam)).toList();
+      roster.sort((a, b) =>
+          a.name.toLowerCase().compareTo(b.name.toLowerCase()));
     } catch (e) {
       roster = const [];
     }
     if (!mounted) return;
 
+    String nameFor(String id) {
+      final hit = roster.firstWhere(
+        (c) => c.id == id,
+        orElse: () => const CustomerModel(
+            id: '', name: '', address: '', phone: '',
+            type: '', lastOrderValue: 0),
+      );
+      return hit.name.isEmpty ? id : hit.name;
+    }
+
     final result = await showDialog<List<String>>(
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setS) {
-          final pickerCtrl = TextEditingController();
-          final query = pickerCtrl.text.trim().toLowerCase();
+          final query = pickerCtrl.text.trim();
           final matches = query.isEmpty
-              ? roster.take(8).toList()
-              : roster.where((c) =>
-                  c.name.toLowerCase().contains(query) ||
-                  c.phone.contains(query) ||
-                  c.id.contains(query))
-                .take(20).toList();
-          return AlertDialog(
-            title: Text('Edit ${_humanRuleKey(rule['rule_key'] as String)} '
-                '${scopeTeam != null ? "· $scopeTeam" : ""}',
-                style: GoogleFonts.manrope(fontWeight: FontWeight.w800)),
-            content: SizedBox(
-              width: double.maxFinite,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  if (rule['description'] != null)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 10),
-                      child: Text(rule['description'] as String,
-                          style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
-                    ),
-                  Text('Current list (${current.length}):',
-                      style: GoogleFonts.manrope(fontSize: 11, fontWeight: FontWeight.w700)),
-                  const SizedBox(height: 6),
-                  if (current.isEmpty)
-                    Text('(empty — no customers excluded from merge)',
+              ? roster
+              : roster
+                  .where((c) => tokenMatch(query, [c.name, c.phone, c.id]))
+                  .toList();
+
+          void toggle(String id) {
+            setS(() {
+              if (current.contains(id)) {
+                current.remove(id);
+              } else {
+                current.add(id);
+              }
+            });
+          }
+
+          return Dialog(
+            insetPadding:
+                const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
+            shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(16)),
+            child: ConstrainedBox(
+              constraints: BoxConstraints(maxWidth: 600, maxHeight: 80.h),
+              child: SizedBox(
+                width: 90.w,
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Edit ${_humanRuleKey(rule['rule_key'] as String)}'
+                        '${scopeTeam != null ? " · $scopeTeam" : ""}',
                         style: GoogleFonts.manrope(
-                            fontSize: 11, color: AppTheme.onSurfaceVariant, fontStyle: FontStyle.italic))
-                  else
-                    Wrap(spacing: 6, runSpacing: 6, children: [
-                      for (final id in current)
-                        InputChip(
-                          label: Text(
-                            roster.firstWhere(
-                                  (c) => c.id == id,
-                                  orElse: () => const CustomerModel(
-                                      id: '', name: '', address: '', phone: '',
-                                      type: '', lastOrderValue: 0),
-                                ).name.isEmpty
-                                ? id
-                                : roster.firstWhere((c) => c.id == id).name,
-                            style: GoogleFonts.manrope(fontSize: 11),
+                            fontSize: 14, fontWeight: FontWeight.w800),
+                      ),
+                      if (rule['description'] != null) ...[
+                        const SizedBox(height: 6),
+                        Text(rule['description'] as String,
+                            style: GoogleFonts.manrope(
+                                fontSize: 11,
+                                color: AppTheme.onSurfaceVariant)),
+                      ],
+                      const SizedBox(height: 12),
+                      Text('Current list (${current.length}):',
+                          style: GoogleFonts.manrope(
+                              fontSize: 11, fontWeight: FontWeight.w700)),
+                      const SizedBox(height: 6),
+                      if (current.isEmpty)
+                        Text('(empty — no customers excluded from merge)',
+                            style: GoogleFonts.manrope(
+                                fontSize: 11,
+                                color: AppTheme.onSurfaceVariant,
+                                fontStyle: FontStyle.italic))
+                      else
+                        ConstrainedBox(
+                          constraints: const BoxConstraints(maxHeight: 96),
+                          child: SingleChildScrollView(
+                            child: Wrap(spacing: 6, runSpacing: 6, children: [
+                              for (final id in current)
+                                InputChip(
+                                  label: Text(
+                                    nameFor(id),
+                                    style:
+                                        GoogleFonts.manrope(fontSize: 11),
+                                  ),
+                                  onDeleted: () =>
+                                      setS(() => current.remove(id)),
+                                ),
+                            ]),
                           ),
-                          onDeleted: () => setS(() => current.remove(id)),
                         ),
-                    ]),
-                  const Divider(height: 24),
-                  Text('Add a customer:',
-                      style: GoogleFonts.manrope(fontSize: 11, fontWeight: FontWeight.w700)),
-                  const SizedBox(height: 4),
-                  TextField(
-                    controller: pickerCtrl,
-                    onChanged: (_) => setS(() {}),
-                    decoration: InputDecoration(
-                      hintText: 'Search name / phone / id',
-                      prefixIcon: const Icon(Icons.search_rounded, size: 16),
-                      isDense: true,
-                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
-                    ),
-                  ),
-                  const SizedBox(height: 6),
-                  ConstrainedBox(
-                    constraints: const BoxConstraints(maxHeight: 180),
-                    child: ListView(shrinkWrap: true, children: [
-                      for (final c in matches)
-                        ListTile(
-                          dense: true,
-                          title: Text(c.name, style: GoogleFonts.manrope(fontSize: 12)),
-                          subtitle: Text('${c.phone}  ·  ${c.id}',
-                              style: GoogleFonts.manrope(fontSize: 10, color: AppTheme.onSurfaceVariant)),
-                          trailing: current.contains(c.id)
-                              ? const Icon(Icons.check, color: Colors.green, size: 18)
-                              : const Icon(Icons.add_circle_outline, size: 18),
-                          onTap: current.contains(c.id)
+                      const Divider(height: 24),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Text('Tap to add or remove',
+                                style: GoogleFonts.manrope(
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w700)),
+                          ),
+                          Text(
+                            'Showing ${matches.length} of ${roster.length} · ${current.length} selected',
+                            style: GoogleFonts.manrope(
+                                fontSize: 10,
+                                color: AppTheme.onSurfaceVariant),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 6),
+                      TextField(
+                        controller: pickerCtrl,
+                        onChanged: (_) => setS(() {}),
+                        decoration: InputDecoration(
+                          hintText: 'Search name / phone / id',
+                          prefixIcon:
+                              const Icon(Icons.search_rounded, size: 16),
+                          suffixIcon: query.isEmpty
                               ? null
-                              : () => setS(() => current.add(c.id)),
+                              : IconButton(
+                                  icon: const Icon(Icons.close_rounded,
+                                      size: 16),
+                                  onPressed: () {
+                                    pickerCtrl.clear();
+                                    setS(() {});
+                                  },
+                                ),
+                          isDense: true,
+                          border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(8)),
                         ),
-                      if (matches.isEmpty)
-                        Padding(
-                          padding: const EdgeInsets.all(8),
-                          child: Text('No matches',
-                              style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant)),
+                      ),
+                      const SizedBox(height: 6),
+                      Expanded(
+                        child: roster.isEmpty
+                            ? Center(
+                                child: Text(
+                                  scopeTeam == null
+                                      ? 'No customers found.'
+                                      : 'No customers on team $scopeTeam.',
+                                  style: GoogleFonts.manrope(
+                                      fontSize: 11,
+                                      color: AppTheme.onSurfaceVariant),
+                                ),
+                              )
+                            : matches.isEmpty
+                                ? Center(
+                                    child: Text('No matches for "$query"',
+                                        style: GoogleFonts.manrope(
+                                            fontSize: 11,
+                                            color:
+                                                AppTheme.onSurfaceVariant)),
+                                  )
+                                : Scrollbar(
+                                    child: ListView.builder(
+                                      itemCount: matches.length,
+                                      itemBuilder: (_, i) {
+                                        final c = matches[i];
+                                        final selected =
+                                            current.contains(c.id);
+                                        return ListTile(
+                                          dense: true,
+                                          title: Text(c.name,
+                                              style: GoogleFonts.manrope(
+                                                  fontSize: 12)),
+                                          subtitle: Text(
+                                              '${c.phone}  ·  ${c.id}',
+                                              style: GoogleFonts.manrope(
+                                                  fontSize: 10,
+                                                  color: AppTheme
+                                                      .onSurfaceVariant)),
+                                          trailing: Icon(
+                                            selected
+                                                ? Icons.check_circle
+                                                : Icons.add_circle_outline,
+                                            color: selected
+                                                ? Colors.green
+                                                : null,
+                                            size: 20,
+                                          ),
+                                          onTap: () => toggle(c.id),
+                                        );
+                                      },
+                                    ),
+                                  ),
+                      ),
+                      const SizedBox(height: 10),
+                      TextField(
+                        controller: reasonCtrl,
+                        maxLines: 2,
+                        decoration: InputDecoration(
+                          labelText:
+                              'Reason (optional, stored in audit log)',
+                          border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(8)),
                         ),
-                    ]),
+                      ),
+                      const SizedBox(height: 12),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.end,
+                        children: [
+                          TextButton(
+                              onPressed: () => Navigator.pop(ctx),
+                              child: const Text('Cancel')),
+                          const SizedBox(width: 8),
+                          FilledButton(
+                            onPressed: () => Navigator.pop(ctx, current),
+                            child: const Text('Save'),
+                          ),
+                        ],
+                      ),
+                    ],
                   ),
-                  const SizedBox(height: 10),
-                  TextField(
-                    controller: reasonCtrl,
-                    maxLines: 2,
-                    decoration: InputDecoration(
-                      labelText: 'Reason (optional, stored in audit log)',
-                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
-                    ),
-                  ),
-                ],
+                ),
               ),
             ),
-            actions: [
-              TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
-              FilledButton(onPressed: () => Navigator.pop(ctx, current), child: const Text('Save')),
-            ],
           );
         },
       ),

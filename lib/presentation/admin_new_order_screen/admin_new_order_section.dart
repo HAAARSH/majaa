@@ -28,10 +28,10 @@ class AdminNewOrderSection extends StatelessWidget {
           icon: Icons.edit_rounded,
           child: ManualOrderTab(isSuperAdmin: isSuperAdmin),
         ),
-        const AdminSectionItem(
+        AdminSectionItem(
           label: 'Smart Import',
           icon: Icons.auto_awesome_rounded,
-          child: SmartImportTab(),
+          child: SmartImportTab(isSuperAdmin: isSuperAdmin),
         ),
         const AdminSectionItem(
           label: 'Aliases',

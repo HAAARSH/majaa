@@ -23,6 +23,11 @@ class DriveSyncService {
   static String? _maFolderId;
   static String? _dataUploadFolderId;
 
+  // Web-only: admin picks the CSV upload folder at runtime instead of shipping
+  // DRIVE_FOLDER_DATA_UPLOAD in the web bundle. Persisted in Hive app_settings.
+  static const String _webUploadFolderKey = 'web_drive_upload_folder_id';
+  static String? _webUploadFolderOverride;
+
   static Future<void> _ensureFolderIds() async {
     if (_jaFolderId != null) return;
     try {
@@ -35,11 +40,48 @@ class DriveSyncService {
       _jaFolderId = 'PLACEHOLDER_JA';
       _maFolderId = 'PLACEHOLDER_MA';
     }
+    if (kIsWeb) {
+      try {
+        final box = Hive.isBoxOpen('app_settings')
+            ? Hive.box('app_settings')
+            : await Hive.openBox('app_settings');
+        final stored = box.get(_webUploadFolderKey) as String?;
+        if (stored != null && stored.isNotEmpty) _webUploadFolderOverride = stored;
+      } catch (_) {}
+    }
   }
 
   static String get jaFolderId => _jaFolderId ?? 'PLACEHOLDER_JA';
   static String get maFolderId => _maFolderId ?? 'PLACEHOLDER_MA';
-  static String? get dataUploadFolderId => _dataUploadFolderId;
+
+  /// On mobile, returns the bundled env.json folder. On web, returns the
+  /// folder ID the admin picked at runtime (null if not yet set — callers
+  /// must prompt the admin to choose a Drive folder to upload CSVs into).
+  static String? get dataUploadFolderId =>
+      kIsWeb ? _webUploadFolderOverride : _dataUploadFolderId;
+
+  /// Web-only: last-picked upload folder. Null if admin hasn't set one yet.
+  static String? get webUploadFolderId => _webUploadFolderOverride;
+
+  /// Web-only: persist the admin-chosen upload folder ID. Pass null/empty to
+  /// clear. Accepts either a bare folder ID or a Drive folders URL — the
+  /// caller is responsible for extracting the ID before calling this.
+  static Future<void> setWebUploadFolderId(String? id) async {
+    final clean = (id ?? '').trim();
+    _webUploadFolderOverride = clean.isEmpty ? null : clean;
+    try {
+      final box = Hive.isBoxOpen('app_settings')
+          ? Hive.box('app_settings')
+          : await Hive.openBox('app_settings');
+      if (_webUploadFolderOverride == null) {
+        await box.delete(_webUploadFolderKey);
+      } else {
+        await box.put(_webUploadFolderKey, _webUploadFolderOverride!);
+      }
+    } catch (e) {
+      debugPrint('setWebUploadFolderId persist failed: $e');
+    }
+  }
 
   static const String _failuresBoxName = 'drive_sync_failures';
   static const int _maxRetries = 5;
@@ -836,6 +878,7 @@ class DriveSyncService {
       // Same product can appear in both JA and MA files with different stock/MRP
       // Key: "itemName_lower|company_lower" to keep per-company separation
       final Map<String, List<Map<String, dynamic>>> allRows = {};
+      int parseSkipped = 0;
       for (final file in itmrpFiles) {
         debugPrint('📄 StockSync: Processing ${file['name']}');
         final csvContent = await _downloadFile(headers, file['id']!);
@@ -844,8 +887,11 @@ class DriveSyncService {
           continue;
         }
 
+        // Strip CRLF before parse — Windows \r\n + quoted field with embedded
+        // comma (e.g. multi-phone "7300957028, 7078734158") confuses the
+        // CSV state machine and drops every subsequent row. See v1.2.5 memo.
         final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false)
-            .convert(csvContent);
+            .convert(csvContent.replaceAll('\r\n', '\n').replaceAll('\r', '\n'));
         if (rows.isEmpty) continue;
 
         // Parse dBASE headers
@@ -871,7 +917,16 @@ class DriveSyncService {
           if (row.length <= itemNameIdx || row.length <= cfQtyIdx) continue;
           final itemName = row[itemNameIdx].toString().trim();
           if (itemName.isEmpty) continue;
-          final cfQty = int.tryParse(row[cfQtyIdx].toString().trim().split('.').first) ?? 0;
+          // Unparseable CFQUANTITY must not default to 0 — that would
+          // silently zero the product's real stock on a CSV glitch. Skip
+          // the row so the DB value survives; legitimate "0" still parses.
+          final cfQtyRaw = row[cfQtyIdx].toString().trim();
+          final cfQty = int.tryParse(cfQtyRaw.split('.').first);
+          if (cfQty == null) {
+            parseSkipped++;
+            debugPrint('⚠️ StockSync: ${file['name']} "$itemName" unparseable CFQUANTITY="$cfQtyRaw" — skipped (preserving DB stock)');
+            continue;
+          }
           double? mrp;
           if (mrpIdx >= 0 && row.length > mrpIdx) {
             mrp = double.tryParse(row[mrpIdx].toString().trim());
@@ -1069,12 +1124,13 @@ class DriveSyncService {
         priceChanges: priceChanges,
         mrpUpdated: mrpUpdated,
         mrpCapWarnings: mrpCapWarnings,
+        parseSkipped: parseSkipped,
       );
       lastStockSyncResult = result;
       debugPrint('✅ StockSync: Done — ${result.matched} matched, $updated updated, '
           '$mrpUpdated MRP updated, ${unmatched.length} unmatched, '
           '${newProducts.length} new products, ${priceChanges.length} price changes pending, '
-          '${mrpCapWarnings.length} MRP-cap warnings');
+          '${mrpCapWarnings.length} MRP-cap warnings, $parseSkipped rows skipped (bad qty)');
       return result;
     } catch (e) {
       debugPrint('❌ StockSync error: $e');
@@ -1268,8 +1324,11 @@ class DriveSyncService {
         final csvContent = await _downloadFile(headers, file['id']!);
         if (csvContent == null || csvContent.isEmpty) continue;
 
+        // Strip CRLF before parse — quoted multi-phone fields in ACMAST
+        // (e.g. "7300957028, 7078734158") break the CSV parser and silently
+        // drop rows. Missed by the v1.2.5 sweep due to multi-line form.
         final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false)
-            .convert(csvContent);
+            .convert(csvContent.replaceAll('\r\n', '\n').replaceAll('\r', '\n'));
         if (rows.isEmpty) continue;
 
         final rawHeaders = rows.first.map((h) {
@@ -3985,6 +4044,11 @@ class StockSyncResult {
   /// { itemName, company, mrp, rate, capped_to, qty }
   final List<Map<String, dynamic>> mrpCapWarnings;
 
+  /// Rows dropped because CFQUANTITY was unparseable. These rows were NOT
+  /// written to the DB — existing stock is preserved. Admin sees the count
+  /// in the sync summary so a degrading source CSV can be caught early.
+  final int parseSkipped;
+
   StockSyncResult({
     this.matched = 0,
     this.unmatched = 0,
@@ -3996,6 +4060,7 @@ class StockSyncResult {
     this.priceChanges = const [],
     this.mrpUpdated = 0,
     this.mrpCapWarnings = const [],
+    this.parseSkipped = 0,
   });
 
   bool get hasError => error != null;

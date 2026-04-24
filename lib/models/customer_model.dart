@@ -269,6 +269,24 @@ class CustomerModel {
   String? effectiveOrderBeatIdForTeam(String team) =>
       _profile?.orderBeatIdFor(team) ?? _profile?.beatIdFor(team);
 
+  /// The beat NAME this order must be tagged with. Admin's manual
+  /// ordering-beat override for [team] wins when set — compulsory
+  /// app-wide. Falls back to [repBeat] (rep's currently-selected route),
+  /// then the primary ACMAST beat, then [editingFallback]. Returns ''
+  /// when nothing is available; callers should reject the save.
+  String resolvedOrderBeatNameForTeam(
+    String team, {
+    String repBeat = '',
+    String editingFallback = '',
+  }) {
+    final override = _profile?.orderBeatNameFor(team) ?? '';
+    if (override.isNotEmpty) return override;
+    if (repBeat.isNotEmpty) return repBeat;
+    final primary = _profile?.beatNameFor(team) ?? '';
+    if (primary.isNotEmpty) return primary;
+    return editingFallback;
+  }
+
   /// True if admin has explicitly set a different ordering beat for this
   /// team. Used by the customer list + beat counters to know the customer
   /// should appear under two different beats (primary for collection,

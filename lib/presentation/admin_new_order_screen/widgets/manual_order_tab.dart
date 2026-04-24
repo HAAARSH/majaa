@@ -129,13 +129,17 @@ class _ManualOrderTabState extends State<ManualOrderTab> {
 
     final orderId = _generateOrderId();
     final itemsJson = _lines.map((l) => l.toJson(orderId)).toList();
+    final resolvedBeatName = _selectedCustomer!.resolvedOrderBeatNameForTeam(
+      _team,
+      repBeat: _selectedBeat?.beatName ?? '',
+    );
 
     try {
       await SupabaseService.instance.createOrder(
         orderId: orderId,
         customerId: _selectedCustomer!.id,
         customerName: _selectedCustomer!.name,
-        beat: _selectedBeat?.beatName ?? '',
+        beat: resolvedBeatName,
         deliveryDate: _deliveryDate,
         subtotal: _subtotal,
         vat: _gstTotal,
@@ -159,7 +163,7 @@ class _ManualOrderTabState extends State<ManualOrderTab> {
           'order_id': orderId,
           'customer_id': _selectedCustomer!.id,
           'customer_name': _selectedCustomer!.name,
-          'beat': _selectedBeat?.beatName ?? '',
+          'beat': resolvedBeatName,
           'is_out_of_beat': false,
           'delivery_date': _deliveryDate.toIso8601String(),
           'subtotal': _subtotal,
@@ -284,11 +288,13 @@ class _ManualOrderTabState extends State<ManualOrderTab> {
           for (final t in ['JA', 'MA'])
             Padding(
               padding: const EdgeInsets.only(right: 8),
-              child: ChoiceChip(
-                label: Text(t == 'JA' ? 'Jagannath' : 'Madhav',
-                    style: GoogleFonts.manrope(fontWeight: FontWeight.w700)),
+              child: _TeamChoice(
+                label: t == 'JA' ? 'Jagannath' : 'Madhav',
+                color: t == 'JA'
+                    ? const Color(0xFF1D4ED8)
+                    : const Color(0xFFC2410C),
                 selected: _team == t,
-                onSelected: (_) => _onTeamChanged(t),
+                onTap: () => _onTeamChanged(t),
               ),
             ),
         ]),
@@ -875,5 +881,46 @@ class _CartLine {
       m['free_qty'] = freeQty;
     }
     return m;
+  }
+}
+
+class _TeamChoice extends StatelessWidget {
+  final String label;
+  final Color color;
+  final bool selected;
+  final VoidCallback onTap;
+
+  const _TeamChoice({
+    required this.label,
+    required this.color,
+    required this.selected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 180),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+        decoration: BoxDecoration(
+          color: selected ? color : color.withValues(alpha: 0.10),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(
+            color: selected ? color : color.withValues(alpha: 0.40),
+            width: selected ? 1.5 : 1,
+          ),
+        ),
+        child: Text(
+          label,
+          style: GoogleFonts.manrope(
+            fontSize: 13,
+            fontWeight: FontWeight.w700,
+            color: selected ? Colors.white : color,
+          ),
+        ),
+      ),
+    );
   }
 }

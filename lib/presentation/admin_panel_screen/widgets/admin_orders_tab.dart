@@ -295,12 +295,6 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
     // map is null or missing an entry, the order is treated as sales_rep
     // (safe default — never merges).
     Map<String, String>? userRoleMap,
-    // Phase D guard: customer → acc_code lookup for the CSV's team. When
-    // provided, orders for customers with NO acc_code in [csvTeamId] are
-    // skipped — their invoice would land in a billing system that doesn't
-    // recognize the customer. Without this, a JA-only customer's brand_rep
-    // orders could produce a merged MA invoice that DUA Clipper can't match.
-    Map<String, String>? customerAccCodeForCsvTeam,
     // Phase E: mutable sink the builder appends to for each order_items.id
     // that lands in this CSV (including every source id of a merged
     // brand_rep row). Ids are captured here at build time and persisted
@@ -353,22 +347,7 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
       return false;
     }
 
-    // Phase D guard: customer must have an acc_code for the CSV's team.
-    // A missing or blank acc_code means this team's billing software does
-    // not know the customer — writing an invoice row for them would either
-    // fail the import or silently create a ghost customer in DUA Clipper.
-    // Applied at order level (not item level) so partial orders don't
-    // leak through.
-    bool customerInvoiceableHere(OrderModel o) {
-      if (customerAccCodeForCsvTeam == null) return true; // guard inactive
-      final cid = o.customerId;
-      if (cid == null || cid.isEmpty) return true; // can't verify → keep
-      final code = customerAccCodeForCsvTeam[cid];
-      return code != null && code.trim().isNotEmpty;
-    }
-
     List<OrderItemModel> eligibleItemsOf(OrderModel o) {
-      if (!customerInvoiceableHere(o)) return const [];
       return scoped
           ? o.lineItems.where((i) => itemBelongsToTeam(i, o.customerId)).toList()
           : o.lineItems.toList();
@@ -943,10 +922,10 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
     }
 
     // ─── Step 7.5: customer acc_code lookups per team. ──────────────────
-    // Customers missing acc_code for a team's billing software are skipped
-    // from that team's CSV — DUA Clipper would either fail the import or
-    // silently create a ghost customer. Applied uniformly across sales_rep
-    // and brand_rep (merged) orders so nothing leaks through.
+    // The exported CSV has no acc_code column — DUA Clipper matches by
+    // customer name. We still count customers whose acc_code_<team> field
+    // is blank so admins can cross-check those customers exist in the
+    // team's DUA before importing. No orders are skipped based on this.
     final allCustomers = await _service.getCustomers();
     final jaAccCodeByCustomer = <String, String>{};
     final maAccCodeByCustomer = <String, String>{};
@@ -957,36 +936,35 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
       if (ma != null && ma.trim().isNotEmpty) maAccCodeByCustomer[c.id] = ma;
     }
 
-    bool customerInvoiceableInTeam(String? customerId, String team) {
+    bool customerHasAccCodeInTeam(String? customerId, String team) {
       if (customerId == null || customerId.isEmpty) return true;
       final m = team == 'JA' ? jaAccCodeByCustomer : maAccCodeByCustomer;
       return m.containsKey(customerId);
     }
 
     // ─── Step 8: compute per-team bucket stats for the summary ──────────
-    // An order counts for team X's CSV when (a) it has at least one line
-    // that routes to X after OI override (Phase C) AND (b) the customer
-    // has an acc_code in X (Phase D guard). Cross-team = order booked by
-    // the OTHER team but landing in this team's file.
+    // An order counts for team X's CSV when it has at least one line that
+    // routes to X after OI override (Phase C). Cross-team = order booked
+    // by the OTHER team but landing in this team's file. Orders for
+    // customers without acc_code_<team> still export — that count is
+    // surfaced as an informational note.
     int jaOrderCount = 0, jaCrossCount = 0;
     int maOrderCount = 0, maCrossCount = 0;
-    int jaSkippedNoAcc = 0, maSkippedNoAcc = 0;
+    int jaMissingAcc = 0, maMissingAcc = 0;
     for (final o in beatFilteredOrders) {
-      final jaAcc = customerInvoiceableInTeam(o.customerId, 'JA');
-      final maAcc = customerInvoiceableInTeam(o.customerId, 'MA');
+      final jaAcc = customerHasAccCodeInTeam(o.customerId, 'JA');
+      final maAcc = customerHasAccCodeInTeam(o.customerId, 'MA');
       final hasJaLine = o.lineItems.any((it) => _itemRoutesToTeam(
             it, o.customerId, 'JA', jaProducts, organicIndiaKeys, organicIndiaRouting));
       final hasMaLine = o.lineItems.any((it) => _itemRoutesToTeam(
             it, o.customerId, 'MA', maProducts, organicIndiaKeys, organicIndiaRouting));
-      final hasJa = hasJaLine && jaAcc;
-      final hasMa = hasMaLine && maAcc;
-      if (hasJaLine && !jaAcc) jaSkippedNoAcc++;
-      if (hasMaLine && !maAcc) maSkippedNoAcc++;
-      if (hasJa) {
+      if (hasJaLine && !jaAcc) jaMissingAcc++;
+      if (hasMaLine && !maAcc) maMissingAcc++;
+      if (hasJaLine) {
         jaOrderCount++;
         if (o.teamId != 'JA') jaCrossCount++;
       }
-      if (hasMa) {
+      if (hasMaLine) {
         maOrderCount++;
         if (o.teamId != 'MA') maCrossCount++;
       }
@@ -1029,10 +1007,10 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
                               '${jaCrossCount > 0 ? ' (incl. $jaCrossCount cross-team from MA reps)' : ''}',
                         style: GoogleFonts.manrope(fontSize: 12),
                       ),
-                      if (jaSkippedNoAcc > 0)
+                      if (jaMissingAcc > 0)
                         Text(
-                          '⚠ $jaSkippedNoAcc skipped — no JA acc_code on customer',
-                          style: GoogleFonts.manrope(fontSize: 11, color: Colors.orange.shade800),
+                          'ℹ $jaMissingAcc exported without JA acc_code — verify customer exists in JA DUA Clipper',
+                          style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant),
                         ),
                       Text(
                         'Starting invoice: ${jaPrefix != null ? '$jaPrefix$jaStart' : '(none)'}',
@@ -1060,10 +1038,10 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
                               '${maCrossCount > 0 ? ' (incl. $maCrossCount cross-team from JA reps)' : ''}',
                         style: GoogleFonts.manrope(fontSize: 12),
                       ),
-                      if (maSkippedNoAcc > 0)
+                      if (maMissingAcc > 0)
                         Text(
-                          '⚠ $maSkippedNoAcc skipped — no MA acc_code on customer',
-                          style: GoogleFonts.manrope(fontSize: 11, color: Colors.orange.shade800),
+                          'ℹ $maMissingAcc exported without MA acc_code — verify customer exists in MA DUA Clipper',
+                          style: GoogleFonts.manrope(fontSize: 11, color: AppTheme.onSurfaceVariant),
                         ),
                       Text(
                         'Starting invoice: ${maPrefix != null ? '$maPrefix$maStart' : '(none)'}',
@@ -1148,7 +1126,6 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
         organicIndiaRouting: organicIndiaRouting,
         csvTeamId: 'JA',
         userRoleMap: userRoleMap,
-        customerAccCodeForCsvTeam: jaAccCodeByCustomer,
         writtenLineItemIdsSink: jaLineSink,
         writtenOrderIdsSink: jaOrderSink,
         mergingStrategy: rulesSnapshot.mergingFor('JA'),
@@ -1177,7 +1154,6 @@ class _AdminOrdersTabState extends State<AdminOrdersTab> {
         organicIndiaRouting: organicIndiaRouting,
         csvTeamId: 'MA',
         userRoleMap: userRoleMap,
-        customerAccCodeForCsvTeam: maAccCodeByCustomer,
         writtenLineItemIdsSink: maLineSink,
         writtenOrderIdsSink: maOrderSink,
         mergingStrategy: rulesSnapshot.mergingFor('MA'),

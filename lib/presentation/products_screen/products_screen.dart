@@ -7,6 +7,7 @@ import '../../routes/app_routes.dart';
 import '../../services/supabase_service.dart';
 import '../../services/cart_service.dart';
 import '../../services/auth_service.dart';
+import '../../services/billing_rules_service.dart';
 import '../../theme/app_theme.dart';
 import './widgets/cart_fab_widget.dart';
 import './widgets/category_filter_chips_widget.dart';
@@ -169,14 +170,21 @@ class _ProductsScreenState extends State<ProductsScreen>
   // uncategorized products on their route.
   bool get _isBrandRep => SupabaseService.instance.currentUserRole == 'brand_rep';
 
-  // Rep-visible lists. 2-day grace window (2026-04-23): zero-stock
-  // products stay VISIBLE even past the grace window — rep needs to
-  // know the product exists. Whether it's ADD-TO-CART-able is a
-  // separate check (ProductModel.isBillable) enforced at the detail
-  // screen and grid card. This getter name stayed `_inStockDisplayed`
-  // to minimise the diff — despite the name it now shows everything.
-  List<Product> get _inStockDisplayed => _displayedProducts;
-  List<Product> get _inStockSearchResults => _searchResults;
+  // Rep-visible lists. Filter by isBillable with the admin-tuned grace
+  // window from billing_rules.stock_zero_grace_days:
+  //   • grace = 0  → zero-stock products hidden entirely
+  //   • grace = N  → zero-stock shown only while within the N-day window
+  //                  (past-grace items drop off the rep list)
+  // Why: reps can't act on an unaddable product, so hiding it removes
+  // noise. Admin controls the tradeoff from the Rules Tab.
+  List<Product> get _inStockDisplayed {
+    final g = BillingRulesService.instance.stockZeroGraceDays;
+    return _displayedProducts.where((p) => p.isBillable(graceDays: g)).toList();
+  }
+  List<Product> get _inStockSearchResults {
+    final g = BillingRulesService.instance.stockZeroGraceDays;
+    return _searchResults.where((p) => p.isBillable(graceDays: g)).toList();
+  }
 
   // ─── Search query ───
   String _searchQuery = '';

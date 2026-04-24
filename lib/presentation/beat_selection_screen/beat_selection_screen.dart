@@ -1562,56 +1562,88 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen>
     );
   }
 
-  /// Unified Share / Print row on the Collections tab. One pair of buttons
-  /// regardless of whether any collections have been recorded yet:
-  /// - Empty collections  → today's outstanding (same layout as Next-Day-Due)
-  /// - Has collections     → overlay PDF with cash/UPI/cheque breakdown per bill
+  /// Share / Print buttons on the Collections tab.
+  /// - Outstanding row is ALWAYS visible (today's outstanding for the beat).
+  /// - Overlay row appears below it once any collection has been recorded
+  ///   (cash/UPI/cheque breakdown to re-feed onto the printed outstanding sheet).
   Widget _buildCollectionActionsRow() {
     final hasCollections = _todayCollections.isNotEmpty;
     return Padding(
       padding: const EdgeInsets.only(top: 8, bottom: 16),
-      child: Row(children: [
-        Expanded(
-          child: SizedBox(
-            height: 46,
-            child: FilledButton.icon(
-              onPressed: hasCollections
-                  ? _shareCollectionOverlay
-                  : () => _shareOutstandingReport(
-                        primaryBeatNames: _todayPrimaryBeatNames,
-                        crossTeamId: _todayCrossTeamId,
-                        crossBeatNames: _todayCrossBeatNames,
-                      ),
-              icon: const Icon(Icons.share_rounded, size: 16),
-              label: Text('Share', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700)),
-              style: FilledButton.styleFrom(
-                backgroundColor: Colors.green.shade700,
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      child: Column(children: [
+        Row(children: [
+          Expanded(
+            child: SizedBox(
+              height: 46,
+              child: FilledButton.icon(
+                onPressed: () => _shareOutstandingReport(
+                  primaryBeatNames: _todayPrimaryBeatNames,
+                  crossTeamId: _todayCrossTeamId,
+                  crossBeatNames: _todayCrossBeatNames,
+                ),
+                icon: const Icon(Icons.share_rounded, size: 16),
+                label: Text('Share Outstanding', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700)),
+                style: FilledButton.styleFrom(
+                  backgroundColor: Colors.green.shade700,
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                ),
               ),
             ),
           ),
-        ),
-        const SizedBox(width: 10),
-        Expanded(
-          child: SizedBox(
-            height: 46,
-            child: OutlinedButton.icon(
-              onPressed: hasCollections
-                  ? _printCollectionOverlay
-                  : () => _printOutstandingReport(
-                        primaryBeatNames: _todayPrimaryBeatNames,
-                        crossTeamId: _todayCrossTeamId,
-                        crossBeatNames: _todayCrossBeatNames,
-                      ),
-              icon: Icon(Icons.print_rounded, size: 16, color: AppTheme.primary),
-              label: Text('Print', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700, color: AppTheme.primary)),
-              style: OutlinedButton.styleFrom(
-                side: BorderSide(color: AppTheme.primary),
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          const SizedBox(width: 10),
+          Expanded(
+            child: SizedBox(
+              height: 46,
+              child: OutlinedButton.icon(
+                onPressed: () => _printOutstandingReport(
+                  primaryBeatNames: _todayPrimaryBeatNames,
+                  crossTeamId: _todayCrossTeamId,
+                  crossBeatNames: _todayCrossBeatNames,
+                ),
+                icon: Icon(Icons.print_rounded, size: 16, color: AppTheme.primary),
+                label: Text('Print Outstanding', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700, color: AppTheme.primary)),
+                style: OutlinedButton.styleFrom(
+                  side: BorderSide(color: AppTheme.primary),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                ),
               ),
             ),
           ),
-        ),
+        ]),
+        if (hasCollections) ...[
+          const SizedBox(height: 8),
+          Row(children: [
+            Expanded(
+              child: SizedBox(
+                height: 46,
+                child: FilledButton.icon(
+                  onPressed: _shareCollectionOverlay,
+                  icon: const Icon(Icons.share_rounded, size: 16),
+                  label: Text('Share Overlay', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700)),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: Colors.green.shade700,
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: SizedBox(
+                height: 46,
+                child: OutlinedButton.icon(
+                  onPressed: _printCollectionOverlay,
+                  icon: Icon(Icons.print_rounded, size: 16, color: AppTheme.primary),
+                  label: Text('Print Overlay', style: GoogleFonts.manrope(fontSize: 12, fontWeight: FontWeight.w700, color: AppTheme.primary)),
+                  style: OutlinedButton.styleFrom(
+                    side: BorderSide(color: AppTheme.primary),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                  ),
+                ),
+              ),
+            ),
+          ]),
+        ],
       ]),
     );
   }
