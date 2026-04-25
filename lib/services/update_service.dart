@@ -14,7 +14,14 @@ import '../theme/app_theme.dart';
 class UpdateService {
   static const _channel = MethodChannel('com.example.fmcgorders/apk_install');
 
+  // Prevents stacking a second "Update Available" dialog on top of an already-
+  // open one (e.g., when AppLifecycleState.resumed re-fires checkForUpdates
+  // while a download is in progress and the user pulls the notification shade
+  // or returns from the install-permission settings screen).
+  static bool _dialogVisible = false;
+
   static Future<void> checkForUpdates(BuildContext context) async {
+    if (_dialogVisible) return;
     try {
       final PackageInfo packageInfo = await PackageInfo.fromPlatform();
       final String currentVersion = packageInfo.version;
@@ -67,6 +74,7 @@ class UpdateService {
   }
 
   static void _showUpdateDialog(BuildContext context, String newVersion, String url, bool isMandatory) {
+    _dialogVisible = true;
     showDialog(
       context: context,
       barrierDismissible: !isMandatory,
@@ -78,7 +86,7 @@ class UpdateService {
           isMandatory: isMandatory,
         ),
       ),
-    );
+    ).whenComplete(() => _dialogVisible = false);
   }
 
   /// Download APK to internal ota_update/ directory and trigger install.
@@ -182,8 +190,13 @@ class UpdateService {
 
         onInstalling();
 
-        // Trigger Android install intent via method channel
-        await _channel.invokeMethod('installApk', {'filePath': file.path});
+        // Trigger Android install via PackageInstaller.Session. On Android 12+
+        // (API 31+) the second and later self-updates from this same source
+        // install silently with zero user taps; the first one still shows the
+        // system installer once. MainActivity calls finishAffinity() after
+        // session.commit, so the Flutter UI exits and only the installer (or
+        // nothing, on the silent path) remains.
+        await _channel.invokeMethod('installApkSession', {'filePath': file.path});
       } finally {
         client.close();
       }

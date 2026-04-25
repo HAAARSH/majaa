@@ -89,5 +89,16 @@
                 android:resource="@xml/filepaths" />
         </provider>
 
+        <!-- Receives PackageInstaller.Session.commit() callbacks: pending
+             user-action, install success, and install failure. Invoked via
+             a PendingIntent we hand to the system; not exposed to other apps. -->
+        <receiver
+            android:name=".InstallResultReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.example.fmcgorders.INSTALL_RESULT" />
+            </intent-filter>
+        </receiver>
+
     </application>
 </manifest>
