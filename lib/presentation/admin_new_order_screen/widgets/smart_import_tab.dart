@@ -3,6 +3,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:hive/hive.dart';
 
 import '../../../core/pricing.dart';
 import '../../../core/search_utils.dart';
@@ -635,6 +636,15 @@ class _SmartImportTabState extends State<SmartImportTab> {
       );
     }
 
+    // Force-refresh the products cache before resolution so every line is
+    // priced against the latest products row in Supabase. Without this, a
+    // stale Hive cache (e.g. desktop ran ITMRP but mobile didn't reopen
+    // the products list) would feed old unitPrice/mrp into l.toJson().
+    await SupabaseService.instance.getProducts(
+      teamId: _team,
+      forceRefresh: true,
+    );
+
     if (result.batch == null || result.batch!.orders.isEmpty) {
       a.status = _AttachmentStatus.error;
       a.parseError = result.reason;
@@ -1110,8 +1120,57 @@ class _SmartImportTabState extends State<SmartImportTab> {
   /// Save the CURRENT queue draft. On success, marks the queue entry
   /// saved and advances to the next reviewing draft. When the last draft
   /// finalizes, writes the per-attachment audit row and resets to compose.
+  /// Returns null when ITMRP sync is fresh (< 24h). Returns a human label
+  /// like "32h ago" or "never" when stale — used to block save with a
+  /// clear reason. Hive `last_itmrp_sync` is set by drive_sync_service
+  /// after every successful ITMRP push (drive_sync_service.dart:1112).
+  /// Stale rate × fresh CSDS = wrong invoice, so we hard-block here.
+  Future<String?> _itmrpStaleness() async {
+    try {
+      final box = Hive.isBoxOpen('app_settings')
+          ? Hive.box('app_settings')
+          : await Hive.openBox('app_settings');
+      final ts = box.get('last_itmrp_sync') as String?;
+      if (ts == null) return 'never';
+      final last = DateTime.tryParse(ts);
+      if (last == null) return 'never';
+      final age = DateTime.now().difference(last);
+      if (age.inHours < 24) return null;
+      final h = age.inHours;
+      final d = (h / 24).floor();
+      return d > 0 ? '${d}d ${h % 24}h ago' : '${h}h ago';
+    } catch (_) {
+      return 'never';
+    }
+  }
+
   Future<void> _save() async {
     if (!_canSave) return;
+    final stale = await _itmrpStaleness();
+    if (stale != null && mounted) {
+      await showDialog<void>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          icon: Icon(Icons.warning_amber_rounded,
+              color: Colors.red.shade700, size: 36),
+          title: const Text('ITMRP sync is stale'),
+          content: Text(
+            'Last ITMRP sync: $stale.\n\n'
+            'Smart Import stamps order rates from the products table. If '
+            "ITMRP hasn't been pushed since DUA bumped MRPs, every saved "
+            'order will use OLD rates. Run ITMRP sync from the Admin '
+            'panel before saving this import.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('OK'),
+            ),
+          ],
+        ),
+      );
+      return;
+    }
     _flushCurrentToQueue();
     setState(() => _submitting = true);
     final originalTeam = AuthService.currentTeam;
@@ -2099,7 +2158,8 @@ class _SmartImportTabState extends State<SmartImportTab> {
   }
 
   Future<void> _pickProductForLine(_ReviewLine line) async {
-    final products = await SupabaseService.instance.getProducts(teamId: _team);
+    final products = await SupabaseService.instance
+        .getProducts(teamId: _team, forceRefresh: true);
     if (!mounted) return;
     final picked = await showModalBottomSheet<ProductModel>(
       context: context,
