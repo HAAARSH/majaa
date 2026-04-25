@@ -6,6 +6,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **MAJAA Sales** — a Flutter B2B sales order management app for Madhav & Jagannath Associates. Supports iOS, Android, and Web. Backend is Supabase (PostgreSQL + Auth + Realtime).
 
+## Companion Desktop App
+
+A companion desktop app lives in a separate repository: <https://github.com/HAAARSH/majaa_desktop>. Both repos are owned by the `HAAARSH` GitHub account and share the same Supabase backend (so schema changes, RLS policies, and `team_id` filters must stay consistent across both).
+
+When you need to read or edit the desktop app, clone it as a sibling directory:
+
+```bash
+git clone https://github.com/HAAARSH/majaa_desktop.git ../majaa_desktop
+```
+
+Cross-repo work that touches Supabase tables, models, or auth flows should be reviewed against the desktop repo to avoid drift.
+
 ## Commands
 
 ### Flutter (primary app)
