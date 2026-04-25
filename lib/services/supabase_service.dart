@@ -52,23 +52,33 @@ class SupabaseService {
   String? _resolvedAppUserId; // cached resolved app_users.id
   void clearResolvedUserId() => _resolvedAppUserId = null;
 
-  /// Resolves auth UID to app_users.id (they may differ for early users)
+  /// Resolves auth UID to app_users.id (they may differ for early users).
+  ///
+  /// The cache is only populated/read when [authUid] matches the currently
+  /// signed-in auth user. Admin screens (Brand Access tab) loop through other
+  /// users' ids; if we cached/short-circuited on those, every subsequent
+  /// lookup would return the first user's id and brand counts would be wrong
+  /// for everyone but the first rep.
   Future<String> _resolveAppUserId(String authUid) async {
-    if (_resolvedAppUserId != null) return _resolvedAppUserId!;
+    final currentAuthUid = client.auth.currentUser?.id;
+    final isCurrent = authUid == currentAuthUid;
+    if (isCurrent && _resolvedAppUserId != null) return _resolvedAppUserId!;
     try {
-      // First try direct match
       final direct = await client.from('app_users').select('id').eq('id', authUid).maybeSingle();
       if (direct != null) {
-        _resolvedAppUserId = authUid;
+        if (isCurrent) _resolvedAppUserId = authUid;
         return authUid;
       }
-      // Fall back to email match
-      final email = client.auth.currentUser?.email;
-      if (email != null) {
-        final byEmail = await client.from('app_users').select('id').eq('email', email).maybeSingle();
-        if (byEmail == null) return authUid;
-        _resolvedAppUserId = byEmail['id'] as String;
-        return _resolvedAppUserId!;
+      // Email fallback only meaningful for the signed-in user (we don't have
+      // arbitrary other users' emails in this scope).
+      if (isCurrent) {
+        final email = client.auth.currentUser?.email;
+        if (email != null) {
+          final byEmail = await client.from('app_users').select('id').eq('email', email).maybeSingle();
+          if (byEmail == null) return authUid;
+          _resolvedAppUserId = byEmail['id'] as String;
+          return _resolvedAppUserId!;
+        }
       }
     } catch (e) {
       debugPrint('[_resolveAppUserId] error: $e');
