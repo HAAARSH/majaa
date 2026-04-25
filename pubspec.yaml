@@ -41,6 +41,7 @@ dependencies:
   google_generative_ai: ^0.4.0           # Phase 3: PDF parsing via Gemini SDK
   receive_sharing_intent: ^1.8.0         # Phase 5: Android WhatsApp share-intent
   crypto: ^3.0.0                         # Phase 2: SHA-256 of normalized input for dedup
+  flutter_secure_storage: ^9.2.2         # Login PIN: per-device email+password store (Keystore/Keychain)
 
 dev_dependencies:
   flutter_test:

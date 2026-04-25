@@ -7,7 +7,9 @@ import '../../routes/app_routes.dart';
 import '../../services/supabase_service.dart';
 import '../../services/session_service.dart';
 import '../../services/update_service.dart';
+import '../../services/login_pin_service.dart';
 import '../../theme/app_theme.dart';
+import '../../widgets/login_pin_dialog.dart';
 import './widgets/login_form_widget.dart';
 import '../../services/auth_service.dart';
 
@@ -36,8 +38,17 @@ class _LoginScreenState extends State<LoginScreen>
       return;
     }
     try {
-      final canResume = await AuthService.instance.attemptOfflineResume();
+      var canResume = await AuthService.instance.attemptOfflineResume();
       debugPrint('AutoResume: canResume=$canResume, mounted=$mounted');
+
+      // JWT refresh failed — try the per-user login PIN before falling back
+      // to the email/password screen. attemptPinRelogin returns false if no
+      // PIN is configured, the user taps Forgot PIN, or the dialog dismisses.
+      if (!canResume && mounted) {
+        canResume = await AuthService.instance.attemptPinRelogin(context);
+        debugPrint('AutoResume: pinRelogin canResume=$canResume');
+      }
+
       if (!canResume || !mounted) return;
 
       SessionService.instance.markActive();
@@ -211,6 +222,27 @@ class _LoginScreenState extends State<LoginScreen>
         TextInput.finishAutofillContext(); // Tell OS to save credentials
         SessionService.instance.markActive(); // Start 6-hour session timer
 
+        // Forced login-PIN setup on first sign-in for this user. Once a PIN
+        // is configured server-side, subsequent logins skip this dialog.
+        // If the user kills the app without setting a PIN, the next
+        // successful password login re-prompts — they're never locked out.
+        final hasPin = await LoginPinService.instance.hasPinSet(email);
+        if (!hasPin && mounted) {
+          final result = await showLoginPinDialog(
+            context,
+            mode: LoginPinDialogMode.setup,
+          );
+          if (result?.pin != null && result!.pin!.length == 4) {
+            try {
+              await LoginPinService.instance.setPin(result.pin!);
+            } catch (e) {
+              debugPrint('[LoginScreen] setPin failed: $e');
+              // Non-fatal — user can set PIN next session.
+            }
+          }
+          if (!mounted) return;
+        }
+
         // 2. Fetch the User Profile & Role for Routing
         final userData = await SupabaseService.instance.client
             .from('app_users')
@@ -228,6 +260,7 @@ class _LoginScreenState extends State<LoginScreen>
 
         // 3. --- ROLE-BASED ROUTING ---
         SupabaseService.instance.currentUserRole = role;
+        if (!mounted) return;
         if (role == 'admin' || role == 'super_admin') {
           Navigator.pushReplacementNamed(context, AppRoutes.adminPanelScreen,
               arguments: {'user': userModel});
