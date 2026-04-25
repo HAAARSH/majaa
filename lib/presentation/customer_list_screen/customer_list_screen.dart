@@ -136,25 +136,32 @@ class _CustomerListScreenState extends State<CustomerListScreen> {
           if (beatTeam != AuthService.currentTeam) {
             AuthService.currentTeam = beatTeam;
           }
-          _allCustomers = customers.where((c) {
-            final primary = c.beatIdForTeam(beatTeam);
-            final orderOverride = c.orderBeatIdOverrideForTeam(beatTeam);
-            // Appear on this beat's list if primary matches (collection context)
-            // OR the admin-set ordering override matches (order context).
-            return primary == _beat!.id ||
-                (orderOverride != null && orderOverride == _beat!.id);
-          }).toList();
+          // 2026-04-25 — Set-based dedup guard. The DB-level UNIQUE INDEX on
+          // LOWER(TRIM(name)) (migration 20260425000003) plus the desktop
+          // sync fix make duplicate customer rows impossible going forward,
+          // but render-time dedup is cheap and protects against a future
+          // sync-path regression silently double-listing a shop.
+          final seenIds = <String>{};
+          _allCustomers = [
+            for (final c in customers)
+              if ((c.beatIdForTeam(beatTeam) == _beat!.id ||
+                      c.orderBeatIdOverrideForTeam(beatTeam) == _beat!.id) &&
+                  seenIds.add(c.id))
+                c,
+          ];
         } else {
           // Normal beat mode: strictly filter to this beat — but include
           // customers whose ordering-beat override points here, so reps
           // working the route can place orders for them even if their
           // billing beat is elsewhere.
-          _allCustomers = customers.where((c) {
-            final primary = c.beatIdForTeam(AuthService.currentTeam);
-            final orderOverride = c.orderBeatIdOverrideForTeam(AuthService.currentTeam);
-            return primary == _beat!.id ||
-                (orderOverride != null && orderOverride == _beat!.id);
-          }).toList();
+          final seenIds = <String>{};
+          _allCustomers = [
+            for (final c in customers)
+              if ((c.beatIdForTeam(AuthService.currentTeam) == _beat!.id ||
+                      c.orderBeatIdOverrideForTeam(AuthService.currentTeam) == _beat!.id) &&
+                  seenIds.add(c.id))
+                c,
+          ];
         }
         _visitedIds = visitedIds;
         _applyFilters('');

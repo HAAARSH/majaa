@@ -172,18 +172,31 @@ class _BeatSelectionScreenState extends State<BeatSelectionScreen>
           // semantics — a customer with an ordering-beat override should
           // appear on BOTH beats' count so the rep knows to stop by on
           // whichever route they're running that day.
-          final orderContextCustomers = allCustomers.where((c) {
-            final primary = c.beatIdForTeam(beatTeam);
-            final orderOverride = c.orderBeatIdOverrideForTeam(beatTeam);
-            return primary == b.id ||
-                (orderOverride != null && orderOverride == b.id);
-          }).toList();
+          //
+          // 2026-04-25 — Set-based dedup by customer.id WITHIN a single
+          // beat's bucket. Cross-beat dupes (same customer on primary +
+          // override beats) are intentional per the OR semantics above.
+          // What we're guarding against is the same DB customer row
+          // appearing twice in `allCustomers` — which the desktop sync
+          // bug was producing. Even after the DB-level UNIQUE INDEX +
+          // desktop fix, this render-time guard prevents future sync
+          // regressions from inflating Total Outlets.
+          final seenIds = <String>{};
+          final orderContextCustomers = <CustomerModel>[
+            for (final c in allCustomers)
+              if ((c.beatIdForTeam(beatTeam) == b.id ||
+                      c.orderBeatIdOverrideForTeam(beatTeam) == b.id) &&
+                  seenIds.add(c.id))
+                c,
+          ];
           // Outstanding is a collection metric — use PRIMARY beat only
           // (ACMAST-synced billing address). Including order-override
           // customers would double-count their dues across beats.
-          final collectionCustomers = allCustomers
-              .where((c) => c.beatIdForTeam(beatTeam) == b.id)
-              .toList();
+          final seenCollectionIds = <String>{};
+          final collectionCustomers = <CustomerModel>[
+            for (final c in allCustomers)
+              if (c.beatIdForTeam(beatTeam) == b.id && seenCollectionIds.add(c.id)) c,
+          ];
           todayTotalMap[b.id] = orderContextCustomers.length;
           todayOrderMap[b.id] = orders
               .where((o) => o['beat_name'] == b.beatName)
