@@ -3427,7 +3427,7 @@ final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false).conv
 
         if (acCodeI < 0 || typeI < 0 || amtI < 0) continue;
 
-        int accepted = 0, skippedAcc = 0, skippedBadRow = 0;
+        int accepted = 0, skippedAcc = 0, skippedBadRow = 0, skippedNoDate = 0;
         for (int i = 1; i < rows.length; i++) {
           final row = rows[i];
           if (row.length <= acCodeI) { skippedBadRow++; continue; }
@@ -3440,6 +3440,13 @@ final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false).conv
           final amount = double.tryParse(_col(row, amtI)) ?? 0;
           if (amount == 0) continue;
 
+          // customer_ledger.entry_date is NOT NULL. Some DUA rows have
+          // empty/unparseable DATE — letting them through poisons the entire
+          // 100-row upsert chunk (Postgres rejects the whole batch on any
+          // constraint violation). Parity with desktop _syncLedger.
+          final entryDate = _parseDate(_col(row, dateI));
+          if (entryDate == null) { skippedNoDate++; continue; }
+
           final narr1 = _col(row, narr1I);
           final narr2 = _col(row, narr2I);
           final narration = [narr1, narr2].where((s) => s.isNotEmpty).join(' | ');
@@ -3448,7 +3455,7 @@ final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false).conv
             'customer_id': custId,
             'team_id': team,
             'acc_code': acCode,
-            'entry_date': _parseDate(_col(row, dateI)),
+            'entry_date': entryDate,
             'pass_date': _parseDate(_col(row, passDateI)),
             'book': _col(row, bookI),
             'bill_no': _col(row, billNoI),
@@ -3459,7 +3466,7 @@ final rows = const CsvToListConverter(eol: '\n', shouldParseNumbers: false).conv
           });
           accepted++;
         }
-        debugPrint('📊 LEDGER: $fileName — ${rows.length - 1} data rows → $accepted accepted, $skippedAcc dropped (acc_code), $skippedBadRow dropped (row too short)');
+        debugPrint('📊 LEDGER: $fileName — ${rows.length - 1} data rows → $accepted accepted, $skippedAcc dropped (acc_code), $skippedBadRow dropped (row too short)${skippedNoDate > 0 ? ", $skippedNoDate dropped (bad date)" : ""}');
       }
 
       final deduped = _dedup(allRows, ['team_id', 'customer_id', 'entry_date', 'book', 'bill_no', 'type', 'sno']);
